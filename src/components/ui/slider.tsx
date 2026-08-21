@@ -15,6 +15,8 @@ function Slider({
   value,
   onChange,
   "aria-label": ariaLabel,
+  variant = "blue",
+  tooltipText,
 }: {
   className?: string
   min: number
@@ -23,6 +25,11 @@ function Slider({
   value: number
   onChange: (value: number) => void
   "aria-label"?: string
+  /** Color theme. Blue (default) for primary actions, black for secondary. */
+  variant?: "blue" | "black"
+  /** Override the tooltip body (default: numeric `value`). Useful when the
+   *  slider stands in for a categorical picker. */
+  tooltipText?: string
 }) {
   const trackRef = useRef<HTMLDivElement>(null)
   const [dragging, setDragging] = useState(false)
@@ -96,14 +103,20 @@ function Slider({
         className,
       )}
     >
-      <div className="absolute inset-x-0 h-1.5 rounded-full bg-muted" />
+      <div className="absolute inset-x-0 h-[4.5px] rounded-full bg-muted" />
       <div
-        className="absolute h-1.5 rounded-full bg-blue-500"
+        className={cn(
+          "absolute h-[4.5px] rounded-full",
+          variant === "black" ? "bg-foreground" : "bg-blue-500",
+        )}
         style={{ width: `${pct}%` }}
       />
       <div
         data-slot="slider-thumb"
-        className="absolute size-4 -translate-x-1/2 rounded-full border-2 border-blue-500 bg-white shadow-sm"
+        className={cn(
+          "absolute size-[11.52px] -translate-x-1/2 rounded-full border bg-white shadow-sm",
+          variant === "black" ? "border-foreground" : "border-blue-500",
+        )}
         style={{ left: `${pct}%` }}
       />
       {dragging && (
@@ -112,7 +125,7 @@ function Slider({
           className="pointer-events-none absolute -top-2 -translate-x-1/2 -translate-y-full rounded-md bg-foreground px-2 py-1 text-xs font-medium text-background shadow-md"
           style={{ left: `${pct}%` }}
         >
-          {value}
+          {tooltipText ?? value}
         </div>
       )}
     </div>
