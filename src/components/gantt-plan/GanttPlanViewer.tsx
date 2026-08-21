@@ -3,13 +3,14 @@ import {
   Gantt,
   type GanttApi,
   type GanttColumn,
+  useGanttScale,
 } from "@/components/reui/gantt/gantt"
 import {
+  GANTT_SCALES,
   GanttNav,
   GanttNavNext,
   GanttNavPrev,
   GanttNavToday,
-  GanttScaleSwitcher,
   GanttTitle,
 } from "@/components/reui/gantt/gantt-nav"
 import { GanttView } from "@/components/reui/gantt/gantt-view"
@@ -123,7 +124,7 @@ export function GanttPlanViewer() {
         <GanttNav>
           <TooltipProvider delay={600} closeDelay={0} timeout={300}>
             <GanttNavToday />
-            <GanttScaleSwitcher />
+            <GanttScaleSlider />
             <div className="flex items-center">
               <GanttNavPrev />
               <GanttNavNext />
@@ -190,6 +191,38 @@ function WbsLevelSlider({
       />
       <span className="text-muted-foreground w-9 shrink-0 text-right text-xs tabular-nums">
         {level >= max ? "máx" : `${level}/${max}`}
+      </span>
+    </div>
+  )
+}
+
+/** Timeline scale picker: Día / Semana / Mes / Trimestre / Año. Black variant
+ *  to distinguish from the blue WBS depth control. */
+function GanttScaleSlider() {
+  const { scale, setScale } = useGanttScale()
+  const labels = I18N_ES.labels?.scales
+  const index = GANTT_SCALES.indexOf(scale)
+  return (
+    <div className="flex w-full items-center gap-2" data-slot="gantt-scale-slider">
+      <span className="text-muted-foreground shrink-0 text-xs font-medium">
+        Escala
+      </span>
+      <Slider
+        variant="black"
+        min={0}
+        max={GANTT_SCALES.length - 1}
+        step={1}
+        value={index >= 0 ? index : 0}
+        onChange={(i) => setScale(GANTT_SCALES[i])}
+        tooltipText={labels?.[scale] ?? scale}
+        aria-label="Escala del timeline"
+        className="w-20"
+      />
+      <span
+        data-slot="gantt-scale-value"
+        className="text-muted-foreground ml-3 shrink-0 text-xs"
+      >
+        {labels?.[scale] ?? scale}
       </span>
     </div>
   )
