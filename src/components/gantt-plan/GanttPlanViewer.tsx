@@ -20,32 +20,97 @@ import type {
 } from "@/components/reui/gantt/gantt-types"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Slider } from "@/components/ui/slider"
 import { TooltipProvider } from "@/components/ui/tooltip"
-import { PLAN, RESPONSABLES, type EventData } from "@/data/plan-departamento"
-import { toGanttEvents, toGanttResources } from "@/lib/plan-mapper"
 import { createChangesetRecorder, type ChangesetRecorder } from "@/lib/changeset"
 import { I18N_ES, LOCALE_ES } from "@/lib/i18n-es"
+import type { EventData, PlanJSON, PlanResource } from "@/lib/plan-types"
+import { toGanttEvents, toGanttResources } from "@/lib/plan-mapper"
+import { applyOps, encodeUpdatedPlan, type ChangeOp } from "@/lib/umejson/codec"
+import { decodeUmePlan, type UmeJsonEntity, type ValidationError } from "@/lib/umejson/schema"
 import { wbsLevelStyle } from "@/lib/wbs-levels"
 import { ChangesetPanel } from "@/components/gantt-plan/ChangesetPanel"
 
-export function GanttPlanViewer() {
+export interface GanttPlanViewerProps {
+  document: UmeJsonEntity
+  onError?: (errors: ValidationError[]) => void
+  onOpsChange?: (ops: ChangeOp[]) => void
+  onDocumentChange?: (entity: UmeJsonEntity) => void
+}
+
+export function GanttPlanViewer({
+  document,
+  onError,
+  onOpsChange,
+  onDocumentChange,
+}: GanttPlanViewerProps) {
+  const decoded = useMemo(() => decodeUmePlan(document), [document])
+  const validationError = !decoded.ok ? decoded.errors : null
+
+  useEffect(() => {
+    if (validationError && onError) onError(validationError)
+  }, [validationError, onError])
+
+  if (!decoded.ok) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Documento umeJSON inválido</CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-2">
+          <p className="text-sm text-muted-foreground">
+            El documento recibido no cumple el contrato umeJSON. No se puede
+            renderizar el Gantt hasta corregir los siguientes errores:
+          </p>
+          <pre className="text-xs overflow-auto max-h-72 rounded-md bg-muted p-3">
+            {JSON.stringify(decoded.errors, null, 2)}
+          </pre>
+        </CardContent>
+      </Card>
+    )
+  }
+
+  return (
+    <GanttPlanViewerInner
+      entity={decoded.entity}
+      originalPlan={decoded.plan}
+      onOpsChange={onOpsChange}
+      onDocumentChange={onDocumentChange}
+    />
+  )
+}
+
+function GanttPlanViewerInner({
+  entity,
+  originalPlan,
+  onOpsChange,
+  onDocumentChange,
+}: {
+  entity: UmeJsonEntity
+  originalPlan: PlanJSON
+  onOpsChange?: (ops: ChangeOp[]) => void
+  onDocumentChange?: (entity: UmeJsonEntity) => void
+}) {
   const apiRef = useRef<GanttApi<EventData> | null>(null)
   const recorderRef = useRef<ChangesetRecorder | null>(null)
   if (recorderRef.current === null) {
-    recorderRef.current = createChangesetRecorder(apiRef)
+    recorderRef.current = createChangesetRecorder(apiRef, {
+      createDraft: (slot) => buildDraft(slot, originalPlan),
+    })
   }
   const recorder = recorderRef.current!
 
   const [events, setEvents] = useState<GanttEvent<EventData>[]>(() =>
-    toGanttEvents(PLAN),
+    toGanttEvents(originalPlan),
   )
-  const resources: GanttResource[] = useMemo(() => toGanttResources(PLAN), [])
+  const resources: GanttResource[] = useMemo(
+    () => toGanttResources(originalPlan),
+    [originalPlan],
+  )
 
-  // ----- WBS level control: one slider drives the visible depth -----
   const maxDepth = useMemo(() => depthOf(resources), [resources])
   const [level, setLevel] = useState(maxDepth)
-  // every group at depth >= level folds; level = maxDepth leaves the tree open
   const collapsedGroups = useMemo(() => {
     const ids: string[] = []
     const walk = (nodes: GanttResource[], depth: number) => {
@@ -65,21 +130,31 @@ export function GanttPlanViewer() {
         id: "responsable",
         title: "Responsable",
         width: 130,
-        render: (ctx: { resource: { id: string } }) =>
-          RESPONSABLES[ctx.resource.id] ?? "—",
+        render: (ctx: { resource: { id: string } }) => {
+          const r = originalPlan.resources.find((rr) => rr.id === ctx.resource.id)
+          return r?.responsable ?? "—"
+        },
       },
     ],
-    [],
+    [originalPlan],
   )
 
-  const [opsCount, setOpsCount] = useState(0)
+  const ops = useRecorderOps(recorder)
+  const documentOut = useMemo(
+    () => (ops.length ? encodeUpdatedPlan(entity, applyOps(originalPlan, ops), ops.length) : null),
+    [ops, entity, originalPlan],
+  )
+
   useEffect(() => {
-    setOpsCount(recorder.getOps().length)
-    return recorder.subscribe(() => setOpsCount(recorder.getOps().length))
-  }, [recorder])
+    onOpsChange?.(ops)
+  }, [ops, onOpsChange])
+
+  useEffect(() => {
+    if (documentOut) onDocumentChange?.(documentOut)
+  }, [documentOut, onDocumentChange])
 
   const handleReset = () => {
-    setEvents(toGanttEvents(PLAN))
+    setEvents(toGanttEvents(originalPlan))
     recorder.reset()
   }
 
@@ -141,7 +216,7 @@ export function GanttPlanViewer() {
       <div className="flex flex-col gap-3 border-t pt-4">
         <div className="flex items-center gap-2">
           <Badge variant="secondary" data-slot="gantt-ops-count">
-            {opsCount} cambios
+            {ops.length} cambios
           </Badge>
           <Button
             size="sm"
@@ -152,10 +227,60 @@ export function GanttPlanViewer() {
             Reiniciar plan
           </Button>
         </div>
-        <ChangesetPanel recorder={recorder} />
+        <ChangesetPanel recorder={recorder} documentOut={documentOut} />
       </div>
     </div>
   )
+}
+
+function useRecorderOps(recorder: ChangesetRecorder): ChangeOp[] {
+  const [ops, setOps] = useState<ChangeOp[]>(() => recorder.getOps())
+  useEffect(() => {
+    setOps(recorder.getOps())
+    return recorder.subscribe(() => setOps(recorder.getOps()))
+  }, [recorder])
+  return ops
+}
+
+function buildDraft(
+  slot: { resourceId?: string; start: Date; end: Date },
+  plan: PlanJSON,
+): GanttEvent<EventData> | null {
+  if (!slot.resourceId) return null
+  const byId = new Map(plan.resources.map((r) => [r.id, r]))
+  const resource = byId.get(slot.resourceId)
+  if (!resource) return null
+  const phaseId = resolvePhaseId(resource, byId)
+  const phase = phaseId ? plan.phases.find((p) => p.id === phaseId) : undefined
+  return {
+    id: `tmp-${crypto.randomUUID()}`,
+    title: resource.title,
+    start: slot.start,
+    end: slot.end,
+    allDay: true,
+    resourceId: slot.resourceId,
+    color: phase?.color ?? "var(--color-indigo-500)",
+    data: {
+      responsable: resource.responsable ?? "—",
+      fase: phaseId ?? "",
+      status: "Pendiente",
+    },
+  }
+}
+
+function resolvePhaseId(
+  resource: PlanResource,
+  byId: Map<string, PlanResource>,
+): string | undefined {
+  const visiting = new Set<string>()
+  let current: PlanResource | undefined = resource
+  while (current) {
+    if (visiting.has(current.id)) return undefined
+    visiting.add(current.id)
+    if (current.phaseId) return current.phaseId
+    current = current.parentId ? byId.get(current.parentId) : undefined
+  }
+  return undefined
 }
 
 /** Deepest WBS level present in the mapped tree (root = 0). */
@@ -169,7 +294,6 @@ function depthOf(nodes: GanttResource[], depth = 0): number {
   )
 }
 
-/** Global depth control: 0 = root only, max = fully expanded. */
 function WbsLevelSlider({
   level,
   max,
@@ -200,8 +324,6 @@ function WbsLevelSlider({
   )
 }
 
-/** Timeline scale picker: Día / Semana / Mes / Trimestre / Año. Black variant
- *  to distinguish from the blue WBS depth control. */
 function GanttScaleSlider() {
   const { scale, setScale } = useGanttScale()
   const labels = I18N_ES.labels?.scales
