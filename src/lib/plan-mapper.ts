@@ -2,25 +2,22 @@ import type {
   GanttEvent,
   GanttResource,
 } from "@/components/reui/gantt/gantt-types"
-import { PLAN, RESPONSABLES, type EventData, type PlanJSON, type PlanResource } from "@/data/plan-departamento"
-
-const phaseColorById = new Map(PLAN.phases.map((p) => [p.id, p.color]))
-
-const statusFor = (eventId: string): string => {
-  const ev = PLAN.events.find((e) => e.id === eventId)
-  if (!ev) return "Sin programar"
-  if (ev.progress >= 100) return "Terminado"
-  if (ev.progress > 0) return "En curso"
-  return "Pendiente"
-}
+import type { EventData, PlanJSON, PlanResource } from "@/lib/plan-types"
 
 export function toGanttEvents(plan: PlanJSON): GanttEvent<EventData>[] {
   const byId = new Map(plan.resources.map((r) => [r.id, r]))
+  const phaseColorById = new Map(plan.phases.map((p) => [p.id, p.color]))
+  const statusFor = (progress: number): string => {
+    if (progress >= 100) return "Terminado"
+    if (progress > 0) return "En curso"
+    return "Pendiente"
+  }
   return plan.events.map((e) => {
-    const phaseId = resolvePhaseId(e.resourceId, byId) ?? "entrega"
+    const phaseId = resolvePhaseId(e.resourceId, byId) ?? ""
+    const resource = byId.get(e.resourceId)
     return {
       id: e.id,
-      title: titleize(e.resourceId),
+      title: resource?.title ?? titleize(e.resourceId),
       start: new Date(e.start),
       end: new Date(e.end),
       allDay: true,
@@ -28,9 +25,9 @@ export function toGanttEvents(plan: PlanJSON): GanttEvent<EventData>[] {
       resourceId: e.resourceId,
       color: phaseColorById.get(phaseId),
       data: {
-        responsable: RESPONSABLES[e.resourceId] ?? "—",
+        responsable: resource?.responsable ?? "—",
         fase: phaseId,
-        status: statusFor(e.id),
+        status: statusFor(e.progress),
       },
     }
   })
@@ -102,6 +99,6 @@ function resolvePhaseId(
 function titleize(id: string): string {
   return id
     .split("-")
-    .map((w) => w[0].toUpperCase() + w.slice(1))
+    .map((w) => w[0]?.toUpperCase() + w.slice(1))
     .join(" ")
 }

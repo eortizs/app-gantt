@@ -6,29 +6,10 @@ import type {
   GanttSlotDraft,
   GanttUpdateResult,
 } from "@/components/reui/gantt/gantt-types"
-import { RESPONSABLES, type EventData } from "@/data/plan-departamento"
+import type { EventData } from "@/lib/plan-types"
+import type { ChangeOp } from "@/lib/umejson/codec"
 
-export type UpdateOp = {
-  op: "update"
-  id: string
-  patch: { start: string; end: string }
-}
-
-export type CreateOp = {
-  op: "create"
-  event: {
-    id: string
-    resourceId: string
-    start: string
-    end: string
-    progress: number
-    title: string
-    color?: string
-    data: EventData
-  }
-}
-
-export type ChangeOp = UpdateOp | CreateOp
+export type { ChangeOp, UpdateOp, CreateOp, DeleteOp } from "@/lib/umejson/codec"
 
 export interface ChangesetRecorder {
   subscribe(listener: () => void): () => void
@@ -40,8 +21,13 @@ export interface ChangesetRecorder {
   onSelectSlot(slot: GanttSlotDraft): void
 }
 
+export interface ChangesetRecorderOpts {
+  createDraft?: (slot: GanttSlotDraft) => GanttEvent<EventData> | null
+}
+
 export function createChangesetRecorder(
   apiRef: RefObject<GanttApi<EventData> | null>,
+  opts: ChangesetRecorderOpts = {},
 ): ChangesetRecorder {
   const opsMap = new Map<string, ChangeOp>()
   const listeners = new Set<() => void>()
@@ -84,47 +70,28 @@ export function createChangesetRecorder(
       return true
     },
     canSelectSlot(slot) {
-      return Boolean(slot.resourceId)
+      if (!slot.resourceId) return false
+      return Boolean(opts.createDraft)
     },
     onSelectSlot(slot) {
       if (!slot.resourceId) return
-      const id = `tmp-${crypto.randomUUID()}`
-      const event: GanttEvent<EventData> = {
-        id,
-        title: titleize(slot.resourceId),
-        start: slot.start,
-        end: slot.end,
-        allDay: true,
-        resourceId: slot.resourceId,
-        color: "var(--color-indigo-500)",
-        data: {
-          responsable: RESPONSABLES[slot.resourceId] ?? "—",
-          fase: slot.resourceId,
-          status: "Programado",
-        },
-      }
-      apiRef.current?.addEvent(event)
-      opsMap.set(id, {
+      const draft = opts.createDraft?.(slot)
+      if (!draft) return
+      apiRef.current?.addEvent(draft)
+      opsMap.set(draft.id, {
         op: "create",
         event: {
-          id,
-          resourceId: slot.resourceId,
-          start: slot.start.toISOString(),
-          end: slot.end.toISOString(),
+          id: draft.id,
+          resourceId: draft.resourceId!,
+          start: draft.start.toISOString(),
+          end: draft.end.toISOString(),
           progress: 0,
-          title: event.title,
-          color: event.color,
-          data: event.data!,
+          title: draft.title,
+          color: draft.color,
+          data: draft.data!,
         },
       })
       notify()
     },
   }
-}
-
-function titleize(id: string): string {
-  return id
-    .split("-")
-    .map((w) => w[0].toUpperCase() + w.slice(1))
-    .join(" ")
 }
