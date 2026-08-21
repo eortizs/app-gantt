@@ -9,11 +9,12 @@ Viewer Gantt editable construido con **React 19 + Vite 8 + TypeScript**, que con
 ## Scripts
 
 ```bash
-npm install        # instala dependencias
-npm run dev        # vite dev server (http://localhost:5173)
-npm run build      # tsc -b && vite build → dist/
-npm run preview    # sirve dist/ en local
-npm run lint       # oxlint
+pnpm install        # instala dependencias (NO usar npm — reescribe el lockfile)
+pnpm dev            # vite dev server (http://localhost:5173)
+pnpm build          # tsc -b && vite build → dist/
+pnpm preview        # sirve dist/ en local
+pnpm lint           # oxlint
+pnpm verify         # round-trip del codec umeJSON (Node --experimental-strip-types)
 ```
 
 ## Estructura
@@ -29,11 +30,18 @@ src/
 ├── data/
 │   └── plan-departamento.ts      # plan sintético (schema v2): WBS de 4–5 niveles, 7 fases, ~28 eventos
 ├── lib/
-│   ├── plan-mapper.ts            # adapta PlanJSON → GanttEvent[] + GanttResource[] (árbol recursivo)
+│   ├── plan-types.ts             # tipos PlanJSON v2 + EventData (compartidos data ↔ lib ↔ umejson)
+│   ├── plan-mapper.ts            # PlanJSON → GanttEvent[] + GanttResource[] (puro sobre el plan recibido)
 │   ├── wbs-levels.ts             # paleta L0–L4 + helper wbsLevelStyle(depth)
-│   ├── changeset.ts              # recorder de operaciones (drag/resize/create)
+│   ├── changeset.ts              # recorder de operaciones (drag/resize/create); re-exporta ChangeOp
+│   ├── umejson/
+│   │   ├── schema.ts             # tipos UmeJsonEntity + decoder hand-rolled (envelope + payload)
+│   │   └── codec.ts              # ChangeOp + applyOps() + encodeUpdatedPlan() (capa anti-corrupción)
 │   ├── i18n-es.ts                # traducciones + locale es-AR
 │   └── utils.ts                  # cn() y helpers
+├── scripts/
+│   └── verify-roundtrip.mts      # round-trip + invariantes del codec (corre con pnpm verify)
+├── App.tsx                       # shell: construye la entidad umeJSON demo + monta GanttPlanViewer
 ├── App.tsx                       # shell (header + GanttPlanViewer)
 ├── main.tsx                      # entrypoint React 19 createRoot
 └── index.css                     # tailwind v4 + tokens del tema
@@ -108,16 +116,79 @@ El timeline (barras, filas del timeline, summary bars) conserva el color de fase
 
 ## Edición y contrato de cambios
 
-`ChangesetRecorder` (`src/lib/changeset.ts`) escucha drag/resize/create vía callbacks del Gantt (`onEventUpdate`, `onSelectSlot`, `canSelectSlot`) y emite operaciones serializables:
+`ChangesetRecorder` (`src/lib/changeset.ts`) escucha drag/resize/create vía callbacks del Gantt (`onEventUpdate`, `onSelectSlot`, `canSelectSlot`) y emite operaciones serializables. El draft (título/color/responsable de una nueva tarea) lo construye el módulo vía `createDraft(slot)` — el recorder no conoce el dominio.
 
 ```ts
-type Op =
-  | { kind: 'update'; id: string; before: { start: string; end: string; resourceId: string }; after: { ... } }
-  | { kind: 'create'; slot: { resourceId: string; start: string; end: string }; task: string }
-  | { kind: 'delete'; id: string }
+// src/lib/umejson/codec.ts
+export type UpdateOp = { op: "update"; id: string; patch: { start: string; end: string } }
+export type CreateOp = {
+  op: "create"
+  event: {
+    id: string
+    resourceId: string
+    start: string
+    end: string
+    progress: number
+    title: string
+    color?: string
+    data: { responsable: string; fase: string; status: string }
+  }
+}
+export type DeleteOp = { op: "delete"; id: string }
+export type ChangeOp = UpdateOp | CreateOp | DeleteOp
 ```
 
-El panel `ChangesetPanel` inferior muestra la lista acumulada y permite **Copiar JSON** — es el contrato que la futura API REST debe aceptar (POST batch de `Op[]`).
+El panel `ChangesetPanel` inferior muestra dos secciones: el **`Op[]`** acumulado y, cuando hay cambios, el **documento umeJSON actualizado** (entidad lista para POST). Ambos con **Copiar JSON**.
+
+> **Nota sobre borrado**: la UI aún no expone borrado de eventos (la API del engine lo soporta vía `GanttApi.removeEvent` pero no hay interacción cableada). `DeleteOp` queda en el contrato y `applyOps` lo entiende, pero el recorder no lo emite hoy.
+
+## Pipeline umeJSON (caja negra)
+
+El módulo Gantt consume y produce **una sola entidad umeJSON** (`entityName: "GanttPlan"`, `dynamicProperties.plan` = `PlanJSON` v2 completo). La frontera entre el documento externo y el dominio interno cruza por un codec puro en `src/lib/umejson/`.
+
+```
+       ┌─────────────────────────────────────────────────────────────┐
+       │                                                             │
+in ──▶ │  decodeUmePlan(entity)  ──▶  originalPlan (PlanJSON)        │
+       │        │                                                    │
+       │        └─ err ──▶ panel de error (nada del engine)          │
+       │                                                             │
+       │  ┌──────────────────────────────────────────┐               │
+       │  │  Gantt engine (drag / resize / create)   │               │
+       │  └──────────────────────────────────────────┘               │
+       │        │                                                    │
+       │        ▼                                                    │
+       │  recorder  ──▶  ChangeOp[]   ──▶  applyOps(originalPlan)    │
+       │                                     │                      │
+       │                                     ▼                      │
+       │  encodeUpdatedPlan(entity, …)  ──▶  entityOut               │
+       │                                                             │
+out ──▶│  ChangeOp[]  +  entityOut  ──▶  ChangesetPanel              │
+       │                                                             │
+       └─────────────────────────────────────────────────────────────┘
+```
+
+### Decisiones del contrato
+
+- **D2 — Validación runtime**: hand-rolled, sin Zod. Errores estructurados `{ path, code, message }` para que el panel pueda renderizarlos y el backend mapearlos. El modelo es la `Ajv` schema del finalize-api (`ume-json-v1/finalize-api/server.mjs:43-99`).
+- **D4 — Salida**: dual. `Op[]` para el transporte y la entidad completa actualizada para persistir. La entidad out:
+  - preserva `id` y `lifecycle.version` (el server es dueño del bump);
+  - marca `lifecycle.updatedAt` y `timestamp` del append a `statusLog` con el sentinel `RESERVED_FOR_SYSTEM` — el backend los completa al persistir;
+  - append a `state.statusLog` con `{ status: <state.current actual>, timestamp: RESERVED_FOR_SYSTEM, reason: "gantt: N ops" }`;
+  - preserva `markdownDocumentation` tal cual (puede quedar stale — ver nota abajo).
+- **D5 — Forma del Op**: se adoptó la forma real del código (`{ op, … }`) y se agregó `delete` al union.
+- **D6 — Input finalizado**: la entidad debe llegar **finalizada** (UUID real, timestamps reales). El decoder rechaza sentinels `RESERVED_FOR_SYSTEM` en `id`, `lifecycle.createdAt` y `lifecycle.updatedAt` — eso señaliza un documento sin finalizar.
+- **D7 — Borrado en UI**: out of scope (ver nota arriba).
+
+> **`markdownDocumentation` puede quedar stale**: el codec lo preserva intacto aunque el plan haya cambiado. Es responsabilidad del backend regenerarlo si el endpoint lo requiere.
+
+### Validación local del codec
+
+```bash
+pnpm verify   # node --experimental-strip-types scripts/verify-roundtrip.mts
+```
+
+Cubre: round-trip del payload, `applyOps(update+create+delete)`, rechazos (schemaVersion≠2, fecha malformada, `resourceId` huérfano, sentinel en `id`, `entityName` incorrecto) e inmutabilidad del input.
 
 ## Despliegue
 
