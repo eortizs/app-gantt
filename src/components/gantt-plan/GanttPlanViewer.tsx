@@ -123,13 +123,17 @@ export function GanttPlanViewer() {
       >
         <GanttNav>
           <TooltipProvider delay={600} closeDelay={0} timeout={300}>
-            <GanttNavToday />
-            <GanttScaleSlider />
-            <div className="flex items-center">
-              <GanttNavPrev />
-              <GanttNavNext />
+            <div className="flex w-full flex-col gap-2">
+              <div className="flex items-center gap-2">
+                <GanttNavToday />
+                <div className="flex items-center">
+                  <GanttNavPrev />
+                  <GanttNavNext />
+                </div>
+                <GanttTitle />
+              </div>
+              <GanttScaleSlider />
             </div>
-            <GanttTitle />
           </TooltipProvider>
         </GanttNav>
         <GanttView />
