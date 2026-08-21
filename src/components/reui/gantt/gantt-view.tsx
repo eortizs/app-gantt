@@ -1993,6 +1993,16 @@ function GanttView({
             </div>
           )}
         </div>
+        {/* free h-8 band: consumer slot aligned with the timeline header's
+          second row (level controls, filters, legend...) */}
+        {treeConfig.headerContent && (
+          <div
+            data-slot="gantt-tree-header-extra"
+            className="flex h-8 items-center gap-2 px-3"
+          >
+            {treeConfig.headerContent}
+          </div>
+        )}
       </div>
       <div ref={treeRowsRef} className="flex flex-col">
         {rows.map((row) => (
@@ -2003,6 +2013,9 @@ function GanttView({
             bandRem={rowBars.get(row.resource.id)?.bandRem ?? minRowRem}
             columns={columns}
             nameWidth={treeConfig.nameColumnWidth}
+            indentPerLevelRem={treeConfig.indentPerLevelRem ?? 0.875}
+            rowStyle={treeConfig.rowStyle}
+            rowToggles={treeConfig.rowToggles ?? true}
             dimmed={reorder?.resourceId === row.resource.id}
             selected={selectedSet.has(row.resource.id)}
             onSelectedChange={row.isGroup ? undefined : toggleRowSelected}
@@ -2657,6 +2670,9 @@ const GanttTreeRow = memo(function GanttTreeRow({
   bandRem,
   columns,
   nameWidth,
+  indentPerLevelRem,
+  rowStyle,
+  rowToggles,
   dimmed,
   selected,
   onSelectedChange,
@@ -2668,6 +2684,14 @@ const GanttTreeRow = memo(function GanttTreeRow({
   bandRem: number
   columns: GanttColumn[]
   nameWidth: number
+  indentPerLevelRem: number
+  rowStyle?: (ctx: {
+    resource: GanttResource
+    depth: number
+    isGroup: boolean
+    collapsed: boolean
+  }) => CSSProperties | undefined
+  rowToggles: boolean
   dimmed: boolean
   selected: boolean
   onSelectedChange?: (id: string, checked: boolean) => void
@@ -2692,16 +2716,21 @@ const GanttTreeRow = memo(function GanttTreeRow({
   // a single-lane row renders identically either way.
   const alignStart = (viewConfig.rowAlign ?? DEFAULT_ROW_ALIGN) === "start"
 
+  // Consumer paints row backgrounds (name cell + columns) via this style. Hover
+  // and selected tints are layered ON TOP through a transparent overlay so the
+  // inline color stays visible underneath.
+  const consumerRowStyle = rowStyle?.(ctx)
+
   const rowNode = (
     <div
       data-slot="gantt-row-group"
       data-gantt-row-id={row.resource.id}
       data-selected={selected || undefined}
       className={cn(
-        "group/gantt-row data-hover:bg-muted/40 data-selected:bg-primary/5 data-selected:data-hover:bg-primary/5 flex border-b",
+        "group/gantt-row relative flex border-b",
         dimmed && "opacity-50"
       )}
-      style={{ height: `${heightRem}rem` }}
+      style={{ height: `${heightRem}rem`, ...consumerRowStyle }}
       onClick={
         settings.onResourceClick
           ? (e: React.MouseEvent) => {
@@ -2722,7 +2751,13 @@ const GanttTreeRow = memo(function GanttTreeRow({
           : undefined
       }
     >
-      <div className="flex h-full w-full min-w-0">
+      {/* Hover/selected overlay: paints on top of the consumer row background
+        (e.g. WBS-level fill) without occluding the content layer below. */}
+      <div
+        aria-hidden
+        className="group-data-hover/gantt-row:bg-muted/30 group-data-selected/gantt-row:bg-primary/10 group-data-selected/gantt-row:group-data-hover/gantt-row:bg-primary/15 pointer-events-none absolute inset-0"
+      />
+      <div className="relative z-10 flex h-full w-full min-w-0">
         {/* In-flow name cell: the whole tree row scrolls horizontally as one;
           row-level hover/selected tints show through the transparent cell */}
         <div
@@ -2759,34 +2794,36 @@ const GanttTreeRow = memo(function GanttTreeRow({
                 <GripVerticalIcon className="size-3" aria-hidden="true" />
               </button>
             )}
-            {/* per-level indent keeps sibling titles on one x */}
+            {/* per-level indent keeps sibling titles on one x; 0 flattens to the gutter */}
             <span
               aria-hidden
               className="shrink-0"
-              style={{ width: `${row.depth * 0.875}rem` }}
+              style={{ width: `${row.depth * indentPerLevelRem}rem` }}
             />
-            {/* fixed gutter: groups toggle here, leaves carry the checkbox -
-              titles of one level share the same x either way */}
+            {/* fixed gutter: groups toggle here (unless rowToggles is off),
+              leaves carry the checkbox - titles of one level share the same x */}
             <span className="me-1 flex w-5 shrink-0 items-center justify-start">
               {row.isGroup ? (
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  aria-expanded={!row.collapsed}
-                  aria-label={row.resource.title}
-                  className={cn(
-                    "size-5! aria-expanded:bg-transparent!",
-                    row.collapsed
-                      ? "text-foreground"
-                      : "text-muted-foreground aria-expanded:text-muted-foreground! hover:text-foreground!"
-                  )}
-                  onClick={() => onToggle(row)}
-                >
-                  <ChevronRightIcon className={cn(
-                                                        "size-3.5 transition-transform",
-                                                        !row.collapsed && "rotate-90"
-                                                      )} aria-hidden="true" />
-                </Button>
+                rowToggles ? (
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    aria-expanded={!row.collapsed}
+                    aria-label={row.resource.title}
+                    className={cn(
+                      "size-5! aria-expanded:bg-transparent!",
+                      row.collapsed
+                        ? "text-foreground"
+                        : "text-muted-foreground aria-expanded:text-muted-foreground! hover:text-foreground!"
+                    )}
+                    onClick={() => onToggle(row)}
+                  >
+                    <ChevronRightIcon className={cn(
+                                                          "size-3.5 transition-transform",
+                                                          !row.collapsed && "rotate-90"
+                                                        )} aria-hidden="true" />
+                  </Button>
+                ) : null
               ) : (
                 viewConfig.rowCheckboxes &&
                 onSelectedChange && (

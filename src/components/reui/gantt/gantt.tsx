@@ -8,6 +8,7 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
+  type CSSProperties,
   type ReactNode,
   type RefObject,
 } from "react"
@@ -1225,6 +1226,21 @@ interface GanttTreePanelConfig {
   nameColumnWidth?: number
   /** Fires after any user resize (drag release, keyboard, double-click reset). */
   onWidthChange?: (width: number) => void
+  /** Per-level indent of tree row titles in rem. Default 0.875. `0` flattens titles to the gutter. */
+  indentPerLevelRem?: number
+  /**
+   * Inline style applied to each tree-panel row. Use it to paint backgrounds
+   * that span the name cell and the extra columns. Hover/selected tints
+   * remain painted on top of this style as a transparent overlay.
+   */
+  rowStyle?: (ctx: GanttColumnContext) => CSSProperties | undefined
+  /** Collapse/expand chevrons on group rows. Default true. */
+  rowToggles?: boolean
+  /**
+   * Custom content pinned inside the tree-panel header, on the free band
+   * below the column labels (level controls, filters, legend...).
+   */
+  headerContent?: ReactNode
 }
 
 interface GanttRenderEventProps<TData = unknown> {
