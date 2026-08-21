@@ -25,7 +25,7 @@ import { Slider } from "@/components/ui/slider"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { createChangesetRecorder, type ChangesetRecorder } from "@/lib/changeset"
 import { I18N_ES, LOCALE_ES } from "@/lib/i18n-es"
-import type { EventData, PlanJSON, PlanResource } from "@/lib/plan-types"
+import type { EventData, PlanJSON } from "@/lib/plan-types"
 import { toGanttEvents, toGanttResources } from "@/lib/plan-mapper"
 import { applyOps, encodeUpdatedPlan, type ChangeOp } from "@/lib/umejson/codec"
 import { decodeUmePlan, type UmeJsonEntity, type ValidationError } from "@/lib/umejson/schema"
@@ -95,9 +95,7 @@ function GanttPlanViewerInner({
   const apiRef = useRef<GanttApi<EventData> | null>(null)
   const recorderRef = useRef<ChangesetRecorder | null>(null)
   if (recorderRef.current === null) {
-    recorderRef.current = createChangesetRecorder(apiRef, {
-      createDraft: (slot) => buildDraft(slot, originalPlan),
-    })
+    recorderRef.current = createChangesetRecorder(apiRef)
   }
   const recorder = recorderRef.current!
 
@@ -189,11 +187,7 @@ function GanttPlanViewerInner({
         nowIndicator
         offscreenIndicators
         infiniteScroll
-        displayScheduleHint
-        dragCreate
         onEventUpdate={recorder.onEventUpdate}
-        canSelectSlot={recorder.canSelectSlot}
-        onSelectSlot={recorder.onSelectSlot}
         className="h-[560px]"
       >
         <GanttNav>
@@ -240,47 +234,6 @@ function useRecorderOps(recorder: ChangesetRecorder): ChangeOp[] {
     return recorder.subscribe(() => setOps(recorder.getOps()))
   }, [recorder])
   return ops
-}
-
-function buildDraft(
-  slot: { resourceId?: string; start: Date; end: Date },
-  plan: PlanJSON,
-): GanttEvent<EventData> | null {
-  if (!slot.resourceId) return null
-  const byId = new Map(plan.resources.map((r) => [r.id, r]))
-  const resource = byId.get(slot.resourceId)
-  if (!resource) return null
-  const phaseId = resolvePhaseId(resource, byId)
-  const phase = phaseId ? plan.phases.find((p) => p.id === phaseId) : undefined
-  return {
-    id: `tmp-${crypto.randomUUID()}`,
-    title: resource.title,
-    start: slot.start,
-    end: slot.end,
-    allDay: true,
-    resourceId: slot.resourceId,
-    color: phase?.color ?? "var(--color-indigo-500)",
-    data: {
-      responsable: resource.responsable ?? "—",
-      fase: phaseId ?? "",
-      status: "Pendiente",
-    },
-  }
-}
-
-function resolvePhaseId(
-  resource: PlanResource,
-  byId: Map<string, PlanResource>,
-): string | undefined {
-  const visiting = new Set<string>()
-  let current: PlanResource | undefined = resource
-  while (current) {
-    if (visiting.has(current.id)) return undefined
-    visiting.add(current.id)
-    if (current.phaseId) return current.phaseId
-    current = current.parentId ? byId.get(current.parentId) : undefined
-  }
-  return undefined
 }
 
 /** Deepest WBS level present in the mapped tree (root = 0). */
