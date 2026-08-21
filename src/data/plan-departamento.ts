@@ -1,39 +1,7 @@
 import { addDays, startOfWeek } from "date-fns"
+import type { PlanEvent, PlanJSON, PlanPhase, PlanResource } from "@/lib/plan-types"
 
-export interface PlanEvent {
-  id: string
-  resourceId: string
-  start: string
-  end: string
-  progress: number
-}
-
-export interface PlanResource {
-  id: string
-  title: string
-  parentId?: string
-  phaseId?: string
-}
-
-export interface PlanPhase {
-  id: string
-  title: string
-  color: string
-}
-
-export interface PlanJSON {
-  schemaVersion: 2
-  anchor: string
-  resources: PlanResource[]
-  phases: PlanPhase[]
-  events: PlanEvent[]
-}
-
-export type EventData = {
-  responsable: string
-  fase: string
-  status: string
-}
+export type { PlanEvent, PlanResource, PlanPhase, PlanJSON, EventData } from "@/lib/plan-types"
 
 export const RESPONSABLES: Record<string, string> = {
   "departamento-merida": "Residencia",
@@ -89,41 +57,13 @@ const days = (n: number) => addDays(anchor, n)
 const anchor = startOfWeek(new Date(), { weekStartsOn: 1 })
 
 const phases: PlanPhase[] = [
-  {
-    id: "preliminares",
-    title: "Preliminares",
-    color: "var(--color-stone-500)",
-  },
-  {
-    id: "cimentacion",
-    title: "Cimentación",
-    color: "var(--color-sky-500)",
-  },
-  {
-    id: "estructura",
-    title: "Estructura",
-    color: "var(--color-blue-500)",
-  },
-  {
-    id: "albanileria",
-    title: "Albañilería",
-    color: "var(--color-amber-500)",
-  },
-  {
-    id: "instalaciones",
-    title: "Instalaciones",
-    color: "var(--color-teal-500)",
-  },
-  {
-    id: "acabados",
-    title: "Acabados",
-    color: "var(--color-violet-500)",
-  },
-  {
-    id: "entrega",
-    title: "Entrega",
-    color: "var(--color-emerald-500)",
-  },
+  { id: "preliminares", title: "Preliminares", color: "var(--color-stone-500)" },
+  { id: "cimentacion", title: "Cimentación", color: "var(--color-sky-500)" },
+  { id: "estructura", title: "Estructura", color: "var(--color-blue-500)" },
+  { id: "albanileria", title: "Albañilería", color: "var(--color-amber-500)" },
+  { id: "instalaciones", title: "Instalaciones", color: "var(--color-teal-500)" },
+  { id: "acabados", title: "Acabados", color: "var(--color-violet-500)" },
+  { id: "entrega", title: "Entrega", color: "var(--color-emerald-500)" },
 ]
 
 const event = (
@@ -181,59 +121,70 @@ const events: PlanEvent[] = [
   event("acta-entrega", "acta-entrega", 17 * 7, 7, 0, "entrega"),
 ]
 
+const r = (
+  id: string,
+  title: string,
+  rest: { parentId?: string; phaseId?: string } = {},
+): PlanResource => ({
+  id,
+  title,
+  ...rest,
+  responsable: RESPONSABLES[id],
+})
+
 const resources: PlanResource[] = [
-  { id: "departamento-merida", title: "Departamento Mérida" },
+  r("departamento-merida", "Departamento Mérida"),
 
-  { id: "preliminares", title: "Preliminares", parentId: "departamento-merida", phaseId: "preliminares" },
-  { id: "trazo-nivelacion", title: "Trazo y nivelación", parentId: "preliminares" },
-  { id: "excavacion", title: "Excavación", parentId: "preliminares" },
-  { id: "limpieza-trazos", title: "Limpieza de trazos", parentId: "preliminares" },
+  r("preliminares", "Preliminares", { parentId: "departamento-merida", phaseId: "preliminares" }),
+  r("trazo-nivelacion", "Trazo y nivelación", { parentId: "preliminares" }),
+  r("excavacion", "Excavación", { parentId: "preliminares" }),
+  r("limpieza-trazos", "Limpieza de trazos", { parentId: "preliminares" }),
 
-  { id: "cimentacion", title: "Cimentación", parentId: "departamento-merida", phaseId: "cimentacion" },
-  { id: "zapatas", title: "Zapatas", parentId: "cimentacion" },
-  { id: "zapatas-aisladas", title: "Zapatas aisladas", parentId: "zapatas" },
-  { id: "zapatas-corridas", title: "Zapatas corridas", parentId: "zapatas" },
-  { id: "contratabes", title: "Contratabes", parentId: "cimentacion" },
-  { id: "relleno", title: "Relleno compactado", parentId: "cimentacion" },
-  { id: "impermeabilizacion-ciment", title: "Impermeabilización", parentId: "cimentacion" },
+  r("cimentacion", "Cimentación", { parentId: "departamento-merida", phaseId: "cimentacion" }),
+  r("zapatas", "Zapatas", { parentId: "cimentacion" }),
+  r("zapatas-aisladas", "Zapatas aisladas", { parentId: "zapatas" }),
+  r("zapatas-corridas", "Zapatas corridas", { parentId: "zapatas" }),
+  r("contratabes", "Contratabes", { parentId: "cimentacion" }),
+  r("relleno", "Relleno compactado", { parentId: "cimentacion" }),
+  r("impermeabilizacion-ciment", "Impermeabilización", { parentId: "cimentacion" }),
 
-  { id: "estructura", title: "Estructura", parentId: "departamento-merida", phaseId: "estructura" },
-  { id: "estructura-pb", title: "Estructura PB", parentId: "estructura" },
-  { id: "columnas-pb", title: "Columnas PB", parentId: "estructura-pb" },
-  { id: "losa-pb", title: "Losa PB", parentId: "estructura-pb" },
-  { id: "estructura-pa", title: "Estructura PA", parentId: "estructura" },
-  { id: "columnas-pa", title: "Columnas PA", parentId: "estructura-pa" },
-  { id: "losa-azotea", title: "Losa azotea", parentId: "estructura-pa" },
-  { id: "losa-azotea-cimbra", title: "Cimbra y armado", parentId: "losa-azotea" },
-  { id: "losa-azotea-concreto", title: "Colado y curado", parentId: "losa-azotea" },
+  r("estructura", "Estructura", { parentId: "departamento-merida", phaseId: "estructura" }),
+  r("estructura-pb", "Estructura PB", { parentId: "estructura" }),
+  r("columnas-pb", "Columnas PB", { parentId: "estructura-pb" }),
+  r("losa-pb", "Losa PB", { parentId: "estructura-pb" }),
+  r("estructura-pa", "Estructura PA", { parentId: "estructura" }),
+  r("columnas-pa", "Columnas PA", { parentId: "estructura-pa" }),
+  r("losa-azotea", "Losa azotea", { parentId: "estructura-pa" }),
+  r("losa-azotea-cimbra", "Cimbra y armado", { parentId: "losa-azotea" }),
+  r("losa-azotea-concreto", "Colado y curado", { parentId: "losa-azotea" }),
 
-  { id: "albanileria", title: "Albañilería", parentId: "departamento-merida", phaseId: "albanileria" },
-  { id: "muros", title: "Muros", parentId: "albanileria" },
-  { id: "muros-bloque-pb", title: "Muros bloque PB", parentId: "muros" },
-  { id: "muros-pa", title: "Muros PA", parentId: "muros" },
-  { id: "castillos-cadenas", title: "Castillos y cadenas", parentId: "albanileria" },
-  { id: "firmes", title: "Firmes", parentId: "albanileria" },
+  r("albanileria", "Albañilería", { parentId: "departamento-merida", phaseId: "albanileria" }),
+  r("muros", "Muros", { parentId: "albanileria" }),
+  r("muros-bloque-pb", "Muros bloque PB", { parentId: "muros" }),
+  r("muros-pa", "Muros PA", { parentId: "muros" }),
+  r("castillos-cadenas", "Castillos y cadenas", { parentId: "albanileria" }),
+  r("firmes", "Firmes", { parentId: "albanileria" }),
 
-  { id: "instalaciones", title: "Instalaciones", parentId: "departamento-merida", phaseId: "instalaciones" },
-  { id: "electrica-empotrada", title: "Eléctrica empotrada", parentId: "instalaciones" },
-  { id: "electrica-empotrada-pb", title: "Eléctrica PB", parentId: "electrica-empotrada" },
-  { id: "electrica-empotrada-pa", title: "Eléctrica PA", parentId: "electrica-empotrada" },
-  { id: "hidrosanitaria", title: "Hidrosanitaria", parentId: "instalaciones" },
-  { id: "gas", title: "Gas", parentId: "instalaciones" },
-  { id: "voz-datos", title: "Voz y datos", parentId: "instalaciones" },
+  r("instalaciones", "Instalaciones", { parentId: "departamento-merida", phaseId: "instalaciones" }),
+  r("electrica-empotrada", "Eléctrica empotrada", { parentId: "instalaciones" }),
+  r("electrica-empotrada-pb", "Eléctrica PB", { parentId: "electrica-empotrada" }),
+  r("electrica-empotrada-pa", "Eléctrica PA", { parentId: "electrica-empotrada" }),
+  r("hidrosanitaria", "Hidrosanitaria", { parentId: "instalaciones" }),
+  r("gas", "Gas", { parentId: "instalaciones" }),
+  r("voz-datos", "Voz y datos", { parentId: "instalaciones" }),
 
-  { id: "acabados", title: "Acabados", parentId: "departamento-merida", phaseId: "acabados" },
-  { id: "yeso-pintura", title: "Yeso y pintura", parentId: "acabados" },
-  { id: "pisos-ceramica", title: "Pisos cerámica", parentId: "acabados" },
-  { id: "carpinteria", title: "Carpintería", parentId: "acabados" },
-  { id: "herreria-aluminio", title: "Herrería y aluminio", parentId: "acabados" },
+  r("acabados", "Acabados", { parentId: "departamento-merida", phaseId: "acabados" }),
+  r("yeso-pintura", "Yeso y pintura", { parentId: "acabados" }),
+  r("pisos-ceramica", "Pisos cerámica", { parentId: "acabados" }),
+  r("carpinteria", "Carpintería", { parentId: "acabados" }),
+  r("herreria-aluminio", "Herrería y aluminio", { parentId: "acabados" }),
 
-  { id: "entrega", title: "Entrega", parentId: "departamento-merida", phaseId: "entrega" },
-  { id: "pruebas-puestas-marcha", title: "Pruebas y puestas en marcha", parentId: "entrega" },
-  { id: "limpieza-fina", title: "Limpieza fina", parentId: "entrega" },
-  { id: "obra-gris-correcciones", title: "Correcciones obra gris", parentId: "entrega" },
-  { id: "kit-entrega", title: "Kit de entrega", parentId: "entrega" },
-  { id: "acta-entrega", title: "Acta de entrega", parentId: "entrega" },
+  r("entrega", "Entrega", { parentId: "departamento-merida", phaseId: "entrega" }),
+  r("pruebas-puestas-marcha", "Pruebas y puestas en marcha", { parentId: "entrega" }),
+  r("limpieza-fina", "Limpieza fina", { parentId: "entrega" }),
+  r("obra-gris-correcciones", "Correcciones obra gris", { parentId: "entrega" }),
+  r("kit-entrega", "Kit de entrega", { parentId: "entrega" }),
+  r("acta-entrega", "Acta de entrega", { parentId: "entrega" }),
 ]
 
 export const PLAN: PlanJSON = {
