@@ -11,7 +11,6 @@ import {
   GanttNavToday,
   GanttScaleSwitcher,
   GanttTitle,
-  GanttToolbar,
 } from "@/components/reui/gantt/gantt-nav"
 import { GanttView } from "@/components/reui/gantt/gantt-view"
 import type {
@@ -98,25 +97,26 @@ export function GanttPlanViewer() {
               <GanttNavNext />
             </div>
             <GanttTitle />
-            <div className="grow" />
-            <GanttToolbar>
-              <Badge variant="secondary" data-slot="gantt-ops-count">
-                {opsCount} cambios
-              </Badge>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={handleReset}
-                data-slot="gantt-reset"
-              >
-                Reiniciar plan
-              </Button>
-            </GanttToolbar>
           </TooltipProvider>
         </GanttNav>
         <GanttView />
       </Gantt>
-      <ChangesetPanel recorder={recorder} />
+      <div className="flex flex-col gap-3 border-t pt-4">
+        <div className="flex items-center gap-2">
+          <Badge variant="secondary" data-slot="gantt-ops-count">
+            {opsCount} cambios
+          </Badge>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleReset}
+            data-slot="gantt-reset"
+          >
+            Reiniciar plan
+          </Button>
+        </div>
+        <ChangesetPanel recorder={recorder} />
+      </div>
     </div>
   )
 }
