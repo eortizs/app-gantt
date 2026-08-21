@@ -21,7 +21,7 @@ Editable Gantt viewer (React 19 + Vite 8 + TS 6). Synthetic construction plan de
 - `src/components/gantt-plan/` — app-level viewer (`GanttPlanViewer.tsx` is the **umeJSON black box**) and the changes JSON panel (`ChangesetPanel.tsx`). This is where to add app features.
 - `src/components/reui/gantt/` — **vendored gantt engine** (NOT an npm dep). Edit `gantt.tsx` (main) and siblings here when extending the engine. New generic props for the tree panel live around `gantt.tsx:1215`.
 - `src/components/ui/` — shadcn-style primitives. `slider.tsx` is **custom** (no native `<input type="range">`); it has its own pointer/keyboard handlers.
-- `src/data/plan-departamento.ts` — synthetic plan regenerated on every mount, anchored to the current week (see `:72`). WBS schema v2. Re-exports types from `@/lib/plan-types` for compat.
+- `src/data/plan-departamento.ts` — synthetic plan regenerated on every mount, anchored to the current week (see `:57`). WBS schema v2. Re-exports types from `@/lib/plan-types` for compat.
 - `src/lib/plan-types.ts` — shared types: `PlanJSON`, `PlanEvent`, `PlanResource` (+`responsable?`), `PlanPhase`, `EventData`. `data/` imports types from here, never the other way.
 - `src/lib/plan-mapper.ts` — `PlanJSON` → `GanttEvent[] + GanttResource[]`. Pure on the plan received: phase colors come from `plan.phases`, status is derived from the event's own `progress`, `responsable` comes from `resource.responsable`. Recursive tree builder, preserves sibling order, treats orphans/cycles as roots.
 - `src/lib/umejson/schema.ts` — `UmeJsonEntity` type + `decodeUmePlan()` hand-rolled validator (envelope + payload). Exports `SENTINEL = "RESERVED_FOR_SYSTEM"` and `ENTITY_NAME = "GanttPlan"`.
