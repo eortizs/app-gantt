@@ -12,6 +12,7 @@ import {
   SENTINEL,
   type UmeJsonEntity,
 } from "../src/lib/umejson/schema.ts"
+import { cascadeSchedule, wouldCreateCycle } from "../src/lib/umejson/schedule.ts"
 import type { PlanJSON } from "../src/lib/plan-types.ts"
 
 const fails: string[] = []
@@ -213,6 +214,211 @@ for (const [label, input] of rejectionCases) {
   const decoded = decodeUmePlan(fixtureEntity)
   if (!decoded.ok) fail("baselines: valid history decodes", decoded.errors[0]?.message ?? "rejected")
   else ok("baselines: valid history decodes")
+}
+
+// ---- 7. Dependencias: ops + applyOps mantiene el grafo válido --------------
+{
+  const t = (days: number) => new Date(Date.parse(ISO) + days * 86_400_000).toISOString()
+  const depPlan: PlanJSON = {
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: [
+      { id: "a", resourceId: "r", start: t(0), end: t(2), progress: 0 },
+      { id: "b", resourceId: "r", start: t(1), end: t(3), progress: 0 },
+      { id: "c", resourceId: "r", start: t(2), end: t(4), progress: 0 },
+    ],
+    dependencies: [
+      { id: "d1", fromEventId: "a", toEventId: "b", type: "FS" },
+      { id: "d2", fromEventId: "b", toEventId: "c", type: "FS" },
+    ],
+  }
+
+  // addDependency replaces by id, removeDependency filters, delete prunes
+  // incident edges so the document never carries dangling refs.
+  const added = applyOps(depPlan, [
+    { op: "addDependency", dependency: { id: "d3", fromEventId: "c", toEventId: "b", type: "SS" } },
+  ])
+  if (!deepEqual(
+    added.dependencies?.map((d) => d.id),
+    ["d1", "d2", "d3"],
+  )) fail("deps: addDependency appends", JSON.stringify(added.dependencies))
+  else ok("deps: addDependency appends")
+
+  const removed = applyOps(depPlan, [{ op: "removeDependency", id: "d1" }])
+  if (!deepEqual(removed.dependencies?.map((d) => d.id), ["d2"])) {
+    fail("deps: removeDependency filters", JSON.stringify(removed.dependencies))
+  } else ok("deps: add/remove ops")
+
+  // Contract: any edge incident to the deleted event is pruned. The
+  // resulting graph is empty AND absent as a field (round-trip semantics:
+  // "no constraints" is the same shape as a plan that never had any).
+  const deleted = applyOps(depPlan, [{ op: "delete", id: "b" }])
+  if (
+    deleted.events.length !== 2 ||
+    "dependencies" in deleted ||
+    deleted.dependencies !== undefined
+  ) {
+    fail(
+      "deps: delete prunes incident edges",
+      JSON.stringify({
+        deps: deleted.dependencies,
+        depsKeyPresent: "dependencies" in deleted,
+        events: deleted.events.length,
+      }),
+    )
+  } else ok("deps: delete prunes incident edges")
+
+  // A plan without the field stays without it (round-trip equality).
+  const bare: PlanJSON = { ...depPlan, dependencies: undefined }
+  const untouched = applyOps(bare, [{ op: "update", id: "a", patch: { start: t(0), end: t(2) } }])
+  if ("dependencies" in untouched && untouched.dependencies !== undefined) {
+    fail("deps: absent field not synthesized", String(untouched.dependencies))
+  } else ok("deps: absent field not synthesized")
+
+  // Same when a delete op runs on a bare plan: the dependency walk still
+  // executes (it filters nothing) but the field stays truly absent, not just
+  // undefined - the codec rebuilds the object so the original property does
+  // not resurrect via spread.
+  const bareDelete = applyOps(bare, [{ op: "delete", id: "a" }])
+  if ("dependencies" in bareDelete || bareDelete.dependencies !== undefined) {
+    fail(
+      "deps: absent field not synthesized on delete",
+      `key=${"dependencies" in bareDelete} value=${String(bareDelete.dependencies)}`,
+    )
+  } else ok("deps: absent field not synthesized on delete")
+
+  // ---- 8. Cascada: push-forward documentado, nunca pull-back -------------
+  const shifted: PlanJSON = {
+    ...depPlan,
+    events: depPlan.events.map((e) =>
+      e.id === "a" ? { ...e, start: t(5), end: t(7) } : e,
+    ),
+  }
+  const adjustments = cascadeSchedule(shifted, ["a"])
+  if (adjustments.length !== 2) {
+    fail("cascade: transitive chain", JSON.stringify(adjustments))
+  } else {
+    const bAdj = adjustments[0]!
+    const cAdj = adjustments[1]!
+    if (
+      bAdj.eventId !== "b" ||
+      bAdj.start !== t(7) ||
+      bAdj.end !== t(9) ||
+      bAdj.cause.sourceEventId !== "a" ||
+      bAdj.cause.type !== "FS" ||
+      bAdj.cause.shiftDays !== 6
+    ) fail("cascade: direct successor", JSON.stringify(bAdj))
+    else if (
+      cAdj.eventId !== "c" ||
+      cAdj.start !== t(9) ||
+      cAdj.cause.sourceEventId !== "b"
+    ) fail("cascade: transitive successor", JSON.stringify(cAdj))
+    else ok("cascade: transitive chain with documented cause")
+  }
+
+  // Forward-only: moving a predecessor EARLIER relaxes; nobody is pulled.
+  const earlier: PlanJSON = {
+    ...depPlan,
+    events: depPlan.events.map((e) =>
+      e.id === "a" ? { ...e, start: t(-4), end: t(-2) } : e,
+    ),
+  }
+  if (cascadeSchedule(earlier, ["a"]).length !== 0) {
+    fail("cascade: forward-only", "pulled successors backward")
+  } else ok("cascade: forward-only (no pull-back)")
+
+  // FF bounds the END: B must finish when A finishes, duration preserved.
+  const ffPlan: PlanJSON = {
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: [
+      { id: "a", resourceId: "r", start: t(0), end: t(5), progress: 0 },
+      { id: "b", resourceId: "r", start: t(1), end: t(3), progress: 0 },
+    ],
+    dependencies: [{ id: "d", fromEventId: "a", toEventId: "b", type: "FF" }],
+  }
+  const ffAdj = cascadeSchedule(ffPlan, ["a"])[0]
+  if (!ffAdj || ffAdj.start !== t(3) || ffAdj.end !== t(5)) {
+    fail("cascade: FF math", JSON.stringify(ffAdj))
+  } else ok("cascade: FF bounds the end, duration preserved")
+
+  // Lag: FS with lagDays=2 pushes past pred.end + 2 days.
+  const lagPlan: PlanJSON = {
+    ...ffPlan,
+    dependencies: [{ id: "d", fromEventId: "a", toEventId: "b", type: "FS", lagDays: 2 }],
+  }
+  const lagAdj = cascadeSchedule(lagPlan, ["a"])[0]
+  if (!lagAdj || lagAdj.start !== t(7)) fail("cascade: FS lag", JSON.stringify(lagAdj))
+  else ok("cascade: FS lagDays respected")
+
+  // ---- 9. wouldCreateCycle ------------------------------------------------
+  if (wouldCreateCycle(depPlan.dependencies ?? [], "a", "a")) ok("cycle veto: self-loop")
+  else fail("cycle veto: self-loop", "not detected")
+  if (wouldCreateCycle(depPlan.dependencies ?? [], "c", "a")) ok("cycle veto: back-edge into ancestry")
+  else fail("cycle veto: back-edge", "not detected")
+  if (wouldCreateCycle(depPlan.dependencies ?? [], "a", "c")) {
+    fail("cycle veto: clean edge rejected", "false positive")
+  } else ok("cycle veto: clean edge allowed")
+
+  // ---- 10. Decoder: rechazos y happy path del grafo -----------------------
+  const withDeps = (dependencies: unknown): unknown => ({
+    ...fixtureEntity,
+    dynamicProperties: { plan: { ...fixturePlanWithDeps(), dependencies } },
+  })
+  function fixturePlanWithDeps(): PlanJSON {
+    return {
+      ...fixturePlan,
+      events: [
+        ...fixturePlan.events,
+        { id: "e2", resourceId: "child", start: ISO, end: ISO, progress: 0 },
+      ],
+    }
+  }
+  const depRejections: Array<[string, unknown]> = [
+    ["deps: unknown endpoint", withDeps([{ id: "x", fromEventId: "e1", toEventId: "ghost", type: "FS" }])],
+    ["deps: duplicate id", withDeps([
+      { id: "same", fromEventId: "e1", toEventId: "e2", type: "FS" },
+      { id: "same", fromEventId: "e2", toEventId: "e1", type: "FS" },
+    ])],
+    ["deps: self-loop", withDeps([{ id: "x", fromEventId: "e1", toEventId: "e1", type: "FS" }])],
+    ["deps: bad type", withDeps([{ id: "x", fromEventId: "e1", toEventId: "e2", type: "XX" }])],
+    ["deps: cycle", withDeps([
+      { id: "x1", fromEventId: "e1", toEventId: "e2", type: "FS" },
+      { id: "x2", fromEventId: "e2", toEventId: "e1", type: "FS" },
+    ])],
+    ["deps: non-integer lag", withDeps([{ id: "x", fromEventId: "e1", toEventId: "e2", type: "FS", lagDays: 1.5 }])],
+  ]
+  for (const [label, input] of depRejections) {
+    const decoded = decodeUmePlan(input)
+    if (decoded.ok) fail(`reject: ${label}`, "decoder accepted it")
+    else ok(`reject: ${label}`)
+  }
+  const validDeps = decodeUmePlan(withDeps([
+    { id: "ok1", fromEventId: "e1", toEventId: "e2", type: "FS", lagDays: -1 },
+    { id: "ok2", fromEventId: "e2", toEventId: "e1", type: "SS" },
+  ]))
+  // SS e2->e1 plus FS e1->e2 is NOT a cycle for the validator? It IS:
+  // two edges between the same pair in opposite directions close one.
+  if (validDeps.ok) fail("reject: deps opposite pair closes cycle", "decoder accepted it")
+  else ok("reject: opposite-direction pair closes a cycle")
+
+  const happy = decodeUmePlan(
+    withDeps([{ id: "ok", fromEventId: "e1", toEventId: "e2", type: "FS", lagDays: 2 }]),
+  )
+  if (!happy.ok) {
+    fail("deps: valid graph decodes", JSON.stringify(happy.errors.slice(0, 3)))
+  } else {
+    ok("deps: valid graph decodes")
+    // And the graph survives encode untouched.
+    const encodedDeps = encodeUpdatedPlan(fixtureEntity, happy.plan, 0)
+    if (!deepEqual(encodedDeps.dynamicProperties.plan.dependencies, happy.plan.dependencies)) {
+      fail("deps: preserved through encode", "graph differs after encode")
+    } else ok("deps: preserved through encode")
+  }
 }
 
 if (fails.length) {

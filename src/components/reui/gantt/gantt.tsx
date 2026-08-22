@@ -33,6 +33,7 @@ import type {
   GanttBarId,
   GanttBaselineMark,
   GanttDateRange,
+  GanttDependencyMark,
   GanttDragState,
   GanttEvent,
   GanttInteractions,
@@ -1481,6 +1482,20 @@ interface GanttViewConfig<TData = unknown> {
    * render would re-render every row.
    */
   highlightedBaselineKeys?: string[]
+  /**
+   * Dependency connectors between events, painted on an SVG overlay above
+   * the rows (below drag previews). Endpoints anchor to each event's bar by
+   * id; links whose endpoints are not on screen retarget to the nearest
+   * rendered ancestor group's rollup or drop out entirely. Pass a memoized
+   * array - identity is compared, so a fresh literal per render would repaint
+   * the layer every time. Omit for none.
+   */
+  dependencies?: GanttDependencyMark[]
+  /** Click on a connector's hit area; drive edit/delete from your own UI. */
+  onDependencyClick?: (
+    mark: GanttDependencyMark,
+    e: React.MouseEvent
+  ) => void
 }
 
 const DEFAULT_VIEW_CONFIG: GanttViewConfig = {
@@ -1567,6 +1582,8 @@ const VIEW_CONFIG_KEYS: Array<keyof GanttViewConfig> = [
   "renderTooltipExtras",
   "getEventBaselines",
   "highlightedBaselineKeys",
+  "dependencies",
+  "onDependencyClick",
 ]
 
 interface GanttProps<TData = unknown>
@@ -1771,6 +1788,7 @@ export type {
   GanttClassNames,
   GanttColumn,
   GanttColumnContext,
+  GanttDependencyMark,
   GanttDragIndicatorProps,
   GanttGridLine,
   GanttInstance,

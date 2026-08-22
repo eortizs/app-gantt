@@ -41,6 +41,7 @@ import {
 } from "@/components/reui/gantt/gantt-lib"
 import type {
   GanttDateRange,
+  GanttDependencyMark,
   GanttEvent,
   GanttOccurrence,
   GanttResource,
@@ -2326,6 +2327,21 @@ function GanttView({
             minRowRem={minRowRem}
           />
         ))}
+        {viewConfig.dependencies && viewConfig.dependencies.length > 0 && (
+          <GanttDependencyLayer
+            marks={viewConfig.dependencies}
+            rows={rows}
+            rowBars={rowBars}
+            events={allEvents}
+            resources={settings.resources}
+            rangeStartMs={rangeStartMs}
+            rangeEndMs={rangeEndMs}
+            laneHeightRem={laneHeightRem}
+            laneGapRem={laneGapRem}
+            minRowRem={minRowRem}
+            onMarkClick={viewConfig.onDependencyClick}
+          />
+        )}
         {rows.length === 0 && viewConfig.renderNoResources && (
           <div
             data-slot="gantt-no-resources"
@@ -3733,6 +3749,463 @@ interface OffscreenChip {
   /** End-chip inset in px, widened to clear the zoom control when they overlap. */
   insetEnd: number
 }
+
+/** Exit stub (px) between a bar edge and the connector's first elbow turn. */
+const DEP_STUB_PX = 12
+/** Breathing room (px) kept between a routed connector and any bar. */
+const DEP_MARGIN_PX = 4
+/** Elbow corner radius (px); shrinks to fit tight geometries. */
+const DEP_RADIUS_PX = 4
+/** Fat invisible stroke that makes a hairline connector hoverable. */
+const DEP_HIT_PX = 12
+/** rem -> px at the root's reference, same convention as the baselines. */
+const REM_PX = 16
+
+interface DependencyAnchor {
+  x: number
+  y: number
+  /** Horizontal direction pointing AWAY from the anchored bar edge. */
+  out: 1 | -1
+}
+
+/**
+ * Elbow polyline with rounded corners: straight runs joined by quadratic
+ * curves at each interior point. The radius yields to half the shorter
+ * adjacent segment so a degenerate elbow never folds back onto itself.
+ */
+function roundedElbow(points: Array<[number, number]>): string {
+  if (points.length < 2) return ""
+  const [sx, sy] = points[0]!
+  let d = `M ${sx} ${sy}`
+  for (let i = 1; i < points.length - 1; i++) {
+    const [px, py] = points[i - 1]!
+    const [cx, cy] = points[i]!
+    const [nx, ny] = points[i + 1]!
+    const d1 = Math.hypot(cx - px, cy - py) || 1
+    const d2 = Math.hypot(nx - cx, ny - cy) || 1
+    const r = Math.min(DEP_RADIUS_PX, d1 / 2, d2 / 2)
+    d += ` L ${cx - ((cx - px) / d1) * r} ${cy - ((cy - py) / d1) * r}`
+    d += ` Q ${cx} ${cy} ${cx + ((nx - cx) / d2) * r} ${cy + ((ny - cy) / d2) * r}`
+  }
+  const [lx, ly] = points[points.length - 1]!
+  return `${d} L ${lx} ${ly}`
+}
+
+/** Solid triangle at the entry point; `dir` is where the arrow POINTS. */
+function arrowHead(x: number, y: number, dir: 1 | -1): string {
+  const back = 7 * dir
+  return `M ${x} ${y} L ${x - back} ${y - 3.5} L ${x - back} ${y + 3.5} Z`
+}
+
+/**
+ * Which bar edges a constraint type connects: the predecessor side it exits,
+ * the successor side it enters, and therefore which way each end faces.
+ */
+function dependencySides(type: GanttDependencyMark["type"]): {
+  fromSide: "start" | "end"
+  toSide: "start" | "end"
+} {
+  switch (type) {
+    case "SS":
+      return { fromSide: "start", toSide: "start" }
+    case "FF":
+      return { fromSide: "end", toSide: "end" }
+    case "SF":
+      return { fromSide: "start", toSide: "end" }
+    case "FS":
+    default:
+      return { fromSide: "end", toSide: "start" }
+  }
+}
+
+/**
+ * Connector overlay for `viewConfig.dependencies`. One SVG spanning the rows
+ * container - the SAME scroll coordinate space as the bars - so panning and
+ * zooming move connectors for free. Endpoints anchor by geometry (row top +
+ * lane center + time fraction), never by DOM measurement, so the layer stays
+ * O(links) per layout pass.
+ *
+ * Routing is collision-aware: the vertical channel sweeps to the nearest
+ * strip of free canvas (never crossing a bar), and the arrow enters the
+ * target from OUTSIDE - wrapping around into the far edge when the free
+ * channel lands past the bar. A link whose endpoint row is collapsed
+ * retargets to the nearest rendered ancestor group's rollup; with none
+ * either, it drops out rather than pointing into empty space.
+ *
+ * Pointer-transparent except a fat invisible hit stroke per link, so bars,
+ * hints and panning keep every gesture they own today; clicks surface through
+ * `onDependencyClick` for consumer-owned edit/delete UI.
+ */
+const GanttDependencyLayer = memo(function GanttDependencyLayer({
+  marks,
+  rows,
+  rowBars,
+  events,
+  resources,
+  rangeStartMs,
+  rangeEndMs,
+  laneHeightRem,
+  laneGapRem,
+  minRowRem,
+  onMarkClick,
+}: {
+  marks: GanttDependencyMark[]
+  rows: TimelineRow[]
+  rowBars: Map<string, TimelineRowBars>
+  events: GanttEvent[]
+  resources: GanttResource[]
+  rangeStartMs: number
+  rangeEndMs: number
+  laneHeightRem: number
+  laneGapRem: number
+  minRowRem: number
+  onMarkClick?: (mark: GanttDependencyMark, e: React.MouseEvent) => void
+}) {
+  const layerRef = useRef<HTMLDivElement | null>(null)
+  const [width, setWidth] = useState(0)
+  const [rtl, setRtl] = useState(false)
+  const [hoveredKey, setHoveredKey] = useState<string | null>(null)
+
+  // Width drives x coordinates (fractions resolve against the real content
+  // width, which can exceed the configured track on wide panes); direction
+  // decides whether fractions measure from the left or right edge. Both are
+  // measured, not assumed, and re-measured on resize.
+  useLayoutEffect(() => {
+    const el = layerRef.current
+    if (!el) return
+    const update = () => {
+      setWidth(el.clientWidth)
+      setRtl(getComputedStyle(el).direction === "rtl")
+    }
+    update()
+    const observer = new ResizeObserver(update)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
+
+  const totalMin = rangeEndMs - rangeStartMs
+  const fractionOf = (ms: number) =>
+    Math.min(Math.max((ms - rangeStartMs) / totalMin, 0), 1)
+
+  const links = useMemo(() => {
+    if (!width || !marks.length) return []
+
+    // Rendered-row index: vertical offsets are the cumulative row heights,
+    // the exact numbers the rows themselves are laid out with.
+    const rowIndexByResource = new Map<string, number>()
+    const rowTopPx: number[] = []
+    let accPx = 0
+    rows.forEach((row, index) => {
+      rowIndexByResource.set(row.resource.id, index)
+      rowTopPx.push(accPx)
+      accPx += (rowBars.get(row.resource.id)?.heightRem ?? minRowRem) * REM_PX
+    })
+
+    // Full-tree parent map for collapsed-endpoint retargeting.
+    const parentOf = new Map<string, string | null>()
+    const walk = (nodes: GanttResource[], parent: string | null) => {
+      for (const node of nodes) {
+        parentOf.set(node.id, parent)
+        if (node.children?.length) walk(node.children, node.id)
+      }
+    }
+    walk(resources, null)
+
+    const eventById = new Map(events.map((event) => [event.id, event]))
+    const laneCenterY = (resourceId: string, occurrenceKey: string): number | null => {
+      const index = rowIndexByResource.get(resourceId)
+      if (index === undefined) return null
+      const bars = rowBars.get(resourceId)
+      const lane =
+        bars?.segments.find((seg) => seg.occurrence.key === occurrenceKey)
+          ?.column ?? 0
+      const laneOffsetRem =
+        bars?.laneOffsetRem ?? (minRowRem - laneHeightRem) / 2
+      return (
+        rowTopPx[index]! +
+        (laneOffsetRem + lane * (laneHeightRem + laneGapRem) + laneHeightRem / 2) *
+          REM_PX
+      )
+    }
+    const rowMiddleY = (resourceId: string): number | null => {
+      const index = rowIndexByResource.get(resourceId)
+      if (index === undefined) return null
+      return rowTopPx[index]! + ((rowBars.get(resourceId)?.heightRem ?? minRowRem) * REM_PX) / 2
+    }
+
+    const resolveAnchor = (
+      eventId: string,
+      side: "start" | "end",
+      occurrenceKey: string
+    ): DependencyAnchor | null => {
+      const event = eventById.get(eventId)
+      if (!event?.resourceId) return null
+      const resourceId = event.resourceId
+      const direct = laneCenterY(resourceId, occurrenceKey)
+      if (direct !== null) {
+        const ms =
+          side === "start"
+            ? Math.max(event.start.getTime(), rangeStartMs)
+            : Math.min(event.end.getTime(), rangeEndMs)
+        return {
+          x: fractionOf(ms) * width,
+          y: direct,
+          out: side === "end" ? 1 : -1,
+        }
+      }
+      // Collapsed: climb to the nearest RENDERED ancestor and anchor to its
+      // rollup envelope (or row middle as a fallback).
+      let parent = parentOf.get(resourceId)
+      while (parent && !rowIndexByResource.has(parent)) {
+        parent = parentOf.get(parent) ?? null
+      }
+      if (!parent) return null
+      const bars = rowBars.get(parent)
+      const env = bars?.summary ?? bars?.extent
+      const y = rowMiddleY(parent)
+      if (!env || y === null) return null
+      const f = side === "start" ? env.from : env.to
+      return { x: f * width, y, out: side === "end" ? 1 : -1 }
+    }
+
+    // First occurrence key per event for lane lookups (recurrence would add
+    // more; this app's plans are single-schedule).
+    const occKeyByEvent = new Map<string, string>()
+    for (const row of rows) {
+      for (const seg of rowBars.get(row.resource.id)?.segments ?? []) {
+        if (!occKeyByEvent.has(seg.occurrence.event.id)) {
+          occKeyByEvent.set(seg.occurrence.event.id, seg.occurrence.key)
+        }
+      }
+    }
+
+    // Bar rectangles for collision-aware routing. The connector's vertical
+    // channel must ride FREE canvas: it never crosses a bar, and when the
+    // free channel lands past the target's far edge, the arrow wraps around
+    // and enters from outside that edge instead of cutting through the bar.
+    const barRects: Array<{
+      x1: number
+      x2: number
+      y1: number
+      y2: number
+      eventId: string
+    }> = []
+    rows.forEach((row, index) => {
+      const bars = rowBars.get(row.resource.id)
+      const topPx = rowTopPx[index]!
+      const laneOffsetRem =
+        bars?.laneOffsetRem ?? (minRowRem - laneHeightRem) / 2
+      for (const seg of bars?.segments ?? []) {
+        const lane = seg.column ?? 0
+        const yTop =
+          topPx +
+          (laneOffsetRem + lane * (laneHeightRem + laneGapRem)) * REM_PX
+        barRects.push({
+          x1:
+            fractionOf(rangeStartMs + (seg.startMin ?? 0) * 60000) * width,
+          x2: fractionOf(rangeStartMs + (seg.endMin ?? 0) * 60000) * width,
+          y1: yTop,
+          y2: yTop + laneHeightRem * REM_PX,
+          eventId: seg.occurrence.event.id,
+        })
+      }
+    })
+
+    const next: Array<{
+      mark: GanttDependencyMark
+      path: string
+      arrow: string
+      violated: boolean
+    }> = []
+    for (const mark of marks) {
+      const { fromSide, toSide } = dependencySides(mark.type)
+      const from = resolveAnchor(
+        mark.fromEventId,
+        fromSide,
+        occKeyByEvent.get(mark.fromEventId) ?? ""
+      )
+      const to = resolveAnchor(
+        mark.toEventId,
+        toSide,
+        occKeyByEvent.get(mark.toEventId) ?? ""
+      )
+      if (!from || !to) continue
+
+      // Vertical channel: start at the natural exit point (bar edge + stub)
+      // and sweep outward through every bar the straight drop would cross,
+      // landing on the nearest x with clear canvas down to the target row.
+      const vMin = Math.min(from.y, to.y)
+      const vMax = Math.max(from.y, to.y)
+      const intervals: Array<[number, number]> = []
+      for (const r of barRects) {
+        if (r.y1 - DEP_MARGIN_PX < vMax && r.y2 + DEP_MARGIN_PX > vMin) {
+          intervals.push([r.x1 - DEP_MARGIN_PX, r.x2 + DEP_MARGIN_PX])
+        }
+      }
+      const x1e = from.x + DEP_STUB_PX * from.out
+      let channel = x1e
+      if (from.out === 1) {
+        for (const [a, b] of [...intervals].sort((p, q) => p[0] - q[0])) {
+          if (a <= channel && b > channel) channel = b
+        }
+      } else {
+        for (const [a, b] of [...intervals].sort((p, q) => q[1] - p[1])) {
+          if (a < channel && channel <= b) channel = a
+        }
+      }
+      channel = Math.min(Math.max(channel, 2), width - 2)
+
+      // Entry edge: whichever side of the target bar the channel can reach
+      // from OUTSIDE. Left of the bar enters the start edge (arrow points
+      // right); right of the bar wraps around into the end edge (arrow
+      // points left) - the connector circles the bar instead of invading it.
+      const targetRect =
+        barRects.find((r) => r.eventId === mark.toEventId) ?? null
+      let entryX = to.x
+      let arrowDir: 1 | -1 = toSide === "start" ? 1 : -1
+      let wrap = false
+      if (targetRect && channel < targetRect.x1 - 0.5) {
+        entryX = targetRect.x1
+        arrowDir = 1
+      } else if (targetRect && channel > targetRect.x2 + 0.5) {
+        entryX = targetRect.x2
+        arrowDir = -1
+      } else if (
+        !targetRect &&
+        ((arrowDir === 1 && channel > to.x + 0.5) ||
+          (arrowDir === -1 && channel < to.x - 0.5))
+      ) {
+        // Collapsed-group anchor on the wrong side: S-curve around it.
+        wrap = true
+      } else if (targetRect) {
+        // Channel clamped INSIDE the target span (range boundary): the only
+        // honest route left is the S-curve, entering the desired edge from
+        // a stub outside it.
+        wrap = true
+        entryX = arrowDir === 1 ? targetRect.x1 : targetRect.x2
+      }
+
+      let points: Array<[number, number]>
+      if (wrap) {
+        const x2e = entryX - DEP_STUB_PX * arrowDir
+        const midY = (from.y + to.y) / 2
+        points = [
+          [from.x, from.y],
+          [x1e, from.y],
+          [x1e, midY],
+          [x2e, midY],
+          [x2e, to.y],
+          [entryX, to.y],
+        ]
+      } else {
+        points = [
+          [from.x, from.y],
+          [channel, from.y],
+          [channel, to.y],
+          [entryX, to.y],
+        ]
+      }
+      next.push({
+        mark,
+        path: roundedElbow(points),
+        arrow: arrowHead(entryX, to.y, arrowDir),
+        violated: !!mark.violated,
+      })
+    }
+    return next
+  }, [
+    marks,
+    rows,
+    rowBars,
+    events,
+    resources,
+    rangeStartMs,
+    totalMin,
+    width,
+    laneHeightRem,
+    laneGapRem,
+    minRowRem,
+  ])
+
+  // ALWAYS mounted while dependencies exist - even before the first
+  // measurement. Returning null on an empty link set would unmount the very
+  // element the ResizeObserver measures against: width would stay 0, links
+  // would stay empty, and the layer would never paint (a perfect deadlock).
+  return (
+    <div
+      ref={layerRef}
+      data-slot="gantt-dependencies"
+      aria-hidden="true"
+      className="pointer-events-none absolute inset-0 z-20"
+    >
+      <svg
+        width="100%"
+        height="100%"
+        className="overflow-visible"
+        style={rtl ? { transform: "scaleX(-1)" } : undefined}
+      >
+        {links.map(({ mark, path, arrow, violated }) => {
+          const hovered = hoveredKey === mark.key
+          const color = violated
+            ? "var(--color-destructive)"
+            : hovered
+              ? "var(--color-foreground)"
+              : "var(--color-muted-foreground)"
+          return (
+            <g
+              key={mark.key}
+              data-slot="gantt-dependency"
+              data-dependency-key={mark.key}
+              data-type={mark.type}
+              data-violated={violated || undefined}
+              className={onMarkClick ? "cursor-pointer" : undefined}
+              onMouseEnter={() => setHoveredKey(mark.key)}
+              onMouseLeave={() =>
+                setHoveredKey((prev) => (prev === mark.key ? null : prev))
+              }
+              onClick={(e) => {
+                e.stopPropagation()
+                onMarkClick?.(mark, e)
+              }}
+            >
+              {/* Hit stroke FIRST so it sits under nothing that matters - it
+                  is transparent and fat; visible strokes stay hairline. */}
+              <path
+                d={path}
+                fill="none"
+                stroke="transparent"
+                strokeWidth={DEP_HIT_PX}
+                strokeLinecap="round"
+                style={{
+                  pointerEvents: onMarkClick ? "stroke" : "none",
+                }}
+                onPointerDown={(e) => e.stopPropagation()}
+              />
+              <path
+                data-slot="gantt-dependency-line"
+                d={path}
+                fill="none"
+                stroke={color}
+                strokeOpacity={violated ? 0.9 : hovered ? 1 : 0.55}
+                strokeWidth={hovered ? 2 : 1.25}
+                strokeLinecap="round"
+                // only the fat transparent twin above answers the pointer
+                style={{ pointerEvents: "none" }}
+              />
+              <path
+                data-slot="gantt-dependency-arrow"
+                d={arrow}
+                fill={color}
+                fillOpacity={violated ? 0.9 : hovered ? 1 : 0.55}
+                style={{ pointerEvents: "none" }}
+              />
+            </g>
+          )
+        })}
+      </svg>
+    </div>
+  )
+})
 
 function sameChips(a: OffscreenChip[], b: OffscreenChip[]): boolean {
   return (

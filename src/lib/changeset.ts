@@ -6,10 +6,23 @@ import type {
   GanttSlotDraft,
   GanttUpdateResult,
 } from "@/components/reui/gantt/gantt-types"
-import type { EventData } from "@/lib/plan-types"
-import type { ChangeOp } from "@/lib/umejson/codec"
+import type { EventData, PlanDependency, PlanJSON } from "@/lib/plan-types"
+import {
+  applyOps,
+  type AddDependencyOp,
+  type ChangeOp,
+  type RemoveDependencyOp,
+} from "@/lib/umejson/codec"
+import { cascadeSchedule, wouldCreateCycle, type ScheduleAdjustment } from "@/lib/umejson/schedule"
 
-export type { ChangeOp, UpdateOp, CreateOp, DeleteOp } from "@/lib/umejson/codec"
+export type {
+  ChangeOp,
+  UpdateOp,
+  CreateOp,
+  DeleteOp,
+  AddDependencyOp,
+  RemoveDependencyOp,
+} from "@/lib/umejson/codec"
 
 export interface ChangesetRecorder {
   subscribe(listener: () => void): () => void
@@ -20,10 +33,31 @@ export interface ChangesetRecorder {
   onEventDelete(eventId: string): void
   canSelectSlot(slot: GanttSlotDraft): boolean
   onSelectSlot(slot: GanttSlotDraft): void
+  /**
+   * Records an edge and cascades its constraints immediately (an FS edge
+   * onto a too-early successor pushes it in the same changeset). Returns
+   * the produced adjustments for the host to mirror into its events state,
+   * or false when the edge is rejected (self-loop or would close a cycle).
+   */
+  addDependency(dependency: PlanDependency): false | ScheduleAdjustment[]
+  /** Records the removal of one edge. Relaxing never moves any date. */
+  removeDependency(depId: string): void
+  /**
+   * Cascade adjustments produced by the LAST onEventUpdate, for the host to
+   * merge into the engine's event array when it emits onEventsChange (the
+   * engine's emission carries only the dragged bar; consuming here keeps the
+   * ordering deterministic). Consumed on read.
+   */
+  consumePendingCascade(): ScheduleAdjustment[]
 }
 
 export interface ChangesetRecorderOpts {
   createDraft?: (slot: GanttSlotDraft) => GanttEvent<EventData> | null
+  /**
+   * The BASE plan (before uncommitted ops). Required for dependency
+   * cascades; without it, update/delete still record but no cascade runs.
+   */
+  getBasePlan?: () => PlanJSON
 }
 
 export function createChangesetRecorder(
@@ -33,11 +67,60 @@ export function createChangesetRecorder(
   const opsMap = new Map<string, ChangeOp>()
   const listeners = new Set<() => void>()
   let snapshot: ChangeOp[] = []
+  let pendingCascade: ScheduleAdjustment[] = []
 
   const notify = () => {
     snapshot = Array.from(opsMap.values())
     for (const l of listeners) l()
   }
+
+  /** The plan as the ops recorded so far describe it. */
+  const currentPlan = (): PlanJSON | null => {
+    const base = opts.getBasePlan?.()
+    return base ? applyOps(base, Array.from(opsMap.values())) : null
+  }
+
+  /**
+   * Pushes dependents of `seedIds` forward where constraints demand it.
+   * Every moved event becomes its own documented update op (cause included),
+   * so the JSON panel shows exactly what the engine adjusted and why.
+   * `queueForEngine` parks the adjustments for consumePendingCascade - only
+   * the drag flow uses it, because only that flow is followed by an engine
+   * events emission that would otherwise wipe the cascade from view.
+   */
+  const runCascade = (
+    seedIds: readonly string[],
+    queueForEngine: boolean,
+  ): ScheduleAdjustment[] => {
+    if (!seedIds.length) return []
+    const plan = currentPlan()
+    if (!plan) return []
+    const adjustments = cascadeSchedule(plan, seedIds)
+    if (!adjustments.length) return []
+    for (const adj of adjustments) {
+      const existing = opsMap.get(adj.eventId)
+      if (existing?.op === "create") {
+        // A cascade push on an event born in this changeset rewrites its
+        // create op in place; the cause documents the binding constraint.
+        opsMap.set(adj.eventId, {
+          ...existing,
+          event: { ...existing.event, start: adj.start, end: adj.end },
+          cause: adj.cause,
+        })
+      } else {
+        opsMap.set(adj.eventId, {
+          op: "update",
+          id: adj.eventId,
+          patch: { start: adj.start, end: adj.end },
+          cause: adj.cause,
+        })
+      }
+    }
+    if (queueForEngine) pendingCascade = adjustments
+    return adjustments
+  }
+
+  const liveDeps = (): PlanDependency[] => currentPlan()?.dependencies ?? []
 
   return {
     subscribe(listener) {
@@ -54,19 +137,33 @@ export function createChangesetRecorder(
     },
     reset() {
       opsMap.clear()
+      pendingCascade = []
       notify()
     },
     onEventUpdate(p) {
       const { event, start, end } = p
       if (end.getTime() <= start.getTime()) return false
-      opsMap.set(event.id, {
-        op: "update",
-        id: event.id,
-        patch: {
-          start: start.toISOString(),
-          end: end.toISOString(),
-        },
-      })
+      // A fresh gesture invalidates any cascade the previous one queued.
+      pendingCascade = []
+      const patch = {
+        start: start.toISOString(),
+        end: end.toISOString(),
+      }
+      const existing = opsMap.get(event.id)
+      if (existing?.op === "create") {
+        // The event was born in this changeset: fold the new dates into its
+        // create op. Replacing it with an update would orphan the creation
+        // (applyOps would find nothing to update and drop the task).
+        opsMap.set(event.id, {
+          ...existing,
+          event: { ...existing.event, ...patch },
+        })
+      } else {
+        opsMap.set(event.id, { op: "update", id: event.id, patch })
+      }
+      // The seed is already in opsMap, so the cascade reads the dragged
+      // dates; only DEPENDENTS move here, never the dragged bar again.
+      runCascade([event.id], true)
       notify()
       return true
     },
@@ -77,6 +174,14 @@ export function createChangesetRecorder(
       } else {
         opsMap.set(eventId, { op: "delete", id: eventId })
       }
+      // Incident edges die with their endpoint - as DOCUMENTED removals,
+      // so reviewers see the graph change next to the date changes.
+      for (const dep of liveDeps()) {
+        if (dep.fromEventId === eventId || dep.toEventId === eventId) {
+          opsMap.set(`dep:${dep.id}`, { op: "removeDependency", id: dep.id })
+        }
+      }
+      // Relaxing constraints never pulls work back: no cascade by design.
       notify()
     },
     canSelectSlot(slot) {
@@ -102,6 +207,32 @@ export function createChangesetRecorder(
         },
       })
       notify()
+    },
+    addDependency(dependency) {
+      if (
+        wouldCreateCycle(liveDeps(), dependency.fromEventId, dependency.toEventId)
+      ) {
+        return false
+      }
+      const op: AddDependencyOp = { op: "addDependency", dependency }
+      opsMap.set(`dep:${dependency.id}`, op)
+      // A new constraint may bind its successor immediately; that push is
+      // part of THIS change, not a silent follow-up. Not queued for the
+      // engine - no events emission follows, the host applies the returned
+      // adjustments itself.
+      const adjustments = runCascade([dependency.toEventId], false)
+      notify()
+      return adjustments
+    },
+    removeDependency(depId) {
+      const op: RemoveDependencyOp = { op: "removeDependency", id: depId }
+      opsMap.set(`dep:${depId}`, op)
+      notify()
+    },
+    consumePendingCascade() {
+      const out = pendingCascade
+      pendingCascade = []
+      return out
     },
   }
 }

@@ -30,24 +30,37 @@ import type {
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { ContextMenuItem } from "@/components/ui/context-menu"
+import { ContextMenuItem, ContextMenuSub, ContextMenuSubContent, ContextMenuSubTrigger } from "@/components/ui/context-menu"
 import { Slider } from "@/components/ui/slider"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import {
   GhostIcon,
   HistoryIcon,
   PinIcon,
+  SplineIcon,
   Trash2Icon,
+  UnlinkIcon,
   XIcon,
 } from "lucide-react"
 import { createChangesetRecorder, type ChangesetRecorder } from "@/lib/changeset"
 import { APP_STRINGS_ES, I18N_ES, LOCALE_ES } from "@/lib/i18n-es"
-import type { EventData, PlanBaseline, PlanJSON } from "@/lib/plan-types"
-import { toGanttEvents, toGanttResources } from "@/lib/plan-mapper"
+import type {
+  EventData,
+  PlanBaseline,
+  PlanDependency,
+  PlanJSON,
+} from "@/lib/plan-types"
+import {
+  resolveDependencyMarks,
+  toGanttEvents,
+  toGanttResources,
+} from "@/lib/plan-mapper"
+import { wouldCreateCycle, type ScheduleAdjustment } from "@/lib/umejson/schedule"
 import { applyOps, encodeUpdatedPlan, type ChangeOp } from "@/lib/umejson/codec"
 import { decodeUmePlan, type UmeJsonEntity, type ValidationError } from "@/lib/umejson/schema"
 import { wbsLevelStyle } from "@/lib/wbs-levels"
 import { ChangesetPanel } from "@/components/gantt-plan/ChangesetPanel"
+import type { GanttDependencyMark } from "@/components/reui/gantt/gantt-types"
 import { cn } from "@/lib/utils"
 
 export interface GanttPlanViewerProps {
@@ -113,7 +126,9 @@ function GanttPlanViewerInner({
   const apiRef = useRef<GanttApi<EventData> | null>(null)
   const recorderRef = useRef<ChangesetRecorder | null>(null)
   if (recorderRef.current === null) {
-    recorderRef.current = createChangesetRecorder(apiRef)
+    recorderRef.current = createChangesetRecorder(apiRef, {
+      getBasePlan: () => originalPlan,
+    })
   }
   const recorder = recorderRef.current!
 
@@ -124,6 +139,30 @@ function GanttPlanViewerInner({
     () => toGanttResources(originalPlan),
     [originalPlan],
   )
+
+  // ----- dependencias: cascada documentada -----
+  // The engine emits the WHOLE events array after a committed drag, carrying
+  // only the dragged bar's new dates. The recorder queues the cascade it
+  // computed for that same gesture; merging HERE (after the engine's
+  // emission) is what keeps the adjusted successors visible without a second
+  // commit pass. Order is deterministic: onEventUpdate -> onEventsChange.
+  const handleEventsChange = useCallback(
+    (next: GanttEvent<EventData>[]) => {
+      const pending = recorder.consumePendingCascade()
+      if (!pending.length) {
+        setEvents(next)
+        return
+      }
+      setEvents(applyAdjustmentsTo(next, pending))
+    },
+    [recorder],
+  )
+
+  // Mirror adjustments produced outside an engine emission (adding an edge
+  // can bind its successor immediately).
+  const applyAdjustments = useCallback((adjustments: readonly ScheduleAdjustment[]) => {
+    setEvents((prev) => applyAdjustmentsTo(prev, adjustments))
+  }, [])
 
   // ----- bitácora de baselines -----
   // Anchor lookups resolve against this subtree: the tooltip lives in a
@@ -139,6 +178,14 @@ function GanttPlanViewerInner({
   const [highlightedBaseline, setHighlightedBaseline] = useState<string | null>(
     null,
   )
+
+  // Connector click: parked with the pointer position; the panel reads the
+  // edge out of the LIVE plan, so removing/reverting it closes this too.
+  const [dependencyTarget, setDependencyTarget] = useState<{
+    mark: GanttDependencyMark
+    x: number
+    y: number
+  } | null>(null)
 
   // STABLE identity is load-bearing: the engine's per-row layout memo depends
   // on this callback, and a fresh closure per render would rebuild every row.
@@ -254,9 +301,42 @@ function GanttPlanViewerInner({
   )
 
   const ops = useRecorderOps(recorder)
+  const livePlan = useMemo(
+    () => (ops.length ? applyOps(originalPlan, ops) : originalPlan),
+    [ops, originalPlan],
+  )
   const documentOut = useMemo(
-    () => (ops.length ? encodeUpdatedPlan(entity, applyOps(originalPlan, ops), ops.length) : null),
-    [ops, entity, originalPlan],
+    () => (ops.length ? encodeUpdatedPlan(entity, livePlan, ops.length) : null),
+    [ops, entity, livePlan],
+  )
+
+  // Connectors read the LIVE engine events: a violation lights up during the
+  // drag that causes it, before any op is committed to the document.
+  const dependencyMarks = useMemo(
+    () => resolveDependencyMarks(livePlan.dependencies ?? [], events),
+    [livePlan, events],
+  )
+
+  // Derived, not effect-synced: an edge that disappears (removed, reset)
+  // closes the panel during render with no extra pass.
+  const activeDependency =
+    dependencyTarget &&
+    livePlan.dependencies?.some((d) => d.id === dependencyTarget.mark.key)
+      ? dependencyTarget
+      : null
+
+  const handleAddDependency = useCallback(
+    (fromEventId: string, toEventId: string) => {
+      const dep: PlanDependency = {
+        id: crypto.randomUUID(),
+        fromEventId,
+        toEventId,
+        type: "FS",
+      }
+      const adjustments = recorder.addDependency(dep)
+      if (adjustments !== false) applyAdjustments(adjustments)
+    },
+    [recorder, applyAdjustments],
   )
 
   useEffect(() => {
@@ -269,6 +349,7 @@ function GanttPlanViewerInner({
 
   const handleReset = () => {
     setEvents(toGanttEvents(originalPlan))
+    setDependencyTarget(null)
     recorder.reset()
   }
 
@@ -277,8 +358,12 @@ function GanttPlanViewerInner({
       <Gantt<EventData>
         apiRef={apiRef}
         events={events}
-        onEventsChange={setEvents}
+        onEventsChange={handleEventsChange}
         resources={resources}
+        dependencies={dependencyMarks}
+        onDependencyClick={(mark, e) =>
+          setDependencyTarget({ mark, x: e.clientX, y: e.clientY })
+        }
         defaultScale="month"
         locale={LOCALE_ES}
         i18n={I18N_ES}
@@ -324,28 +409,90 @@ function GanttPlanViewerInner({
             </button>
           )
         }}
-        renderEventMenu={({ occurrence }) => (
-          <>
-            <ContextMenuItem onClick={() => captureBaseline(occurrence.event.id)}>
-              <PinIcon aria-hidden /> {APP_STRINGS_ES.setBaseline}
-            </ContextMenuItem>
-            <ContextMenuItem
-              disabled={!occurrence.event.data?.baselines?.length}
-              onClick={() => openHistory(occurrence)}
-            >
-              <HistoryIcon aria-hidden /> {APP_STRINGS_ES.viewBaselines}
-            </ContextMenuItem>
-            <ContextMenuItem
-              variant="destructive"
-              onClick={() => {
-                apiRef.current?.removeEvent(occurrence.event.id)
-                recorder.onEventDelete(occurrence.event.id)
-              }}
-            >
-              <Trash2Icon aria-hidden /> {APP_STRINGS_ES.deleteEvent}
-            </ContextMenuItem>
-          </>
-        )}
+        renderEventMenu={({ occurrence }) => {
+          const selfId = occurrence.event.id
+          const deps = livePlan.dependencies ?? []
+          // Outgoing = this event is the predecessor; incoming = successor.
+          const outgoing = deps.filter((d) => d.fromEventId === selfId)
+          const incoming = deps.filter((d) => d.toEventId === selfId)
+          const titleOf = (id: string) =>
+            events.find((ev) => ev.id === id)?.title ?? id
+          return (
+            <>
+              <ContextMenuItem onClick={() => captureBaseline(occurrence.event.id)}>
+                <PinIcon aria-hidden /> {APP_STRINGS_ES.setBaseline}
+              </ContextMenuItem>
+              <ContextMenuItem
+                disabled={!occurrence.event.data?.baselines?.length}
+                onClick={() => openHistory(occurrence)}
+              >
+                <HistoryIcon aria-hidden /> {APP_STRINGS_ES.viewBaselines}
+              </ContextMenuItem>
+              <ContextMenuSub>
+                <ContextMenuSubTrigger>
+                  <SplineIcon aria-hidden /> {APP_STRINGS_ES.addDependency}
+                </ContextMenuSubTrigger>
+                <ContextMenuSubContent className="max-h-64 overflow-auto">
+                  {events
+                    .filter((ev) => ev.id !== selfId)
+                    .map((ev) => {
+                      const blocked = wouldCreateCycle(deps, selfId, ev.id)
+                      return (
+                        <ContextMenuItem
+                          key={ev.id}
+                          disabled={blocked}
+                          onClick={() =>
+                            handleAddDependency(selfId, ev.id)
+                          }
+                        >
+                          {APP_STRINGS_ES.dependencyTargetLabel(ev.title)}
+                          {blocked && (
+                            <span className="text-muted-foreground ms-2 text-xs">
+                              {APP_STRINGS_ES.dependencyCycleBlocked}
+                            </span>
+                          )}
+                        </ContextMenuItem>
+                      )
+                    })}
+                </ContextMenuSubContent>
+              </ContextMenuSub>
+              {(outgoing.length > 0 || incoming.length > 0) && (
+                <ContextMenuSub>
+                  <ContextMenuSubTrigger>
+                    <UnlinkIcon aria-hidden /> {APP_STRINGS_ES.removeDependency}
+                  </ContextMenuSubTrigger>
+                  <ContextMenuSubContent className="max-h-64 overflow-auto">
+                    {[...outgoing, ...incoming].map((dep) => (
+                      <ContextMenuItem
+                        key={dep.id}
+                        onClick={() => recorder.removeDependency(dep.id)}
+                      >
+                        {APP_STRINGS_ES.dependencyEdgeLabel(
+                          titleOf(
+                            dep.fromEventId === selfId
+                              ? dep.toEventId
+                              : dep.fromEventId,
+                          ),
+                          APP_STRINGS_ES.dependencyTypes[dep.type],
+                          dep.fromEventId === selfId,
+                        )}
+                      </ContextMenuItem>
+                    ))}
+                  </ContextMenuSubContent>
+                </ContextMenuSub>
+              )}
+              <ContextMenuItem
+                variant="destructive"
+                onClick={() => {
+                  apiRef.current?.removeEvent(occurrence.event.id)
+                  recorder.onEventDelete(occurrence.event.id)
+                }}
+              >
+                <Trash2Icon aria-hidden /> {APP_STRINGS_ES.deleteEvent}
+              </ContextMenuItem>
+            </>
+          )
+        }}
         className="h-[560px]"
       >
         <GanttNav>
@@ -385,6 +532,19 @@ function GanttPlanViewerInner({
           onClose={() => setHistoryTarget(null)}
         />
       )}
+      {activeDependency && (
+        <DependencyPanel
+          mark={activeDependency.mark}
+          deps={livePlan.dependencies ?? []}
+          events={events}
+          point={{ x: activeDependency.x, y: activeDependency.y }}
+          onRemove={() => {
+            recorder.removeDependency(activeDependency.mark.key)
+            setDependencyTarget(null)
+          }}
+          onClose={() => setDependencyTarget(null)}
+        />
+      )}
       <div className="flex flex-col gap-3 border-t pt-4">
         <div className="flex items-center gap-2">
           <Badge variant="secondary" data-slot="gantt-ops-count">
@@ -412,6 +572,21 @@ function useRecorderOps(recorder: ChangesetRecorder): ChangeOp[] {
     return recorder.subscribe(() => setOps(recorder.getOps()))
   }, [recorder])
   return ops
+}
+
+/** Pure merge of cascade adjustments into an events array (by event id). */
+function applyAdjustmentsTo(
+  events: GanttEvent<EventData>[],
+  adjustments: readonly ScheduleAdjustment[],
+): GanttEvent<EventData>[] {
+  if (!adjustments.length) return events
+  const byId = new Map(adjustments.map((a) => [a.eventId, a]))
+  return events.map((ev) => {
+    const adj = byId.get(ev.id)
+    return adj
+      ? { ...ev, start: new Date(adj.start), end: new Date(adj.end) }
+      : ev
+  })
 }
 
 /** Deepest WBS level present in the mapped tree (root = 0). */
@@ -646,6 +821,124 @@ function BaselineHistoryPanel({
             </button>
           )
         })}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Floating card for a clicked connector: names both ends, the constraint
+ * type (and lag), and offers the documented removal. Anchored to the CLICK
+ * point; like the baseline panel it closes when anything reflows under it,
+ * so it can never end up describing the wrong edge.
+ */
+function DependencyPanel({
+  mark,
+  deps,
+  events,
+  point,
+  onRemove,
+  onClose,
+}: {
+  mark: GanttDependencyMark
+  deps: readonly PlanDependency[]
+  events: GanttEvent<EventData>[]
+  point: { x: number; y: number }
+  onRemove: () => void
+  onClose: () => void
+}) {
+  const cardRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    const contains = (target: EventTarget | null) =>
+      target instanceof Node && cardRef.current?.contains(target) === true
+    const onPointerDown = (e: PointerEvent) => {
+      if (!contains(e.target)) onClose()
+    }
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose()
+    }
+    const onScroll = (e: Event) => {
+      if (!contains(e.target)) onClose()
+    }
+    const onResize = () => onClose()
+    window.addEventListener("pointerdown", onPointerDown)
+    window.addEventListener("keydown", onKeyDown)
+    window.addEventListener("scroll", onScroll, true)
+    window.addEventListener("resize", onResize)
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown)
+      window.removeEventListener("keydown", onKeyDown)
+      window.removeEventListener("scroll", onScroll, true)
+      window.removeEventListener("resize", onResize)
+    }
+  }, [onClose])
+
+  const dep = deps.find((d) => d.id === mark.key)
+  if (!dep) return null
+  const titleOf = (id: string) =>
+    events.find((ev) => ev.id === id)?.title ?? id
+  const typeLabel = APP_STRINGS_ES.dependencyTypes[dep.type]
+  const left = Math.min(
+    Math.max(point.x, 120),
+    window.innerWidth - 120,
+  )
+
+  return (
+    <div
+      ref={cardRef}
+      role="dialog"
+      aria-label={APP_STRINGS_ES.dependencyAriaLabel(
+        titleOf(dep.fromEventId),
+        titleOf(dep.toEventId),
+        typeLabel,
+      )}
+      tabIndex={-1}
+      data-slot="gantt-dependency-panel"
+      className="bg-popover text-popover-foreground ring-ring/20 fixed z-50 w-max max-w-80 rounded-md py-2 text-xs shadow-md outline-none ring-1"
+      style={{ left, top: point.y + 8, transform: "translateX(-50%)" }}
+      onPointerDown={(e) => e.stopPropagation()}
+    >
+      <div className="flex items-start justify-between gap-4 px-3 pb-1">
+        <span className="font-medium">{APP_STRINGS_ES.dependencyPanelTitle}</span>
+        <button
+          type="button"
+          aria-label={APP_STRINGS_ES.dependencyClose}
+          onClick={onClose}
+          className="text-muted-foreground hover:text-foreground -mr-1 rounded-sm p-1 outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+        >
+          <XIcon className="size-3.5" aria-hidden />
+        </button>
+      </div>
+      <div className="flex items-center gap-1.5 whitespace-nowrap px-3 pb-1">
+        <span className="truncate font-medium">{titleOf(dep.fromEventId)}</span>
+        <SplineIcon className="text-muted-foreground size-3 shrink-0" aria-hidden />
+        <span className="truncate font-medium">{titleOf(dep.toEventId)}</span>
+      </div>
+      <div className="text-muted-foreground flex items-center gap-2 whitespace-nowrap px-3">
+        <span>{typeLabel}</span>
+        {!!dep.lagDays && (
+          <span className="tabular-nums">
+            ({dep.lagDays > 0 ? "+" : ""}
+            {dep.lagDays} d)
+          </span>
+        )}
+        {mark.violated && (
+          <span className="bg-destructive/10 text-destructive rounded-full px-1.5 py-px font-medium">
+            {APP_STRINGS_ES.dependencyViolated}
+          </span>
+        )}
+      </div>
+      <div className="border-t px-1 pt-1 mt-1">
+        <button
+          type="button"
+          data-slot="gantt-dependency-remove"
+          onClick={onRemove}
+          className="text-destructive focus-visible:bg-accent flex w-full items-center gap-1.5 rounded-sm px-2 py-1.5 text-start outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring/50"
+        >
+          <UnlinkIcon className="size-3.5" aria-hidden />
+          {APP_STRINGS_ES.dependencyRemoveAction}
+        </button>
       </div>
     </div>
   )

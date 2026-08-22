@@ -66,4 +66,33 @@ export const APP_STRINGS_ES = {
   closePanel: "Cerrar",
   /** Reason persisted on the load-time LB1 snapshot (see plan-mapper). */
   baselineOriginalReason: "Carga inicial del plan",
+
+  // ----- dependencias -----
+  /** Context-menu submenu over a bar: link this event to a successor. */
+  addDependency: "Agregar dependencia",
+  /** Context-menu submenu: unlink an edge touching this event. */
+  removeDependency: "Quitar dependencia",
+  dependencyTypes: {
+    FS: "Fin → Inicio",
+    SS: "Inicio → Inicio",
+    FF: "Fin → Fin",
+    SF: "Inicio → Fin",
+  } as const,
+  /** Menu entry naming the target event of a prospective edge. */
+  dependencyTargetLabel: (title: string) => `Hacia «${title}»`,
+  /** Menu entry naming one existing edge (direction relative to this event). */
+  dependencyEdgeLabel: (title: string, type: string, outgoing: boolean) =>
+    `${outgoing ? "→" : "←"} ${title} (${type})`,
+  dependencyPanelTitle: "Dependencia",
+  dependencyRemoveAction: "Quitar",
+  dependencyClose: "Cerrar panel de dependencia",
+  /** Connector tooltip/aria text: type + lag between two named events. */
+  dependencyAriaLabel: (fromTitle: string, toTitle: string, type: string) =>
+    `${fromTitle} → ${toTitle} (${type})`,
+  /** Cause badge on auto-adjusted ops in the changeset JSON. */
+  cascadeCauseLegend:
+    "Los ops con «cause» son ajustes automáticos en cascada por dependencias; el resto son ediciones manuales.",
+  dependencyCycleBlocked: "(cerraría un ciclo)",
+  /** Badge on a connector whose constraint the current dates violate. */
+  dependencyViolated: "Fuera de secuencia",
 } as const

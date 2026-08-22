@@ -60,6 +60,25 @@ interface GanttBaselineMark {
   end: Date
 }
 
+/** The four standard scheduling constraints between two bars. */
+type GanttDependencyType = "FS" | "SS" | "FF" | "SF"
+
+/**
+ * One connector between two events, painted as an elbow arrow on an overlay
+ * above the rows. Domain-free like GanttBaselineMark: the consumer resolves
+ * violation semantics; the engine only anchors endpoints by event id and
+ * paints. `key` should be the dependency's own stable id so consumers can
+ * offer edit/delete affordances off a click.
+ */
+interface GanttDependencyMark {
+  key: string
+  fromEventId: GanttBarId
+  toEventId: GanttBarId
+  type?: GanttDependencyType
+  /** Painted destructive when true; semantics are the consumer's call. */
+  violated?: boolean
+}
+
 type GanttWeekday = "MO" | "TU" | "WE" | "TH" | "FR" | "SA" | "SU"
 
 interface GanttRecurrenceRule {
@@ -238,6 +257,8 @@ export type {
   GanttBaselineMark,
   GanttDataAdapter,
   GanttDateRange,
+  GanttDependencyMark,
+  GanttDependencyType,
   GanttDragState,
   GanttBarId,
   GanttInteractions,

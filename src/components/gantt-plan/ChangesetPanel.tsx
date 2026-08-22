@@ -2,6 +2,7 @@ import { useSyncExternalStore } from "react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import type { ChangesetRecorder } from "@/lib/changeset"
+import { APP_STRINGS_ES } from "@/lib/i18n-es"
 import type { UmeJsonEntity } from "@/lib/umejson/schema"
 
 export function ChangesetPanel({
@@ -42,6 +43,13 @@ export function ChangesetPanel({
             <pre className="text-xs overflow-auto max-h-56 rounded-md bg-muted p-3">
               {JSON.stringify(ops, null, 2)}
             </pre>
+          )}
+          {ops.some(
+            (op) => (op.op === "update" || op.op === "create") && "cause" in op,
+          ) && (
+            <p className="text-muted-foreground mt-2 text-xs">
+              {APP_STRINGS_ES.cascadeCauseLegend}
+            </p>
           )}
         </CardContent>
       </Card>

@@ -1,10 +1,17 @@
-import type { PlanJSON, PlanEvent } from "../plan-types.ts"
+import type { PlanDependency, PlanJSON, PlanEvent } from "../plan-types.ts"
 import { SENTINEL, type UmeJsonEntity } from "./schema.ts"
+import type { DependencyCause } from "./schedule.ts"
 
 export type UpdateOp = {
   op: "update"
   id: string
   patch: { start: string; end: string }
+  /**
+   * Why this date changed. Absent on manual edits; a dependency cascade
+   * documents the binding predecessor, constraint type and shift so the
+   * changeset is self-explaining.
+   */
+  cause?: DependencyCause
 }
 
 export type CreateOp = {
@@ -19,6 +26,11 @@ export type CreateOp = {
     color?: string
     data: { responsable: string; fase: string; status: string }
   }
+  /**
+   * Present when a dependency cascade positioned (or repositioned) this new
+   * event; same provenance contract as UpdateOp.cause.
+   */
+  cause?: DependencyCause
 }
 
 export type DeleteOp = {
@@ -26,10 +38,29 @@ export type DeleteOp = {
   id: string
 }
 
-export type ChangeOp = UpdateOp | CreateOp | DeleteOp
+export type AddDependencyOp = {
+  op: "addDependency"
+  dependency: PlanDependency
+}
+
+export type RemoveDependencyOp = {
+  op: "removeDependency"
+  id: string
+}
+
+export type ChangeOp =
+  | UpdateOp
+  | CreateOp
+  | DeleteOp
+  | AddDependencyOp
+  | RemoveDependencyOp
 
 export function applyOps(plan: PlanJSON, ops: ChangeOp[]): PlanJSON {
   let events: PlanEvent[] = plan.events
+  // Dependencies start from the plan's own graph and are rebuilt lazily:
+  // only ops that touch edges replace the array (and a delete prunes it).
+  let dependencies: PlanDependency[] | null = null
+  const deps = () => dependencies ?? (dependencies = plan.dependencies ?? [])
   for (const op of ops) {
     if (op.op === "update") {
       events = events.map((e) =>
@@ -46,11 +77,39 @@ export function applyOps(plan: PlanJSON, ops: ChangeOp[]): PlanJSON {
           progress: op.event.progress,
         },
       ]
-    } else {
+    } else if (op.op === "delete") {
       events = events.filter((e) => e.id !== op.id)
+      // Incident edges die with their endpoint: a dangling ref would fail
+      // decodeUmePlan, so applyOps keeps the document valid by construction.
+      dependencies = deps().filter(
+        (d) => d.fromEventId !== op.id && d.toEventId !== op.id,
+      )
+    } else if (op.op === "addDependency") {
+      const rest = deps().filter((d) => d.id !== op.dependency.id)
+      dependencies = [...rest, op.dependency]
+    } else {
+      dependencies = deps().filter((d) => d.id !== op.id)
     }
   }
-  return { ...plan, events }
+  // The field is only included when there are surviving edges: an empty
+  // array would round-trip differently from "absent" and signal something
+  // the original plan never said. Touching the field (any add/remove/delete)
+  // always produces an explicit value - including the literal ABSENCE of
+  // the key when the touched list becomes empty (delete on a plan with no
+  // deps; delete of the last event that held the only incident edge, etc.).
+  // Spread `...plan` would otherwise resurrect the original field verbatim
+  // (including a `dependencies: undefined` property) and silently undo the
+  // edit, so when the field was touched we rebuild the object without it.
+  let result: PlanJSON = { ...plan, events }
+  if (dependencies !== null) {
+    const { dependencies: _drop, ...rest } = result
+    void _drop
+    result = rest
+    if (dependencies.length > 0) {
+      result = { ...result, dependencies }
+    }
+  }
+  return result
 }
 
 const deepClone = <T>(v: T): T => structuredClone(v)

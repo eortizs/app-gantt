@@ -24,6 +24,24 @@ export interface PlanEvent {
   baselines?: PlanBaseline[]
 }
 
+/**
+ * Scheduling constraint between two events. `from` is the predecessor,
+ * `to` the successor. Types follow the PM standard: FS (finish-to-start,
+ * the default), SS, FF, SF. `lagDays` is calendar days (may be negative
+ * for a lead) — the plan carries no working-calendar, so lag counts every
+ * day including off days.
+ */
+export type DependencyType = "FS" | "SS" | "FF" | "SF"
+
+export interface PlanDependency {
+  /** Unique within the plan; doubles as the connector's stable identity. */
+  id: string
+  fromEventId: string
+  toEventId: string
+  type: DependencyType
+  lagDays?: number
+}
+
 export interface PlanResource {
   id: string
   title: string
@@ -44,6 +62,8 @@ export interface PlanJSON {
   resources: PlanResource[]
   phases: PlanPhase[]
   events: PlanEvent[]
+  /** Scheduling constraints; optional so older documents stay valid. */
+  dependencies?: PlanDependency[]
 }
 
 export type EventData = {

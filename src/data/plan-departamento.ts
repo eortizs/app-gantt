@@ -1,5 +1,5 @@
 import { addDays, startOfWeek } from "date-fns"
-import type { PlanBaseline, PlanEvent, PlanJSON, PlanPhase, PlanResource } from "@/lib/plan-types"
+import type { PlanBaseline, PlanDependency, PlanEvent, PlanJSON, PlanPhase, PlanResource } from "@/lib/plan-types"
 
 export type { PlanBaseline, PlanEvent, PlanResource, PlanPhase, PlanJSON, EventData } from "@/lib/plan-types"
 
@@ -218,12 +218,42 @@ const resources: PlanResource[] = [
   r("acta-entrega", "Acta de entrega", { parentId: "entrega" }),
 ]
 
+/**
+ * Seeded scheduling constraints, chosen against the event offsets so the
+ * demo loads with a readable graph: mostly clean FS chains, one SS (trazo
+ * runs parallel to excavación) and ONE deliberately violated edge
+ * (muros-pa starts before its predecessor finishes), which paints red and
+ * shows what the cascade fixes when a drag triggers it.
+ */
+const dep = (
+  id: string,
+  fromEventId: string,
+  toEventId: string,
+  type: PlanDependency["type"] = "FS",
+  lagDays?: number,
+): PlanDependency => ({ id, fromEventId, toEventId, type, ...(lagDays ? { lagDays } : {}) })
+
+const dependencies: PlanDependency[] = [
+  dep("dep-01", "trazo-nivelacion", "excavacion", "SS"),
+  dep("dep-02", "excavacion", "limpieza-trazos"),
+  dep("dep-03", "contratabes", "columnas-pb"),
+  dep("dep-04", "columnas-pb", "losa-pb"),
+  dep("dep-05", "losa-pb", "columnas-pa"),
+  dep("dep-06", "columnas-pa", "losa-azotea-cimbra"),
+  dep("dep-07", "losa-azotea-cimbra", "losa-azotea-concreto"),
+  dep("dep-08", "muros-bloque-pb", "muros-pa"),
+  dep("dep-09", "electrica-empotrada-pa", "yeso-pintura"),
+  dep("dep-10", "herreria-aluminio", "pruebas-puestas-marcha"),
+  dep("dep-11", "kit-entrega", "acta-entrega"),
+]
+
 export const PLAN: PlanJSON = {
   schemaVersion: 2,
   anchor: anchor.toISOString(),
   resources,
   phases,
   events,
+  dependencies,
 }
 
 export { week as weekOffset, days as daysOffset }

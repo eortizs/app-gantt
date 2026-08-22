@@ -1,8 +1,14 @@
 import type {
+  GanttDependencyMark,
   GanttEvent,
   GanttResource,
 } from "@/components/reui/gantt/gantt-types"
-import type { EventData, PlanJSON, PlanResource } from "@/lib/plan-types"
+import type {
+  EventData,
+  PlanDependency,
+  PlanJSON,
+  PlanResource,
+} from "@/lib/plan-types"
 import { APP_STRINGS_ES } from "@/lib/i18n-es"
 
 export function toGanttEvents(plan: PlanJSON): GanttEvent<EventData>[] {
@@ -120,4 +126,67 @@ function titleize(id: string): string {
     .split("-")
     .map((w) => w[0]?.toUpperCase() + w.slice(1))
     .join(" ")
+}
+
+const DAY_MS = 86_400_000
+
+/**
+ * A constraint is violated when the successor sits EARLIER than the
+ * constraint demands (FS/SS bound the start; FF/SF bound the end). Only
+ * forward violations count - extra slack is healthy float, not a problem.
+ */
+function isViolated(
+  dep: PlanDependency,
+  fromStartMs: number,
+  fromEndMs: number,
+  toStartMs: number,
+  toEndMs: number,
+): boolean {
+  const lag = (dep.lagDays ?? 0) * DAY_MS
+  switch (dep.type) {
+    case "SS":
+      return toStartMs < fromStartMs + lag
+    case "FF":
+      return toEndMs < fromEndMs + lag
+    case "SF":
+      return toEndMs < fromStartMs + lag
+    case "FS":
+    default:
+      return toStartMs < fromEndMs + lag
+  }
+}
+
+/**
+ * Dependency marks for the engine's connector overlay. Dates come from the
+ * LIVE event list (post-drag, post-cascade), so a violation lights up the
+ * moment a drag creates one - before anything is committed to the document.
+ * Edges with unknown endpoints are skipped; the validator rejects those at
+ * decode time anyway.
+ */
+export function resolveDependencyMarks(
+  dependencies: readonly PlanDependency[],
+  events: readonly GanttEvent<EventData>[],
+): GanttDependencyMark[] {
+  if (!dependencies.length || !events.length) return []
+  const byId = new Map(events.map((e) => [e.id, e]))
+  const marks: GanttDependencyMark[] = []
+  for (const dep of dependencies) {
+    const from = byId.get(dep.fromEventId)
+    const to = byId.get(dep.toEventId)
+    if (!from || !to) continue
+    marks.push({
+      key: dep.id,
+      fromEventId: dep.fromEventId,
+      toEventId: dep.toEventId,
+      type: dep.type,
+      violated: isViolated(
+        dep,
+        from.start.getTime(),
+        from.end.getTime(),
+        to.start.getTime(),
+        to.end.getTime(),
+      ),
+    })
+  }
+  return marks
 }

@@ -217,6 +217,98 @@ export function decodeUmePlan(input: unknown): DecodeResult {
         }
       })
     }
+
+    // Grafo de dependencias: opcional; edges are validated as a WHOLE
+    // (refs, duplicates, cycles) after the per-event pass, because an edge
+    // is only meaningful when both endpoints exist.
+    if (plan.dependencies !== undefined) {
+      if (!Array.isArray(plan.dependencies)) {
+        errors.push(err("dynamicProperties.plan.dependencies", "type", "plan.dependencies must be an array"))
+      } else {
+        const eventIds = new Set<string>()
+        if (Array.isArray(plan.events)) {
+          for (const e of plan.events) {
+            if (isObject(e) && typeof e.id === "string") eventIds.add(e.id)
+          }
+        }
+        const depIds = new Set<string>()
+        const edges: Array<{ from: string; to: string; path: string }> = []
+        plan.dependencies.forEach((d, i) => {
+          const dp = `dynamicProperties.plan.dependencies[${i}]`
+          if (!isObject(d)) {
+            errors.push(err(dp, "type", "dependency must be an object"))
+            return
+          }
+          if (typeof d.id !== "string" || d.id === "") {
+            errors.push(err(`${dp}.id`, "type", "dependency.id must be a non-empty string"))
+          } else if (depIds.has(d.id)) {
+            errors.push(err(`${dp}.id`, "unique", `duplicate dependency id "${d.id}"`))
+          } else {
+            depIds.add(d.id)
+          }
+          for (const side of ["fromEventId", "toEventId"] as const) {
+            if (typeof d[side] !== "string" || d[side] === "") {
+              errors.push(err(`${dp}.${side}`, "type", `dependency.${side} must be a non-empty string`))
+            } else if (!eventIds.has(d[side] as string)) {
+              errors.push(err(`${dp}.${side}`, "ref", `dependency references unknown event "${d[side]}"`))
+            }
+          }
+          if (d.fromEventId === d.toEventId && typeof d.fromEventId === "string") {
+            errors.push(err(`${dp}`, "cycle", `dependency "${d.id}" links an event to itself`))
+          }
+          if (
+            d.type !== "FS" && d.type !== "SS" && d.type !== "FF" && d.type !== "SF"
+          ) {
+            errors.push(err(`${dp}.type`, "enum", "dependency.type must be one of FS, SS, FF, SF"))
+          }
+          if (d.lagDays !== undefined && (typeof d.lagDays !== "number" || !Number.isInteger(d.lagDays))) {
+            errors.push(err(`${dp}.lagDays`, "type", "dependency.lagDays must be an integer (negative for lead)"))
+          }
+          if (
+            typeof d.fromEventId === "string" && typeof d.toEventId === "string" &&
+            d.fromEventId !== d.toEventId &&
+            eventIds.has(d.fromEventId) && eventIds.has(d.toEventId)
+          ) {
+            edges.push({ from: d.fromEventId, to: d.toEventId, path: dp })
+          }
+        })
+
+        // Cycle detection: iterative DFS with colors over the VALID edges.
+        // The error is reported at the edge that closes the cycle, so the
+        // document author sees exactly which line to fix. Seed by NODE so
+        // every connected component - including the trivial single-node case
+        // - is visited even when edges are listed out of component order.
+        const succs = new Map<string, Array<{ to: string; path: string }>>()
+        const nodes = new Set<string>()
+        for (const e of edges) {
+          nodes.add(e.from)
+          nodes.add(e.to)
+          const list = succs.get(e.from)
+          if (list) list.push({ to: e.to, path: e.path })
+          else succs.set(e.from, [{ to: e.to, path: e.path }])
+        }
+        const color = new Map<string, 1 | 2>()
+        const stack: string[] = []
+        for (const seed of nodes) {
+          if (color.get(seed)) continue
+          stack.push(seed)
+          while (stack.length) {
+            const id = stack[stack.length - 1]!
+            const state = color.get(id)
+            if (state === 2) { stack.pop(); continue }
+            if (state === 1) { color.set(id, 2); stack.pop(); continue }
+            color.set(id, 1)
+            for (const next of succs.get(id) ?? []) {
+              if (color.get(next.to) === 1) {
+                errors.push(err(next.path, "cycle", `dependency closes a cycle at "${next.to}"`))
+                continue
+              }
+              if (!color.get(next.to)) stack.push(next.to)
+            }
+          }
+        }
+      }
+    }
   }
 
   if (errors.length) return { ok: false, errors }
