@@ -57,6 +57,10 @@ export const APP_STRINGS_ES = {
   /** Drift of a baseline's end vs the current plan end, in whole days. */
   baselineDelta: (d: number) =>
     d === 0 ? "Δ 0 d" : `Δ ${d > 0 ? "+" : ""}${d} d`,
+  /** Baseline span across calendar days. */
+  baselineDurationDays: (d: number) => (d === 1 ? "1 día" : `${d} días`),
+  /** Baseline span within a single calendar day. */
+  baselineDurationHours: (h: number) => (h === 1 ? "1 hora" : `${h} horas`),
   versionShort: (v: number) => `LB${v}`,
   toggleHistoricalBaselines: "Líneas base",
   closePanel: "Cerrar",

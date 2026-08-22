@@ -5,7 +5,7 @@ import {
   useRef,
   useState,
 } from "react"
-import { format } from "date-fns"
+import { differenceInCalendarDays, format } from "date-fns"
 import {
   Gantt,
   type GanttApi,
@@ -42,7 +42,7 @@ import {
 } from "lucide-react"
 import { createChangesetRecorder, type ChangesetRecorder } from "@/lib/changeset"
 import { APP_STRINGS_ES, I18N_ES, LOCALE_ES } from "@/lib/i18n-es"
-import type { EventData, PlanJSON } from "@/lib/plan-types"
+import type { EventData, PlanBaseline, PlanJSON } from "@/lib/plan-types"
 import { toGanttEvents, toGanttResources } from "@/lib/plan-mapper"
 import { applyOps, encodeUpdatedPlan, type ChangeOp } from "@/lib/umejson/codec"
 import { decodeUmePlan, type UmeJsonEntity, type ValidationError } from "@/lib/umejson/schema"
@@ -489,6 +489,19 @@ function GanttScaleSlider() {
 const HISTORY_CARD_HALF_W = 160
 
 /**
+ * A baseline's own span: calendar days when it crosses days (matching how
+ * all-day ranges read), hours when it starts and ends inside the same day.
+ */
+function baselineDurationLabel(b: PlanBaseline): string {
+  const start = new Date(b.start)
+  const end = new Date(b.end)
+  const days = differenceInCalendarDays(end, start)
+  if (days >= 1) return APP_STRINGS_ES.baselineDurationDays(days)
+  const hours = Math.round((end.getTime() - start.getTime()) / 3_600_000)
+  return APP_STRINGS_ES.baselineDurationHours(hours)
+}
+
+/**
  * Floating bitácora for one event: every captured baseline, newest first,
  * each entry showing its end-date drift (Δ) against the current plan.
  * Hovering/focusing an entry cross-highlights its ghost strip on the
@@ -602,7 +615,10 @@ function BaselineHistoryPanel({
             >
               <span className="flex items-center justify-between gap-4">
                 <span className="font-medium tabular-nums">
-                  {APP_STRINGS_ES.versionShort(b.version)}
+                  {APP_STRINGS_ES.versionShort(b.version)}{" "}
+                  <span className="text-muted-foreground font-normal">
+                    ({baselineDurationLabel(b)})
+                  </span>
                 </span>
                 <span
                   className={cn(
