@@ -21,9 +21,9 @@ Editable Gantt viewer (React 19 + Vite 8 + TS 6). Synthetic construction plan de
 - `src/components/gantt-plan/` — app-level viewer (`GanttPlanViewer.tsx` is the **umeJSON black box**) and the changes JSON panel (`ChangesetPanel.tsx`). This is where to add app features.
 - `src/components/reui/gantt/` — **vendored gantt engine** (NOT an npm dep). Edit `gantt.tsx` (main) and siblings here when extending the engine. New generic props for the tree panel live around `gantt.tsx:1215`.
 - `src/components/ui/` — shadcn-style primitives. `slider.tsx` is **custom** (no native `<input type="range">`); it has its own pointer/keyboard handlers.
-- `src/data/plan-departamento.ts` — synthetic plan regenerated on every mount, anchored to the current week (see `:57`). WBS schema v2. Re-exports types from `@/lib/plan-types` for compat.
-- `src/lib/plan-types.ts` — shared types: `PlanJSON`, `PlanEvent`, `PlanResource` (+`responsable?`), `PlanPhase`, `EventData`. `data/` imports types from here, never the other way.
-- `src/lib/plan-mapper.ts` — `PlanJSON` → `GanttEvent[] + GanttResource[]`. Pure on the plan received: phase colors come from `plan.phases`, status is derived from the event's own `progress`, `responsable` comes from `resource.responsable`. Recursive tree builder, preserves sibling order, treats orphans/cycles as roots.
+- `src/data/plan-departamento.ts` — synthetic plan regenerated on every mount, anchored to the current week (see `:57`). WBS schema v2. A few events ship with seeded `baselines` so the bitácora is visible on load; they keep that history (the LB1-at-load rule does NOT prepend a synthetic entry on top). Re-exports types from `@/lib/plan-types` for compat.
+- `src/lib/plan-types.ts` — shared types: `PlanJSON`, `PlanEvent` (+`baselines?`), `PlanBaseline`, `PlanResource` (+`responsable?`), `PlanPhase`, `EventData` (+`baselines?`). `data/` imports types from here, never the other way. The bitácora de líneas base lives in `EventData.baselines` (append-only snapshots; see `plan-mapper.ts` for the LB1-at-load rule).
+- `src/lib/plan-mapper.ts` — `PlanJSON` → `GanttEvent[] + GanttResource[]`. Pure on the plan received: phase colors come from `plan.phases`, status is derived from the event's own `progress`, `responsable` comes from `resource.responsable`. Recursive tree builder, preserves sibling order, treats orphans/cycles as roots. **Synthetic LB1**: events without a persisted `baselines` array get `[{ version: 1, start, end, capturedAt: plan.anchor, reason: "Carga inicial del plan" }]`, so the very first explicit *Fijar línea base* on any task yields a two-entry log (the default + the new one). Events that already carry history keep theirs.
 - `src/lib/umejson/schema.ts` — `UmeJsonEntity` type + `decodeUmePlan()` hand-rolled validator (envelope + payload). Exports `SENTINEL = "RESERVED_FOR_SYSTEM"` and `ENTITY_NAME = "GanttPlan"`.
 - `src/lib/umejson/codec.ts` — anti-corruption layer: `ChangeOp` union (UpdateOp/CreateOp/DeleteOp), pure `applyOps(plan, ops)`, `encodeUpdatedPlan(base, plan, opCount)`. The recorder re-exports `ChangeOp` from here.
 - `src/lib/changeset.ts` — `ChangesetRecorder` accepts a `createDraft(slot)` opt; the draft is the host module's responsibility (the recorder doesn't know the domain).
@@ -53,11 +53,16 @@ pnpm lint && pnpm build && pnpm verify
 
 ## Deploy
 
+`https://gantt.aeon-ia.com/` is the live demo for this project. **Every change set ships to it** — verification passing is not enough, the user is on this subdomain. Treat the next command as a fourth step of the workflow above; do NOT finish a task without running it.
+
 ```
 pnpm build && rsync -a --delete dist/ /var/www/apps/gantt/
 ```
 
-Served by nginx as `https://gantt.aeon-ia.com/`. Don't skip `--delete` (stale assets linger otherwise).
+- `pnpm build` regenerates `dist/` with a new content-hashed bundle name; the rsync below only overwrites what exists.
+- `--delete` is mandatory — stale hashed assets linger otherwise and nginx happily serves them.
+- After the rsync, confirm the deployment took: `curl -s https://gantt.aeon-ia.com/ | grep -oE 'assets/index-[A-Za-z0-9_-]+\.js'` should match the hash printed by `pnpm build`. If it doesn't, the rsync didn't land.
+- If the user reports "no veo cambios", they are almost certainly hitting a cached `index.html` (assets are hash-busted and update on their own). Suggest a hard reload (Ctrl+Shift+R / Cmd+Shift+R) and re-check the served bundle hash against `ls dist/assets/`.
 
 ## Gotchas
 
