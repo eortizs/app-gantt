@@ -318,7 +318,7 @@ function GanttPlanViewerInner({
                 dismiss()
                 openHistory(occurrence)
               }}
-              className="mt-0.5 font-medium underline underline-offset-2"
+              className="mt-0.5 cursor-pointer font-medium underline underline-offset-2"
             >
               {APP_STRINGS_ES.baselinesLink(count)}
             </button>
