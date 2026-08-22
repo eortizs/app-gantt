@@ -276,6 +276,19 @@ interface TimelineRowBars {
    * present only on group rows without bars of their own.
    */
   summary: { from: number; to: number; progress: number | null } | null
+  /**
+   * Baseline-history ghost strips for this row's events, as track fractions
+   * (same coordinate system as the bars, clamped to the visible range).
+   * `stack` fans multiple strips below a bar's bottom edge - 0 is the newest,
+   * which hugs the bar; older baselines sit below it.
+   */
+  baselines: Array<{
+    key: string
+    lane: number
+    stack: number
+    from: number
+    to: number
+  }>
 }
 
 interface TimelineReorderState {
@@ -285,6 +298,9 @@ interface TimelineReorderState {
   valid: boolean
   proposal: GanttResourceReorder | null
 }
+
+/** Shared identity for rows without baseline history; keeps row props stable. */
+const EMPTY_BASELINES: TimelineRowBars["baselines"] = []
 
 interface GanttViewProps extends useRender.ComponentProps<"div"> {
   /** Day-scale unit interval in minutes; defaults to the interval view config. */
@@ -858,8 +874,52 @@ function GanttView({
       const heightRem = Math.max(minRowRem, blockRem + 2 * rowPaddingRem)
       const laneOffsetRem = (heightRem - blockRem) / 2
 
+      // Baseline-history ghosts: consumer-supplied ranges per event, clamped
+      // to the visible range exactly like segments so the two can never
+      // disagree on geometry. Input is chronological; the LAST mark hugs its
+      // bar's bottom edge and older ones fan downward while the row's padding
+      // has room (strips are h-1 with a 5px pitch; the rest stay reachable
+      // through the consumer's history panel).
+      let baselines: TimelineRowBars["baselines"] = EMPTY_BASELINES
+      const getBaselines = viewConfig.getEventBaselines
+      if (getBaselines && segments.length > 0) {
+        // laneOffsetRem mirrors below the last lane; rem -> px at the root's
+        // 16px reference (strip geometry itself is px-sized Tailwind)
+        const maxStack = Math.max(1, Math.floor((laneOffsetRem * 16 + 2) / 5))
+        const seen = new Set<string>()
+        const list: TimelineRowBars["baselines"] = []
+        for (const segment of segments) {
+          const marks = getBaselines({ event: segment.occurrence.event })
+          if (!marks?.length) continue
+          const lane = segment.column ?? 0
+          for (let stack = 0; stack < marks.length && stack < maxStack; stack++) {
+            const mark = marks[marks.length - 1 - stack]
+            if (!mark || seen.has(mark.key)) continue
+            const fromMin = Math.max(
+              (mark.start.getTime() - rangeStartMs) / 60000,
+              0
+            )
+            const toMin = Math.min(
+              (mark.end.getTime() - rangeStartMs) / 60000,
+              totalMin
+            )
+            if (toMin <= fromMin) continue // entirely outside the visible range
+            seen.add(mark.key)
+            list.push({
+              key: mark.key,
+              lane,
+              stack,
+              from: fromMin / totalMin,
+              to: toMin / totalMin,
+            })
+          }
+        }
+        if (list.length > 0) baselines = list
+      }
+
       map.set(row.resource.id, {
         segments,
+        baselines,
         laneCount,
         draftLane: null,
         scheduleMode: mode,
@@ -901,6 +961,7 @@ function GanttView({
     rangeEndMs,
     settings.i18n,
     viewConfig.summaryBars,
+    viewConfig.getEventBaselines,
     descendantIds,
     subtreeProgress,
     laneHeightRem,
@@ -3293,6 +3354,37 @@ const GanttTimelineRow = memo(function GanttTimelineRow({
         className="pointer-events-none absolute inset-0"
         style={{ contentVisibility: "auto" }}
       >
+        {/* Baseline ghosts: painted BEFORE the segments so the current plan
+            always stays on top, and pointer-transparent like the layer itself
+            - history must never steal hover, click or drag from a live bar.
+            The newest strip straddles its bar's bottom edge; when baseline and
+            plan coincide it reads as a quiet 2px lip, drift fans it out. */}
+        {bars?.baselines.map((bl) => {
+          const laneTopRem =
+            laneOffsetRem + bl.lane * (laneHeightRem + laneGapRem)
+          return (
+            <span
+              key={bl.key}
+              data-slot="gantt-bar-baseline"
+              data-baseline-key={bl.key}
+              data-highlighted={viewConfig.highlightedBaselineKeys?.includes(
+                bl.key
+              ) || undefined}
+              aria-hidden="true"
+              className={cn(
+                "pointer-events-none absolute z-[5] h-1 -translate-y-1/2 rounded-[3px] border border-dashed border-muted-foreground/60 bg-muted-foreground/10 transition-colors duration-100",
+                "data-highlighted:border-solid data-highlighted:border-muted-foreground data-highlighted:bg-muted-foreground/50"
+              )}
+              style={{
+                insetInlineStart: `${bl.from * 100}%`,
+                width: `${Math.max((bl.to - bl.from) * 100, 0.5)}%`,
+                top: `${
+                  laneTopRem + laneHeightRem + bl.stack * 0.3125
+                }rem`,
+              }}
+            />
+          )
+        })}
         {segments.map((segment, segmentIndex) => {
           const from = fractionOf(
             rangeStartMs + (segment.startMin ?? 0) * 60000

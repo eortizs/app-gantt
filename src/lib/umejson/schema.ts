@@ -187,6 +187,34 @@ export function decodeUmePlan(input: unknown): DecodeResult {
         if (typeof e.phaseId === "string" && !phaseIds.has(e.phaseId)) {
           errors.push(err(`dynamicProperties.plan.events[${i}].phaseId`, "ref", `event references unknown phase "${e.phaseId}"`))
         }
+        // Bitácora de baselines: opcional; entries are immutable snapshots.
+        if (e.baselines !== undefined) {
+          if (!Array.isArray(e.baselines)) {
+            errors.push(err(`dynamicProperties.plan.events[${i}].baselines`, "type", "event.baselines must be an array"))
+          } else {
+            const versions = new Set<number>()
+            e.baselines.forEach((b, j) => {
+              const bp = `dynamicProperties.plan.events[${i}].baselines[${j}]`
+              if (!isObject(b)) {
+                errors.push(err(bp, "type", "baseline must be an object"))
+                return
+              }
+              if (typeof b.version !== "number" || !Number.isInteger(b.version) || b.version < 1) {
+                errors.push(err(`${bp}.version`, "type", "baseline.version must be an integer >= 1"))
+              } else if (versions.has(b.version)) {
+                errors.push(err(`${bp}.version`, "unique", `duplicate baseline version "${b.version}"`))
+              } else {
+                versions.add(b.version)
+              }
+              if (!isIsoDate(b.start)) errors.push(err(`${bp}.start`, "iso", "baseline.start must be ISO date string"))
+              if (!isIsoDate(b.end)) errors.push(err(`${bp}.end`, "iso", "baseline.end must be ISO date string"))
+              if (!isIsoDate(b.capturedAt)) errors.push(err(`${bp}.capturedAt`, "iso", "baseline.capturedAt must be ISO date string"))
+              if (b.reason !== undefined && typeof b.reason !== "string") {
+                errors.push(err(`${bp}.reason`, "type", "baseline.reason must be a string"))
+              }
+            })
+          }
+        }
       })
     }
   }

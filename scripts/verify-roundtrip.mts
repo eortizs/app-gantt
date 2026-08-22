@@ -52,7 +52,17 @@ const fixturePlan: PlanJSON = {
     { id: "child", title: "Child", parentId: "root" },
   ],
   events: [
-    { id: "e1", resourceId: "child", start: ISO, end: ISO, progress: 50 },
+    {
+      id: "e1",
+      resourceId: "child",
+      start: ISO,
+      end: ISO,
+      progress: 50,
+      baselines: [
+        { version: 1, start: ISO, end: ISO, capturedAt: ISO },
+        { version: 2, start: ISO, end: ISO, capturedAt: ISO, reason: "Re-plan" },
+      ],
+    },
   ],
 }
 
@@ -151,6 +161,58 @@ for (const [label, input] of rejectionCases) {
   else if (out.markdownDocumentation !== fixtureEntity.markdownDocumentation) fail("encode: markdown preserved", "differs")
   else if (fixtureEntity.lifecycle.updatedAt !== ISO) fail("encode: input untouched", "updatedAt changed on input")
   else ok("encode: clone + sentinel + version + statusLog + markdown preserved")
+}
+
+// ---- 6. Bitácora de baselines ------------------------------------------------
+{
+  // The baseline history must survive encode untouched (append-only log).
+  const encoded = encodeUpdatedPlan(fixtureEntity, fixturePlan, 0)
+  const out = encoded.dynamicProperties.plan.events[0]?.baselines
+  if (!deepEqual(out, fixturePlan.events[0]?.baselines)) {
+    fail("baselines: preserved through encode", "history differs after encode")
+  } else {
+    ok("baselines: preserved through encode")
+  }
+
+  // A date update rewrites start/end but must never touch the history.
+  const next = applyOps(fixturePlan, [
+    { op: "update", id: "e1", patch: { start: ISO, end: ISO } },
+  ])
+  const after = next.events[0]?.baselines
+  if (!deepEqual(after, fixturePlan.events[0]?.baselines)) {
+    fail("baselines: untouched by update op", "history changed on update")
+  } else {
+    ok("baselines: untouched by update op")
+  }
+
+  // Decoder rejections for malformed history entries.
+  const baselineEvent = fixturePlan.events[0]
+  const withBaselines = (baselines: unknown): unknown => ({
+    ...fixtureEntity,
+    dynamicProperties: {
+      plan: { ...fixturePlan, events: [{ ...baselineEvent, baselines }] },
+    },
+  })
+  const baselineRejections: Array<[string, unknown]> = [
+    ["baselines: not an array", withBaselines("nope")],
+    ["baselines: version 0", withBaselines([{ version: 0, start: ISO, end: ISO, capturedAt: ISO }])],
+    ["baselines: duplicate version", withBaselines([
+      { version: 1, start: ISO, end: ISO, capturedAt: ISO },
+      { version: 1, start: ISO, end: ISO, capturedAt: ISO },
+    ])],
+    ["baselines: bad capturedAt", withBaselines([{ version: 1, start: ISO, end: ISO, capturedAt: "nope" }])],
+    ["baselines: entry not an object", withBaselines(["v1"])],
+  ]
+  for (const [label, input] of baselineRejections) {
+    const decoded = decodeUmePlan(input)
+    if (decoded.ok) fail(`reject: ${label}`, "decoder accepted it")
+    else ok(`reject: ${label}`)
+  }
+
+  // And the happy path: a valid history decodes fine.
+  const decoded = decodeUmePlan(fixtureEntity)
+  if (!decoded.ok) fail("baselines: valid history decodes", decoded.errors[0]?.message ?? "rejected")
+  else ok("baselines: valid history decodes")
 }
 
 if (fails.length) {

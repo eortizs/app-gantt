@@ -42,6 +42,10 @@ interface GanttI18nConfig {
     progress: (percent: number) => string
     /** Live duration readout on the resize indicator. */
     durationDays: (days: number) => string
+    /** Bar hover tooltip: "Start Date" label. */
+    startDate: string
+    /** Bar hover tooltip: "End Date" label. */
+    endDate: string
     /** Appended to the bar aria-label when its segment is clipped by the range. */
     continues: string
     scales: {
@@ -110,6 +114,8 @@ const DEFAULT_LABELS: GanttI18nConfig["labels"] = {
   jumpToBar: (title) => `Scroll to "${title}"`,
   progress: (percent) => `${percent}% complete`,
   durationDays: (days) => (days === 1 ? "1 day" : `${days} days`),
+  startDate: "Start Date",
+  endDate: "End Date",
   continues: "continues",
   scales: {
     day: "Day",

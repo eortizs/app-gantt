@@ -31,6 +31,7 @@ import {
 } from "@/components/reui/gantt/gantt-lib"
 import type {
   GanttBarId,
+  GanttBaselineMark,
   GanttDateRange,
   GanttDragState,
   GanttEvent,
@@ -1250,6 +1251,14 @@ interface GanttRenderEventProps<TData = unknown> {
   isSelected: boolean
 }
 
+/** Slot appended inside the built-in hover tooltip (links, badges, actions). */
+interface GanttTooltipExtrasProps<TData = unknown> {
+  occurrence: GanttOccurrence<TData>
+  segment: GanttSegment<TData>
+  /** Closes the tooltip immediately; call it before opening your own popup. */
+  dismiss: () => void
+}
+
 /**
  * View-layer configuration: display props and render overrides. These live on
  * <Gantt> (and per-view components), never in the headless options.
@@ -1448,6 +1457,30 @@ interface GanttViewConfig<TData = unknown> {
     resource: GanttResource
     events: GanttEvent<TData>[]
   }) => number | null
+  /**
+   * Extra rows appended inside the built-in hover tooltip (links, badges).
+   * `dismiss` closes the tooltip - call it before opening your own popup so
+   * the two never stack. Omit or return null for no extras.
+   */
+  renderTooltipExtras?: (props: GanttTooltipExtrasProps<TData>) => ReactNode
+  /**
+   * Historical baseline ranges per event, painted as pointer-transparent
+   * ghost strips BEHIND their bar (the current plan always stays on top).
+   * Return marks in CHRONOLOGICAL order: the last entry hugs its bar's
+   * bottom edge and older ones fan out below it. Memoize the callback - it
+   * runs inside the per-row layout memo, and a fresh identity every render
+   * would rebuild every row. Omit for none.
+   */
+  getEventBaselines?: (ctx: {
+    event: GanttEvent<TData>
+  }) => GanttBaselineMark[]
+  /**
+   * Baseline mark keys currently emphasized (e.g. hovered in a consumer's
+   * history panel); matching strips render highlighted. Pass a memoized
+   * array or undefined - array identity is compared, so a fresh literal per
+   * render would re-render every row.
+   */
+  highlightedBaselineKeys?: string[]
 }
 
 const DEFAULT_VIEW_CONFIG: GanttViewConfig = {
@@ -1531,6 +1564,9 @@ const VIEW_CONFIG_KEYS: Array<keyof GanttViewConfig> = [
   "renderScheduleHint",
   "renderSummary",
   "getSummaryProgress",
+  "renderTooltipExtras",
+  "getEventBaselines",
+  "highlightedBaselineKeys",
 ]
 
 interface GanttProps<TData = unknown>
@@ -1730,6 +1766,7 @@ export {
 export type {
   GanttActivationConfig,
   GanttApi,
+  GanttBaselineMark,
   GanttCallbacks,
   GanttClassNames,
   GanttColumn,
@@ -1747,6 +1784,7 @@ export type {
   GanttSettings,
   GanttSummaryProps,
   GanttTimelineLines,
+  GanttTooltipExtrasProps,
   GanttTreePanelConfig,
   GanttViewConfig,
   UseGanttStateOptions,

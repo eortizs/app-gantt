@@ -46,6 +46,20 @@ interface GanttDateRange {
   end: Date
 }
 
+/**
+ * One historical baseline range of an event, drawn as a pointer-transparent
+ * ghost strip behind its bar. Domain-free on purpose: the engine never knows
+ * WHERE history is stored, only how to paint what the consumer hands over.
+ */
+interface GanttBaselineMark {
+  /** Stable identity (e.g. `${eventId}::v${version}`); powers cross-highlighting. */
+  key: string
+  /** Optional display label; opaque to the engine. */
+  label?: string
+  start: Date
+  end: Date
+}
+
 type GanttWeekday = "MO" | "TU" | "WE" | "TH" | "FR" | "SA" | "SU"
 
 interface GanttRecurrenceRule {
@@ -221,6 +235,7 @@ interface GanttDataAdapter<TData = unknown> {
 
 export type {
   GanttEvent,
+  GanttBaselineMark,
   GanttDataAdapter,
   GanttDateRange,
   GanttDragState,

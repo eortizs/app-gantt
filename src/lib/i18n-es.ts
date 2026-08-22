@@ -25,6 +25,8 @@ export const I18N_ES: GanttI18nOverrides = {
     jumpToBar: (title) => `Ir a "${title}"`,
     progress: (p) => `${p}% completado`,
     durationDays: (d) => (d === 1 ? "1 día" : `${d} días`),
+    startDate: "Fecha de inicio",
+    endDate: "Fecha de fin",
     continues: "continúa",
     scales: {
       day: "Día",
@@ -43,3 +45,21 @@ export const I18N_ES: GanttI18nOverrides = {
 }
 
 export const LOCALE_ES = es
+
+export const APP_STRINGS_ES = {
+  deleteEvent: "Borrar",
+  setBaseline: "Fijar línea base",
+  viewBaselines: "Historial de líneas base",
+  baselinesLink: (n: number) => `Líneas base (${n})`,
+  baselinesTitle: "Historial de líneas base",
+  currentPlan: "Plan actual",
+  baselineCaptured: "Capturado",
+  /** Drift of a baseline's end vs the current plan end, in whole days. */
+  baselineDelta: (d: number) =>
+    d === 0 ? "Δ 0 d" : `Δ ${d > 0 ? "+" : ""}${d} d`,
+  versionShort: (v: number) => `LB${v}`,
+  toggleHistoricalBaselines: "Líneas base",
+  closePanel: "Cerrar",
+  /** Reason persisted on the load-time LB1 snapshot (see plan-mapper). */
+  baselineOriginalReason: "Carga inicial del plan",
+} as const

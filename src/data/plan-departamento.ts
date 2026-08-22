@@ -1,7 +1,7 @@
 import { addDays, startOfWeek } from "date-fns"
-import type { PlanEvent, PlanJSON, PlanPhase, PlanResource } from "@/lib/plan-types"
+import type { PlanBaseline, PlanEvent, PlanJSON, PlanPhase, PlanResource } from "@/lib/plan-types"
 
-export type { PlanEvent, PlanResource, PlanPhase, PlanJSON, EventData } from "@/lib/plan-types"
+export type { PlanBaseline, PlanEvent, PlanResource, PlanPhase, PlanJSON, EventData } from "@/lib/plan-types"
 
 export const RESPONSABLES: Record<string, string> = {
   "departamento-merida": "Residencia",
@@ -81,6 +81,27 @@ const event = (
   progress,
 })
 
+/**
+ * Seeds a baseline history on an event: each entry is a `[startOffset,
+ * durationDays]` pair captured ten days before its own window, so versions
+ * ascend in time like a real re-baselining log.
+ */
+const withBaselines = (
+  e: PlanEvent,
+  ...windows: Array<[number, number]>
+): PlanEvent => ({
+  ...e,
+  baselines: windows.map(
+    ([startOffset, durationDays], i): PlanBaseline => ({
+      version: i + 1,
+      start: days(startOffset).toISOString(),
+      end: days(startOffset + durationDays).toISOString(),
+      capturedAt: days(startOffset - 10).toISOString(),
+      reason: "Línea base aprobada",
+    }),
+  ),
+})
+
 const events: PlanEvent[] = [
   event("trazo-nivelacion", "trazo-nivelacion", -10 * 7, 7, 100, "preliminares"),
   event("excavacion", "excavacion", -10 * 7, 14, 100, "preliminares"),
@@ -93,19 +114,29 @@ const events: PlanEvent[] = [
   event("impermeabilizacion-ciment", "impermeabilizacion-ciment", -5 * 7, 7, 100, "cimentacion"),
 
   event("columnas-pb", "columnas-pb", -5 * 7, 7, 100, "estructura"),
-  event("losa-pb", "losa-pb", -4 * 7, 14, 85, "estructura"),
+  withBaselines(
+    event("losa-pb", "losa-pb", -4 * 7, 14, 85, "estructura"),
+    [-4 * 7 - 3, 10],
+  ),
   event("columnas-pa", "columnas-pa", -2 * 7, 7, 70, "estructura"),
   event("losa-azotea-cimbra", "losa-azotea-cimbra", -1 * 7, 7, 60, "estructura"),
   event("losa-azotea-concreto", "losa-azotea-concreto", 0, 7, 50, "estructura"),
 
   event("muros-bloque-pb", "muros-bloque-pb", -1 * 7, 21, 40, "albanileria"),
-  event("muros-pa", "muros-pa", 1 * 7, 21, 25, "albanileria"),
+  withBaselines(
+    event("muros-pa", "muros-pa", 1 * 7, 21, 25, "albanileria"),
+    [0, 14],
+  ),
   event("castillos-cadenas", "castillos-cadenas", 3 * 7, 14, 10, "albanileria"),
   event("firmes", "firmes", 4 * 7, 14, 0, "albanileria"),
 
   event("electrica-empotrada-pb", "electrica-empotrada-pb", 2 * 7, 21, 15, "instalaciones"),
   event("electrica-empotrada-pa", "electrica-empotrada-pa", 5 * 7, 14, 5, "instalaciones"),
-  event("hidrosanitaria", "hidrosanitaria", 3 * 7, 28, 10, "instalaciones"),
+  withBaselines(
+    event("hidrosanitaria", "hidrosanitaria", 3 * 7, 28, 10, "instalaciones"),
+    [3 * 7 - 7, 21],
+    [3 * 7 - 3, 24],
+  ),
   event("gas", "gas", 6 * 7, 14, 0, "instalaciones"),
   event("voz-datos", "voz-datos", 6 * 7, 14, 0, "instalaciones"),
 

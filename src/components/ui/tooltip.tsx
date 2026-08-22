@@ -17,6 +17,10 @@ function TooltipProvider({
   )
 }
 
+function TooltipPortal(props: TooltipPrimitive.Portal.Props) {
+  return <TooltipPrimitive.Portal data-slot="tooltip-portal" {...props} />
+}
+
 function Tooltip({ ...props }: TooltipPrimitive.Root.Props) {
   return <TooltipPrimitive.Root data-slot="tooltip" {...props} />
 }
@@ -63,4 +67,4 @@ function TooltipContent({
   )
 }
 
-export { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider }
+export { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider, TooltipPortal }

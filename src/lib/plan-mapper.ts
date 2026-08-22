@@ -3,6 +3,7 @@ import type {
   GanttResource,
 } from "@/components/reui/gantt/gantt-types"
 import type { EventData, PlanJSON, PlanResource } from "@/lib/plan-types"
+import { APP_STRINGS_ES } from "@/lib/i18n-es"
 
 export function toGanttEvents(plan: PlanJSON): GanttEvent<EventData>[] {
   const byId = new Map(plan.resources.map((r) => [r.id, r]))
@@ -15,6 +16,23 @@ export function toGanttEvents(plan: PlanJSON): GanttEvent<EventData>[] {
   return plan.events.map((e) => {
     const phaseId = resolvePhaseId(e.resourceId, byId) ?? ""
     const resource = byId.get(e.resourceId)
+    // Load-time snapshot: every event carries at least LB1, the plan AS
+    // LOADED. Events with a persisted history keep theirs (their LB1 was
+    // captured when the document was authored); the rest get one synthesized
+    // from their own dates. This is what makes the first explicit capture a
+    // TWO-entry log - the default line plus the new one.
+    const baselines =
+      e.baselines && e.baselines.length > 0
+        ? e.baselines
+        : [
+            {
+              version: 1,
+              start: e.start,
+              end: e.end,
+              capturedAt: plan.anchor,
+              reason: APP_STRINGS_ES.baselineOriginalReason,
+            },
+          ]
     return {
       id: e.id,
       title: resource?.title ?? titleize(e.resourceId),
@@ -28,6 +46,7 @@ export function toGanttEvents(plan: PlanJSON): GanttEvent<EventData>[] {
         responsable: resource?.responsable ?? "—",
         fase: phaseId,
         status: statusFor(e.progress),
+        baselines,
       },
     }
   })

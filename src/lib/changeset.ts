@@ -17,6 +17,7 @@ export interface ChangesetRecorder {
   getOps(): ChangeOp[]
   reset(): void
   onEventUpdate(p: GanttProposedUpdate<EventData>): GanttUpdateResult
+  onEventDelete(eventId: string): void
   canSelectSlot(slot: GanttSlotDraft): boolean
   onSelectSlot(slot: GanttSlotDraft): void
 }
@@ -68,6 +69,15 @@ export function createChangesetRecorder(
       })
       notify()
       return true
+    },
+    onEventDelete(eventId) {
+      const existing = opsMap.get(eventId)
+      if (existing?.op === "create") {
+        opsMap.delete(eventId)
+      } else {
+        opsMap.set(eventId, { op: "delete", id: eventId })
+      }
+      notify()
     },
     canSelectSlot(slot) {
       if (!slot.resourceId) return false
