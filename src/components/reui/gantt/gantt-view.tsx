@@ -3827,8 +3827,10 @@ function dependencySides(type: GanttDependencyMark["type"]): {
  *
  * Routing is collision-aware: the vertical channel sweeps to the nearest
  * strip of free canvas (never crossing a bar), and the arrow enters the
- * target from OUTSIDE - wrapping around into the far edge when the free
- * channel lands past the bar. A link whose endpoint row is collapsed
+ * target from OUTSIDE - swinging back across the row gap into the start
+ * edge when the free channel lands past the bar, so a link always reads
+ * end-of-predecessor to start-of-successor. A link whose endpoint row is
+ * collapsed
  * retargets to the nearest rendered ancestor group's rollup; with none
  * either, it drops out rather than pointing into empty space.
  *
@@ -3981,8 +3983,9 @@ const GanttDependencyLayer = memo(function GanttDependencyLayer({
 
     // Bar rectangles for collision-aware routing. The connector's vertical
     // channel must ride FREE canvas: it never crosses a bar, and when the
-    // free channel lands past the target's far edge, the arrow wraps around
-    // and enters from outside that edge instead of cutting through the bar.
+    // free channel lands past the target's far edge, a start-entry link
+    // swings back on the row gap and enters from outside the start edge
+    // instead of cutting through the bar or docking at its end.
     const barRects: Array<{
       x1: number
       x2: number
@@ -4057,8 +4060,10 @@ const GanttDependencyLayer = memo(function GanttDependencyLayer({
 
       // Entry edge: whichever side of the target bar the channel can reach
       // from OUTSIDE. Left of the bar enters the start edge (arrow points
-      // right); right of the bar wraps around into the end edge (arrow
-      // points left) - the connector circles the bar instead of invading it.
+      // right); past the far edge, a start-entry link swings back on the
+      // row gap and still enters the start edge - a dependency always reads
+      // end-of-predecessor to start-of-successor, never docks at the far
+      // edge.
       const targetRect =
         barRects.find((r) => r.eventId === mark.toEventId) ?? null
       let entryX = to.x
@@ -4068,8 +4073,14 @@ const GanttDependencyLayer = memo(function GanttDependencyLayer({
         entryX = targetRect.x1
         arrowDir = 1
       } else if (targetRect && channel > targetRect.x2 + 0.5) {
-        entryX = targetRect.x2
-        arrowDir = -1
+        if (toSide === "start") {
+          wrap = true
+          entryX = targetRect.x1
+          arrowDir = 1
+        } else {
+          entryX = targetRect.x2
+          arrowDir = -1
+        }
       } else if (
         !targetRect &&
         ((arrowDir === 1 && channel > to.x + 0.5) ||
