@@ -56,14 +56,18 @@ const days = (n: number) => addDays(anchor, n)
 
 const anchor = startOfWeek(new Date(), { weekStartsOn: 1 })
 
+// Concrete hexes (Tailwind v4 500-level), NOT `var()` references: the whole
+// paint chain (bars, baseline tones, swatches) then works without any
+// runtime CSS-variable resolution, which is silently unreliable across
+// browsers.
 const phases: PlanPhase[] = [
-  { id: "preliminares", title: "Preliminares", color: "var(--color-stone-500)" },
-  { id: "cimentacion", title: "Cimentación", color: "var(--color-sky-500)" },
-  { id: "estructura", title: "Estructura", color: "var(--color-blue-500)" },
-  { id: "albanileria", title: "Albañilería", color: "var(--color-amber-500)" },
-  { id: "instalaciones", title: "Instalaciones", color: "var(--color-teal-500)" },
-  { id: "acabados", title: "Acabados", color: "var(--color-violet-500)" },
-  { id: "entrega", title: "Entrega", color: "var(--color-emerald-500)" },
+  { id: "preliminares", title: "Preliminares", color: "#78716c" },
+  { id: "cimentacion", title: "Cimentación", color: "#0ea5e9" },
+  { id: "estructura", title: "Estructura", color: "#3b82f6" },
+  { id: "albanileria", title: "Albañilería", color: "#f59e0b" },
+  { id: "instalaciones", title: "Instalaciones", color: "#14b8a6" },
+  { id: "acabados", title: "Acabados", color: "#8b5cf6" },
+  { id: "entrega", title: "Entrega", color: "#10b981" },
 ]
 
 const event = (

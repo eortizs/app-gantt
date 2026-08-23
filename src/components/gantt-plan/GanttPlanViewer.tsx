@@ -22,6 +22,7 @@ import {
   GanttTitle,
 } from "@/components/reui/gantt/gantt-nav"
 import { GanttView } from "@/components/reui/gantt/gantt-view"
+import { barTones, baselineTones, DIRTY_LIGHT } from "@/components/reui/gantt/gantt-color"
 import type {
   GanttEvent,
   GanttOccurrence,
@@ -198,6 +199,7 @@ function GanttPlanViewerInner({
       return visible.map((b) => ({
         key: `${event.id}::baseline-v${b.version}`,
         label: APP_STRINGS_ES.versionShort(b.version),
+        color: event.color,
         start: new Date(b.start),
         end: new Date(b.end),
       }))
@@ -210,6 +212,121 @@ function GanttPlanViewerInner({
     () => (highlightedBaseline ? [highlightedBaseline] : undefined),
     [highlightedBaseline],
   )
+
+  // ----- bitono: resting pastel / progress overlay per event -----
+  // Dirty = the LIVE event's dates differ from the vigente baseline (the
+  // highest-version entry of data.baselines). When they line up, the
+  // resting fill is the phase's 80% pastel; when they don't, it's gray-200
+  // to signal "unsynced". The progress overlay keeps the phase's full
+  // color either way - only the resting surface shifts to communicate
+  // drift. Drag->release and Fijar línea base both flow through `events`,
+  // so this map stays in sync without an effect.
+  const barToneByEventId = useMemo(() => {
+    const map = new Map<
+      string,
+      { resting: string; progress: string } | undefined
+    >()
+    for (const ev of events) {
+      const history = ev.data?.baselines ?? []
+      const vigente = history.length
+        ? history.reduce((max, b) => (b.version > max.version ? b : max))
+        : null
+      const dirty =
+        !!vigente &&
+        (ev.start.getTime() !== new Date(vigente.start).getTime() ||
+          ev.end.getTime() !== new Date(vigente.end).getTime())
+      const tones = barTones(ev.color)
+      map.set(ev.id, {
+        resting: dirty ? DIRTY_LIGHT : tones.light,
+        progress: tones.dark,
+      })
+    }
+    return map
+  }, [events])
+
+  // STABLE identity: the engine's per-row layout memo calls this for every
+  // segment, and a fresh closure per render would rebuild every row. The
+  // map is the source of truth; the callback only looks up.
+  const getEventBarTone = useCallback(
+    ({ event }: { event: GanttEvent<EventData> }) =>
+      barToneByEventId.get(event.id),
+    [barToneByEventId],
+  )
+
+  // STABLE identity, same contract. The phase color for a group comes from
+  // any descendant event (the plan maps phases per-resource and groups
+  // inherit downward; the first leaf is the cheapest faithful signal).
+  // Mapping off the live event list so a drag-update keeps the rollup
+  // reading the colors the tree actually shows today.
+  const summaryToneByResourceId = useMemo(() => {
+    const map = new Map<
+      string,
+      { resting: string; progress: string } | undefined
+    >()
+    const byResource = new Map<string, string>()
+    for (const ev of events) {
+      const rid = ev.resourceId
+      if (ev.color && rid && !byResource.has(rid)) {
+        byResource.set(rid, ev.color)
+      }
+    }
+    const stack = [...resources]
+    const grouped = new Set<string>()
+    while (stack.length) {
+      const node = stack.pop()!
+      if (grouped.has(node.id)) continue
+      grouped.add(node.id)
+      if (node.children?.length) stack.push(...node.children)
+      const color = byResource.get(node.id)
+      if (color) {
+        const t = barTones(color)
+        map.set(node.id, { resting: t.light, progress: t.dark })
+      }
+    }
+    return map
+  }, [resources, events])
+
+  const getSummaryBarTone = useCallback(
+    ({ resource }: { resource: GanttResource; events: GanttEvent<EventData>[] }) =>
+      summaryToneByResourceId.get(resource.id),
+    [summaryToneByResourceId],
+  )
+
+  // Hovering a history entry reprojects that event's LIVE bar at the hovered
+  // version's own dates AND tone (pink/amber/emerald... matching the panel
+  // swatch and the timeline fan). Resolved HERE rather than from rendered
+  // marks: the default view only paints the newest baseline, so an older
+  // version's mark may not exist on the timeline at all - but its tone AND
+  // its dates are derivable from the event's own history. Key format is
+  // ours: `${eventId}::baseline-v${version}`. The resting surface takes the
+  // version's fill (a pastel), and the progress overlay takes the strong
+  // partner - so the bar previews the version's bitono instead of one
+  // monochrome block.
+  const eventBarOverlays = useMemo(() => {
+    if (!highlightedBaseline) return undefined
+    const marker = "::baseline-v"
+    const sep = highlightedBaseline.lastIndexOf(marker)
+    if (sep < 0) return undefined
+    const eventId = highlightedBaseline.slice(0, sep)
+    const version = Number(highlightedBaseline.slice(sep + marker.length))
+    const ev = events.find((e) => e.id === eventId)
+    if (!ev) return undefined
+    const ordered = [...(ev.data?.baselines ?? [])].sort(
+      (a, b) => b.version - a.version,
+    )
+    const idx = ordered.findIndex((b) => b.version === version)
+    if (idx < 0) return undefined
+    const baseline = ordered[idx]
+    const tone = baselineTones(ev.color, idx)
+    return {
+      [eventId]: {
+        color: tone.fill,
+        progressColor: tone.full,
+        start: new Date(baseline.start),
+        end: new Date(baseline.end),
+      },
+    }
+  }, [highlightedBaseline, events])
 
   // Re-baselining is an explicit, auditable action: it snapshots the CURRENT
   // dates into the append-only history. Drags never touch it - they only
@@ -391,6 +508,9 @@ function GanttPlanViewerInner({
         onEventUpdate={recorder.onEventUpdate}
         getEventBaselines={getEventBaselines}
         highlightedBaselineKeys={highlightedBaselineKeys}
+        eventBarOverlays={eventBarOverlays}
+        getEventBarTone={getEventBarTone}
+        getSummaryBarTone={getSummaryBarTone}
         renderTooltipExtras={({ occurrence, dismiss }) => {
           const count = occurrence.event.data?.baselines?.length ?? 0
           if (!count) return null
@@ -679,8 +799,13 @@ function baselineDurationLabel(b: PlanBaseline): string {
 /**
  * Floating bitácora for one event: every captured baseline, newest first,
  * each entry showing its end-date drift (Δ) against the current plan.
- * Hovering/focusing an entry cross-highlights its ghost strip on the
- * timeline via `highlightedBaselineKeys`. Anchored to the BAR's rect at open
+ * Hovering/focusing an entry cross-highlights its mark on the timeline via
+ * `highlightedBaselineKeys` AND reprojects the event's live bar at that
+ * version's dates and tone via `eventBarOverlays` - the bar previews the
+ * version (works even when the version's mark isn't rendered, which is the
+ * default view). Each entry's swatch mirrors the timeline's pastel (bar
+ * for the version in force, ramp colors for older ones) so versions map at
+ * a glance. Anchored to the BAR's rect at open
  * time; without floating-ui the honest fallback is to close when anything
  * reflows under it (scroll/resize), so it can never point at the wrong bar.
  */
@@ -769,11 +894,15 @@ function BaselineHistoryPanel({
         </button>
       </div>
       <div className="max-h-64 overflow-auto">
-        {history.map((b) => {
+        {history.map((b, i) => {
           const key = `${event.id}::baseline-v${b.version}`
           const deltaDays = Math.round(
             (currentEndMs - new Date(b.end).getTime()) / 86_400_000,
           )
+          // Same tones as the timeline (gantt-color.ts): the newest entry is
+          // the current baseline BAR in the phase pastel; older ones take the
+          // fixed pastel ramp by depth - index maps 1:1 to the fan.
+          const tone = baselineTones(event.color, i)
           return (
             <button
               key={key}
@@ -789,7 +918,17 @@ function BaselineHistoryPanel({
               )}
             >
               <span className="flex items-center justify-between gap-4">
-                <span className="font-medium tabular-nums">
+                <span className="flex items-center gap-1.5 font-medium tabular-nums">
+                  <span
+                    aria-hidden
+                    className={
+                      // mirrors the timeline mark's shape: bar vs line
+                      i === 0
+                        ? "h-2 w-3 shrink-0 rounded-[3px]"
+                        : "size-2 shrink-0 rounded-full"
+                    }
+                    style={{ backgroundColor: tone.full }}
+                  />
                   {APP_STRINGS_ES.versionShort(b.version)}{" "}
                   <span className="text-muted-foreground font-normal">
                     ({baselineDurationLabel(b)})

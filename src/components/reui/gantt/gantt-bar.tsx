@@ -105,10 +105,27 @@ interface GanttBarProps<TData = unknown> extends Omit<
    */
   labelOutside?: boolean
   /**
-   * The owning row's title for the aria-label. Pass it when the row is in
+   * Owning row's title for the aria-label. Pass it when the row is in
    * scope (the internal view does); omitting falls back to a tree lookup.
    */
   rowTitle?: string
+  /**
+   * Temporary replacement for the bar's resting fill - e.g. a baseline
+   * version's tone while a consumer cross-highlights that baseline. Painted
+   * SOLID while active (no alpha) so plan-vs-version comparison reads at
+   * full strength; the progress overlay keeps the EVENT'S OWN color so
+   * completion stays readable underneath.
+   */
+  colorOverride?: string
+  /**
+   * Companion to `colorOverride` for the bitono model: tones the PROGRESS
+   * overlay specifically. Defaults to the event color (anchored by
+   * `--gantt-event-color`) so identity stays stable on every preview; a
+   * consumer that drives the resting fill with one tone and the progress
+   * overlay with another (the per-event bitono, or a history-version
+   * preview) sets it independently.
+   */
+  progressTintOverride?: string
 }
 
 /**
@@ -123,6 +140,8 @@ function GanttBar<TData = unknown>({
   children,
   labelOutside,
   rowTitle: rowTitleProp,
+  colorOverride,
+  progressTintOverride,
   ...props
 }: GanttBarProps<TData>) {
   const instance = useGantt<TData>()
@@ -371,6 +390,7 @@ function GanttBar<TData = unknown>({
     "data-label-outside": labelOutside || undefined,
     "data-progress": progress ?? undefined,
     "data-completed": progress === 100 || undefined,
+    "data-bar-tinted": colorOverride || progressTintOverride || undefined,
     "aria-label": settings.i18n.functions.formatEventAriaLabel({
       title: event.title,
       timeLabel,
@@ -380,7 +400,18 @@ function GanttBar<TData = unknown>({
       continues: segment.continuesBefore || segment.continuesAfter,
     }),
     style: {
+      // event color stays anchored to the phase: progress, focus chrome and
+      // any consumer chrome that reads it must keep the event identity.
       "--gantt-event-color": event.color ?? "var(--color-primary)",
+      // bar resting fill takes the override (baseline hover) and falls
+      // back to the event color when none is set, so the resting layer
+      // can shift independently of the progress layer.
+      "--gantt-bar-tint": colorOverride ?? "var(--gantt-event-color)",
+      // progress overlay tint moves independently: the consumer can paint a
+      // bitono (separate resting + progress tones, e.g. for a history-
+      // version preview) without rewriting --gantt-event-color.
+      "--gantt-progress-tint":
+        progressTintOverride ?? "var(--gantt-event-color)",
     } as CSSProperties,
     onPointerDown: (e: React.PointerEvent) => {
       e.stopPropagation()
@@ -407,18 +438,23 @@ function GanttBar<TData = unknown>({
       e.stopPropagation()
       settings.onEventDoubleClick?.(occurrence, e)
     },
-    className: cn(
+className: cn(
       "group/gantt-bar-group text-foreground @container relative flex w-full min-w-0 cursor-pointer touch-none items-center gap-1.5 overflow-hidden rounded-sm px-1.5 py-0.5 text-start leading-normal select-none",
       "focus-visible:ring-ring/50 outline-none focus-visible:ring-2",
-      // the unfilled remainder has to be legible on its own - at /12 a bar
-      // with a progress fill read as a floating segment with no basement
-      "bg-(--gantt-event-color)/20 hover:bg-(--gantt-event-color)/30",
-      // move: hide the original (the smooth cursor clone represents it)
+      // resting fill: translucent normally, OPAQUE while a baseline tint is
+      // active so plan-vs-version comparison reads at full strength (the
+      // progress overlay still uses the event color underneath)
+      "bg-(--gantt-bar-tint)/20 data-bar-tinted:bg-(--gantt-bar-tint)",
+      // move: hide the original (the smooth clone represents it)
       "data-[drag-kind=move]:opacity-0",
       // resize: keep the original event exactly, just fade it to a soft
       // placeholder behind the dashed preview - no dramatic restyle
       "data-[drag-kind=resize-start]:opacity-40 data-[drag-kind=resize-end]:opacity-40",
-      "data-selected:bg-(--gantt-event-color)/30",
+      // hover/selected: subtle alpha on the resting translucent look; the
+      // opaque (tinted) layer can't darken with alpha, so a thin black wash
+      // lays over the bar instead - dark text on top stays legible.
+      "hover:bg-(--gantt-bar-tint)/30 data-bar-tinted:hover:bg-black/5",
+      "data-selected:bg-(--gantt-bar-tint)/30 data-bar-tinted:data-selected:bg-black/5",
       segment.continuesBefore && "rounded-s-none",
       segment.continuesAfter && "rounded-e-none",
       viewConfig.classNames?.event,
@@ -431,10 +467,13 @@ function GanttBar<TData = unknown>({
           // whatever the bar renders, so a consumer bar (renderEvent) keeps
           // its completion fill instead of silently losing it. The inline
           // done-mark below stays gated, because that one really is content.
+          // The tint comes from --gantt-progress-tint (defaults to the event
+          // color) so the bitono can move progress independently of the
+          // resting fill underneath.
           <span
             aria-hidden
             data-slot="gantt-bar-progress"
-            className="pointer-events-none absolute inset-y-0 start-0 border-e border-(--gantt-event-color)/65 bg-(--gantt-event-color)/40 data-full:border-e-0"
+            className="pointer-events-none absolute inset-y-0 start-0 border-e border-(--gantt-progress-tint)/65 bg-(--gantt-progress-tint)/40 data-full:border-e-0"
             data-full={progress === 100 || undefined}
             style={{ width: `${progress}%` }}
           />

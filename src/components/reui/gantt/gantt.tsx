@@ -1465,12 +1465,15 @@ interface GanttViewConfig<TData = unknown> {
    */
   renderTooltipExtras?: (props: GanttTooltipExtrasProps<TData>) => ReactNode
   /**
-   * Historical baseline ranges per event, painted as pointer-transparent
-   * ghost strips BEHIND their bar (the current plan always stays on top).
-   * Return marks in CHRONOLOGICAL order: the last entry hugs its bar's
-   * bottom edge and older ones fan out below it. Memoize the callback - it
-   * runs inside the per-row layout memo, and a fresh identity every render
-   * would rebuild every row. Omit for none.
+   * Historical baseline ranges per event, painted pointer-transparent UNDER
+   * their bar (the current plan always stays on top). The last entry is the
+   * baseline in force: a full-size pastel bar dropped a lip below its live
+   * bar; older entries become thin lines fanning below, each in a fixed
+   * pastel ramp color by depth (gantt-color.ts) so versions are instantly
+   * identifiable everywhere. A mark's optional `color` tints the bar;
+   * highlighting restores full strength. Return marks in CHRONOLOGICAL
+   * order. Memoize the callback - it runs inside the per-row layout memo,
+   * and a fresh identity every render would rebuild every row. Omit for none.
    */
   getEventBaselines?: (ctx: {
     event: GanttEvent<TData>
@@ -1482,6 +1485,56 @@ interface GanttViewConfig<TData = unknown> {
    * render would re-render every row.
    */
   highlightedBaselineKeys?: string[]
+  /**
+   * Live-bar overrides keyed by EVENT id, e.g. while a consumer's history
+   * panel hovers a baseline version: the event's bar is reprojected at the
+   * version's own dates AND its resting fill takes the version's tone, so
+   * the user can preview any version (with a single hover) as the bar
+   * itself. The progress overlay keeps the EVENT'S OWN color so completion
+   * stays readable against any reprojected extent. Pass a memoized map or
+   * undefined - identity is compared, so a fresh literal per render would
+   * re-render every row.
+   */
+  eventBarOverlays?: Record<
+    string,
+    {
+      /** Tone for the resting fill; progress keeps the event's own color. */
+      color: string
+      /**
+       * Tone for the progress overlay. Defaults to the event's own color so
+       * the bitono stays anchored to identity on every preview; set on the
+       * history-hover overlay to show the version's strong partner (pairs
+       * with `color` set to the version's pastel).
+       */
+      progressColor?: string
+      /** Reproject the bar at this window (clamped to the visible range). */
+      start: Date
+      end: Date
+    }
+  >
+  /**
+   * Per-event bitono tones (resting + progress) for the LIVE bar. The engine
+   * threads `resting` through `colorOverride` and `progress` through a new
+   * `progressTintOverride` so the two layers can move independently. Return
+   * `undefined` (or omit a side) to leave that layer on its default
+   * (event color or its 20% pastel resting variant). Memoize the callback -
+   * it runs inside per-row layout, and a fresh identity every render would
+   * rebuild every row.
+   */
+  getEventBarTone?: (ctx: {
+    event: GanttEvent<TData>
+  }) => { resting?: string; progress?: string } | undefined
+  /**
+   * Same contract as `getEventBarTone`, scoped to a parent group's summary
+   * rollup. Receives the resource plus the descendant events so the consumer
+   * can derive a phase color from the subtree (or return undefined to leave
+   * the default muted-foreground rollup). Memoize the callback for the same
+   * reason as `getEventBarTone`.
+   */
+  getSummaryBarTone?: (ctx: {
+    resource: GanttResource
+    events: GanttEvent<TData>[]
+  }) => { resting?: string; progress?: string } | undefined
   /**
    * Dependency connectors between events, painted on an SVG overlay above
    * the rows (below drag previews). Endpoints anchor to each event's bar by
@@ -1582,6 +1635,9 @@ const VIEW_CONFIG_KEYS: Array<keyof GanttViewConfig> = [
   "renderTooltipExtras",
   "getEventBaselines",
   "highlightedBaselineKeys",
+  "eventBarOverlays",
+  "getEventBarTone",
+  "getSummaryBarTone",
   "dependencies",
   "onDependencyClick",
 ]

@@ -47,15 +47,25 @@ interface GanttDateRange {
 }
 
 /**
- * One historical baseline range of an event, drawn as a pointer-transparent
- * ghost strip behind its bar. Domain-free on purpose: the engine never knows
- * WHERE history is stored, only how to paint what the consumer hands over.
+ * One historical baseline range of an event. The NEWEST mark of an event is
+ * the baseline in force: painted as a full-size pastel bar sitting a lip
+ * below its live bar; older marks shrink to thin solid pastel lines fanning
+ * below. Domain-free on purpose: the engine never knows WHERE history is
+ * stored, only how to paint what the consumer hands over.
  */
 interface GanttBaselineMark {
   /** Stable identity (e.g. `${eventId}::v${version}`); powers cross-highlighting. */
   key: string
   /** Optional display label; opaque to the engine. */
   label?: string
+  /**
+   * Opaque CSS color for the mark (a phase color; `var()` references are
+   * tolerated but concrete hexes are preferred - they paint without any
+   * runtime resolution). Seeds the current-baseline bar's pastel; older
+   * marks always take the fixed pastel ramp by depth. Without a color the
+   * bar falls back to a muted neutral.
+   */
+  color?: string
   start: Date
   end: Date
 }

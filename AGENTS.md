@@ -20,8 +20,9 @@ Editable Gantt viewer (React 19 + Vite 8 + TS 6). Synthetic construction plan de
 - `src/main.tsx` + `src/App.tsx` — entrypoint and shell. `App.tsx` builds the demo `UmeJsonEntity` (placeholder for the future GET endpoint).
 - `src/components/gantt-plan/` — app-level viewer (`GanttPlanViewer.tsx` is the **umeJSON black box**) and the changes JSON panel (`ChangesetPanel.tsx`). This is where to add app features.
 - `src/components/reui/gantt/` — **vendored gantt engine** (NOT an npm dep). Edit `gantt.tsx` (main) and siblings here when extending the engine. New generic props for the tree panel live around `gantt.tsx:1215`.
+- `src/components/reui/gantt/gantt-color.ts` — concrete-color helpers for the bar paint model. **All phase colors must be concrete hexes**; `var()` chains fail silently in some browsers (the whole chain goes invalid and paints transparent). Exports `baselineTones(color, stack)` for baseline marks (pastel ramp by depth) and `barTones(color)` for live bars (80% pastel + phase at α 0.85). Also `DIRTY_LIGHT = "#e5e7eb"` for the "drift vs vigente baseline" state.
 - `src/components/ui/` — shadcn-style primitives. `slider.tsx` is **custom** (no native `<input type="range">`); it has its own pointer/keyboard handlers.
-- `src/data/plan-departamento.ts` — synthetic plan regenerated on every mount, anchored to the current week (see `:57`). WBS schema v2. A few events ship with seeded `baselines` so the bitácora is visible on load; they keep that history (the LB1-at-load rule does NOT prepend a synthetic entry on top). Re-exports types from `@/lib/plan-types` for compat.
+- `src/data/plan-departamento.ts` — synthetic plan regenerated on every mount, anchored to the current week (see `:57`). WBS schema v2. Phase `color` is a concrete hex (Tailwind 500-level) so every paint path (live bars, baseline tones, swatches) renders without runtime CSS-variable resolution. A few events ship with seeded `baselines` so the bitácora is visible on load; they keep that history (the LB1-at-load rule does NOT prepend a synthetic entry on top). Re-exports types from `@/lib/plan-types` for compat.
 - `src/lib/plan-types.ts` — shared types: `PlanJSON`, `PlanEvent` (+`baselines?`), `PlanBaseline`, `PlanResource` (+`responsable?`), `PlanPhase`, `EventData` (+`baselines?`). `data/` imports types from here, never the other way. The bitácora de líneas base lives in `EventData.baselines` (append-only snapshots; see `plan-mapper.ts` for the LB1-at-load rule).
 - `src/lib/plan-mapper.ts` — `PlanJSON` → `GanttEvent[] + GanttResource[]`. Pure on the plan received: phase colors come from `plan.phases`, status is derived from the event's own `progress`, `responsable` comes from `resource.responsable`. Recursive tree builder, preserves sibling order, treats orphans/cycles as roots. **Synthetic LB1**: events without a persisted `baselines` array get `[{ version: 1, start, end, capturedAt: plan.anchor, reason: "Carga inicial del plan" }]`, so the very first explicit *Fijar línea base* on any task yields a two-entry log (the default + the new one). Events that already carry history keep theirs.
 - `src/lib/umejson/schema.ts` — `UmeJsonEntity` type + `decodeUmePlan()` hand-rolled validator (envelope + payload). Exports `SENTINEL = "RESERVED_FOR_SYSTEM"` and `ENTITY_NAME = "GanttPlan"`.
@@ -30,12 +31,28 @@ Editable Gantt viewer (React 19 + Vite 8 + TS 6). Synthetic construction plan de
 - `src/lib/wbs-levels.ts` — `WBS_LEVELS` palette + `wbsLevelStyle(depth)` helper.
 - `src/lib/i18n-es.ts` — Spanish (es-AR) translations + locale config. **Every user-facing string goes here**; never hardcode JSX strings.
 
+## Bar paint model (bitono)
+
+Live bars are painted in two layers; both tones come from the consumer through `GanttViewConfig`:
+
+- **Resting surface** (`--gantt-bar-tint`): soft pastel, concrete hex. Defaults to `var(--gantt-event-color) / 20` (translucent) when no tone is supplied; switches to opaque (`data-bar-tinted` attribute, driven by `colorOverride` OR `progressTintOverride`) when any tone is provided. Hover/selected darken via `bg-black/5` on the opaque layer.
+- **Progress overlay** (`--gantt-progress-tint`): full-strength phase color at α 0.85. Border at α 0.65. Defaults to `var(--gantt-event-color)`; switched by `progressTintOverride`. The two layers can move independently — a consumer paints a bitono.
+
+Consumer entry points on `GanttViewConfig`:
+
+- `getEventBarTone({ event }) => { resting?, progress? } | undefined` — per-event bitono. The `GanttPlanViewer` uses this to derive the resting fill from `barTones(ev.color)` and to mark the bar DIRTY (resting = `DIRTY_LIGHT`) when `ev.start/end` differ from the vigente baseline (highest-version `data.baselines` entry). Drag-release and *Fijar línea base* both flow through `events`, so the dirty bit updates without an effect. Callback identity MUST be stable (wrap in `useCallback` over the derived `Map<eventId, tone>`).
+- `getSummaryBarTone({ resource, events }) => { resting?, progress? } | undefined` — same contract for parent rollups. Used so the inline summary bar matches the live-bar bitono.
+- `eventBarOverlays[eventId].progressColor?: string` — companion to `color` for history-version previews: `color = baselineTones(...).fill` (pastel), `progressColor = baselineTones(...).full` (strong), so hovering a bitácora entry shows the version's bitono on the bar itself.
+
+Vendored engine additions: `GanttBar` exposes `progressTintOverride`; both overrides feed CSS vars and turn on `data-bar-tinted` so the resting fill switches to opaque.
+
 ## Conventions (differ from defaults)
 
 - **Styling**: Tailwind v4 with `@theme inline` and `data-[slot=…]` / `data-[state=…]` variants. No CSS modules.
 - **Types**: `any` is forbidden unless marked with an explicit eslint-disable and a comment explaining the adapter.
 - **Comments**: only where intent isn't obvious.
 - **WBS depth is color, not indent.** Titles are left-aligned at the gutter; depth shows as row background via `wbsLevelStyle(depth)`. The depth slider (`WbsLevelSlider` in `gantt-plan/`) controls `collapsedGroups`: groups with `depth >= level` collapse. Default level = `maxDepth` (all expanded).
+- **Concrete-hex colors only.** Phase colors flow through `barTones()` and `baselineTones()` → CSS background, and the derivation chain uses `canvas.getContext("2d").fillStyle` for runtime resolution. CSS variables in `var()` chains are tolerated by the helpers but unreliable in the wild; pin hexes in `data/plan-departamento.ts` to keep paint predictable.
 - **PlanJSON v2 quirks** (`plan-departamento.ts`):
   - `parentId` is free — can point to any resource, not just a phase.
   - `phaseId` is **inheritable**: missing `phaseId` falls back to the nearest ancestor's (bar color comes from the resolved chain).

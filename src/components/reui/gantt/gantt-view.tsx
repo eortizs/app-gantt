@@ -48,6 +48,7 @@ import type {
   GanttResourceReorder,
   GanttSegment,
 } from "@/components/reui/gantt/gantt-types"
+import { baselineTones } from "@/components/reui/gantt/gantt-color"
 import { mergeProps } from "@base-ui/react/merge-props"
 // Base UI's ScrollArea re-measures its thumb + overflow on mount, viewport
 // resize and scroll, but NOT on a content-size change unless the content sits
@@ -274,14 +275,24 @@ interface TimelineRowBars {
   } | null
   /**
    * Parent rollup: descendant-bar envelope + duration-weighted progress,
-   * present only on group rows without bars of their own.
+   * present only on group rows without bars of their own. The optional bitono
+   * tones feed the inline summary bar (or any consumer-rendered summary)
+   * directly - resting and progress can move independently of the muted
+   * default chrome.
    */
-  summary: { from: number; to: number; progress: number | null } | null
+  summary: {
+    from: number
+    to: number
+    progress: number | null
+    restingTone?: string
+    progressTone?: string
+  } | null
   /**
-   * Baseline-history ghost strips for this row's events, as track fractions
+   * Baseline-history marks for this row's events, as track fractions
    * (same coordinate system as the bars, clamped to the visible range).
-   * `stack` fans multiple strips below a bar's bottom edge - 0 is the newest,
-   * which hugs the bar; older baselines sit below it.
+   * `stack` orders them below a bar's bottom edge - 0 is the newest, which
+   * paints as the full-size current-baseline bar; older stacks shrink to
+   * thin lines fanning below.
    */
   baselines: Array<{
     key: string
@@ -289,6 +300,7 @@ interface TimelineRowBars {
     stack: number
     from: number
     to: number
+    color?: string
   }>
 }
 
@@ -302,6 +314,13 @@ interface TimelineReorderState {
 
 /** Shared identity for rows without baseline history; keeps row props stable. */
 const EMPTY_BASELINES: TimelineRowBars["baselines"] = []
+
+/**
+ * Vertical drop (rem) of the current-baseline bar under its live bar's lane:
+ * when baseline and plan coincide only a 2px lip peeks out below the bar,
+ * and drift fans the shapes apart. Line stacks pitch off the same drop.
+ */
+const BASELINE_DROP_REM = 0.125
 
 interface GanttViewProps extends useRender.ComponentProps<"div"> {
   /** Day-scale unit interval in minutes; defaults to the interval view config. */
@@ -844,28 +863,51 @@ function GanttView({
         to = Math.max(to, (segment.endMin ?? 0) / totalMin)
       }
 
-      // Parent rollup from the subtree's bars: envelope clamped to the range,
-      // progress weighted by each bar's full duration
-      let summary: TimelineRowBars["summary"] = null
-      if (row.isGroup && segments.length === 0 && viewConfig.summaryBars) {
-        let sumFrom = Infinity
-        let sumTo = -Infinity
-        for (const id of descendantIds.get(row.resource.id) ?? []) {
-          const env = envelopes.get(id)
-          if (!env) continue
-          sumFrom = Math.min(sumFrom, env.fromMin / totalMin)
-          sumTo = Math.max(sumTo, env.toMin / totalMin)
-        }
-        if (sumTo > sumFrom) {
-          summary = {
-            from: sumFrom,
-            to: sumTo,
-            // all-time completion (matches a consumer's tree rollup), not the
-            // visible-range slice - task progress is independent of scroll
-            progress: subtreeProgress.get(row.resource.id) ?? null,
-          }
+// Parent rollup from the subtree's bars: envelope clamped to the range,
+// progress weighted by each bar's full duration
+let summary: TimelineRowBars["summary"] = null
+if (row.isGroup && segments.length === 0 && viewConfig.summaryBars) {
+  let sumFrom = Infinity
+  let sumTo = -Infinity
+  for (const id of descendantIds.get(row.resource.id) ?? []) {
+    const env = envelopes.get(id)
+    if (!env) continue
+    sumFrom = Math.min(sumFrom, env.fromMin / totalMin)
+    sumTo = Math.max(sumTo, env.toMin / totalMin)
+  }
+  if (sumTo > sumFrom) {
+    summary = {
+      from: sumFrom,
+      to: sumTo,
+      // all-time completion (matches a consumer's tree rollup), not the
+      // visible-range slice - task progress is independent of scroll
+      progress: subtreeProgress.get(row.resource.id) ?? null,
+    }
+    // Bitono for the inline rollup: the consumer derives the phase color
+    // from the descendant events, so the same bitono the live bars show
+    // reads at the rollup too. Collecting the subtree events here mirrors
+    // subtreeProgress's gather so the consumer sees identical inputs.
+    const getSummaryTone = viewConfig.getSummaryBarTone
+    if (getSummaryTone) {
+      const subtreeEvents: GanttEvent[] = []
+      for (const id of descendantIds.get(row.resource.id) ?? []) {
+        for (const ev of allEvents) {
+          if (ev.resourceId === id) subtreeEvents.push(ev)
         }
       }
+      if (subtreeEvents.length) {
+        const tone = getSummaryTone({
+          resource: row.resource,
+          events: subtreeEvents,
+        })
+        if (tone) {
+          if (tone.resting) summary.restingTone = tone.resting
+          if (tone.progress) summary.progressTone = tone.progress
+        }
+      }
+    }
+  }
+}
 
       // The stack, then the row's own padding around it. Centering the block
       // in the resulting height gives an equal inset top and bottom, and it
@@ -875,12 +917,13 @@ function GanttView({
       const heightRem = Math.max(minRowRem, blockRem + 2 * rowPaddingRem)
       const laneOffsetRem = (heightRem - blockRem) / 2
 
-      // Baseline-history ghosts: consumer-supplied ranges per event, clamped
+      // Baseline-history marks: consumer-supplied ranges per event, clamped
       // to the visible range exactly like segments so the two can never
-      // disagree on geometry. Input is chronological; the LAST mark hugs its
-      // bar's bottom edge and older ones fan downward while the row's padding
-      // has room (strips are h-1 with a 5px pitch; the rest stay reachable
-      // through the consumer's history panel).
+      // disagree on geometry. Input is chronological; the LAST mark paints
+      // as the full-size current-baseline bar under its live bar, older ones
+      // fan downward as thin lines while the row's padding has room (5px
+      // pitch; anything beyond maxStack stays reachable through the
+      // consumer's history panel).
       let baselines: TimelineRowBars["baselines"] = EMPTY_BASELINES
       const getBaselines = viewConfig.getEventBaselines
       if (getBaselines && segments.length > 0) {
@@ -912,6 +955,7 @@ function GanttView({
               stack,
               from: fromMin / totalMin,
               to: toMin / totalMin,
+              color: mark.color,
             })
           }
         }
@@ -963,6 +1007,8 @@ function GanttView({
     settings.i18n,
     viewConfig.summaryBars,
     viewConfig.getEventBaselines,
+    viewConfig.getSummaryBarTone,
+    allEvents,
     descendantIds,
     subtreeProgress,
     laneHeightRem,
@@ -3002,6 +3048,9 @@ const GanttTimelineRow = memo(function GanttTimelineRow({
   const viewConfig = useGanttViewConfig()
   const gestures = useGanttGestures()
   const segments = bars?.segments ?? []
+  // shared with the row build so the overlay reprojection clamps to the
+  // SAME visible range the segments and baseline marks already use
+  const totalMin = (rangeEndMs - rangeStartMs) / 60000
   // parents aggregate their subtree; they take no direct scheduling gestures
   const schedulable = !row.isGroup || viewConfig.parentScheduling
   const heightRem = bars?.heightRem ?? minRowRem
@@ -3370,14 +3419,34 @@ const GanttTimelineRow = memo(function GanttTimelineRow({
         className="pointer-events-none absolute inset-0"
         style={{ contentVisibility: "auto" }}
       >
-        {/* Baseline ghosts: painted BEFORE the segments so the current plan
+        {/* Baseline marks: painted BEFORE the segments so the current plan
             always stays on top, and pointer-transparent like the layer itself
             - history must never steal hover, click or drag from a live bar.
-            The newest strip straddles its bar's bottom edge; when baseline and
-            plan coincide it reads as a quiet 2px lip, drift fans it out. */}
+            The newest mark (stack 0) is the baseline IN FORCE: a full-size
+            pastel bar dropped 2px below its live bar's lane, so zero drift
+            reads as a quiet bottom lip and drift fans it out. Older marks
+            shrink to thin solid lines fanning below, each in a FIXED pastel
+            ramp color by depth (gantt-color.ts); highlighting restores the
+            full-strength partner tone on either shape. */}
         {bars?.baselines.map((bl) => {
+          // The vigente-baseline bar (stack 0) becomes redundant while a
+          // consumer reprojects the live bar at a hovered baseline: hiding
+          // it avoids two solid-color bars sitting side-by-side in the same
+          // lane, which the eye reads as a "mix" of the vigente color with
+          // the overlay color.
+          if (bl.stack === 0) {
+            const sep = bl.key.lastIndexOf("::baseline-v")
+            const eventId = sep >= 0 ? bl.key.slice(0, sep) : null
+            if (eventId && viewConfig.eventBarOverlays?.[eventId]) return null
+          }
           const laneTopRem =
             laneOffsetRem + bl.lane * (laneHeightRem + laneGapRem)
+          const isCurrent = bl.stack === 0
+          // Concrete precomputed tones (gantt-color.ts): no color-mix or
+          // relative color syntax here - a browser that rejects those makes
+          // the whole var chain invalid and paints NOTHING, losing the very
+          // reference these marks exist to provide.
+          const tone = baselineTones(bl.color, bl.stack)
           return (
             <span
               key={bl.key}
@@ -3388,16 +3457,40 @@ const GanttTimelineRow = memo(function GanttTimelineRow({
               ) || undefined}
               aria-hidden="true"
               className={cn(
-                "pointer-events-none absolute z-[5] h-1 -translate-y-1/2 rounded-[3px] border border-dashed border-muted-foreground/60 bg-muted-foreground/10 transition-colors duration-100",
-                "data-highlighted:border-solid data-highlighted:border-muted-foreground data-highlighted:bg-muted-foreground/50"
+                "pointer-events-none absolute z-[5] bg-(--bl-fill)",
+                "transition-[background-color,border-color] duration-100",
+                "data-highlighted:bg-(--bl-full)",
+                isCurrent
+                  ? [
+                      // same footprint as a live bar, nudged into the lip
+                      "rounded-sm border border-(--bl-border)",
+                      "data-highlighted:border-(--bl-full)",
+                    ]
+                  : [
+                      "h-[3px] -translate-y-1/2 rounded-full",
+                      "data-highlighted:h-[5px]",
+                    ]
               )}
-              style={{
-                insetInlineStart: `${bl.from * 100}%`,
-                width: `${Math.max((bl.to - bl.from) * 100, 0.5)}%`,
-                top: `${
-                  laneTopRem + laneHeightRem + bl.stack * 0.3125
-                }rem`,
-              }}
+              style={
+                {
+                  insetInlineStart: `${bl.from * 100}%`,
+                  width: `${Math.max((bl.to - bl.from) * 100, 0.5)}%`,
+                  // current bar: its lane's footprint dropped into the lip;
+                  // lines: centered on their fan position below that lip
+                  top: isCurrent
+                    ? `${laneTopRem + BASELINE_DROP_REM}rem`
+                    : `${
+                        laneTopRem +
+                        laneHeightRem +
+                        bl.stack * 0.3125 +
+                        BASELINE_DROP_REM
+                      }rem`,
+                  height: isCurrent ? `${laneHeightRem}rem` : undefined,
+                  "--bl-fill": tone.fill,
+                  "--bl-border": tone.border,
+                  "--bl-full": tone.full,
+                } as CSSProperties
+              }
             />
           )
         })}
@@ -3408,6 +3501,29 @@ const GanttTimelineRow = memo(function GanttTimelineRow({
           const to = fractionOf(rangeStartMs + (segment.endMin ?? 0) * 60000)
           if (to <= from) return null
           const lane = segment.column ?? 0
+          // Resolved once per segment so getEventBarTone is called exactly
+          // twice (resting + progress) instead of twice per render of the
+          // bar component. The callback contract is the same as
+          // getEventBaselines: consumer must memoize.
+          const barTone = viewConfig.getEventBarTone?.({
+            event: segment.occurrence.event,
+          })
+          const barResting = barTone?.resting
+          const barProgress = barTone?.progress
+          // Reproject this bar at a hovered baseline's dates when the
+          // consumer asks (eventBarOverlays). Same clamping as the
+          // baseline-mark row build so a hovered version off-screen gets
+          // truncated rather than overflowing.
+          const overlay =
+            viewConfig.eventBarOverlays?.[segment.occurrence.event.id]
+          const overlayFrom = overlay
+            ? Math.max((overlay.start.getTime() - rangeStartMs) / 60000, 0) /
+              totalMin
+            : from
+          const overlayTo = overlay
+            ? Math.min((overlay.end.getTime() - rangeStartMs) / 60000, totalMin) /
+              totalMin
+            : to
           // Title placement: outside beside the bar when configured (or too
           // short in "auto"), flipped before the bar near the range end, and
           // back inside when the bar spans the whole view.
@@ -3452,8 +3568,15 @@ const GanttTimelineRow = memo(function GanttTimelineRow({
               // insetInlineStart, not left: in RTL the axis mirrors and bars
               // must mirror with it (fractions measure from the range start)
               style={{
-                insetInlineStart: `${from * 100}%`,
-                width: `${Math.max((to - from) * 100, 0.5)}%`,
+                // eventBarOverlays: a consumer (history panel hovering a
+                // baseline version) can reproject THIS bar at the hovered
+                // version's dates AND its tone - the bar previews the
+                // version. When no overlay is set the bar stays at the live
+                // plan's own extent. Clamped the same way baseline marks
+                // are, so a hovered version whose dates are off-screen is
+                // truncated to the visible range.
+                insetInlineStart: `${overlayFrom * 100}%`,
+                width: `${Math.max((overlayTo - overlayFrom) * 100, 0.5)}%`,
                 top: `${laneOffsetRem + lane * (laneHeightRem + laneGapRem)}rem`,
                 height: `${laneHeightRem}rem`,
                 // one track means every lane is 0, so paint order (not the
@@ -3463,11 +3586,21 @@ const GanttTimelineRow = memo(function GanttTimelineRow({
                   10 + (singleTrack ? segmentIndex : lane),
               }}
             >
+              {/* The overlay's color drives the resting fill (via
+                  --gantt-bar-tint inside GanttBar); the progress overlay
+                  keeps the EVENT'S OWN color so completion stays readable
+                  against any reprojected extent. When getEventBarTone is
+                  set, the consumer's bitono (default or dirty) wins over
+                  the overlay only while a version is actively being
+                  previewed - so a hover-time reprojection stays the single
+                  source of truth for that moment. */}
               <GanttBar
                 segment={segment}
                 labelOutside={placement !== "inside"}
                 rowTitle={row.resource.title}
                 className="h-full"
+                colorOverride={overlay?.color ?? barResting}
+                progressTintOverride={overlay?.progressColor ?? barProgress}
               />
               {placement !== "inside" && (
                 <span
@@ -3490,12 +3623,19 @@ const GanttTimelineRow = memo(function GanttTimelineRow({
         {bars?.summary && segments.length === 0 && (
           <div
             data-slot="gantt-summary"
+            data-bar-tinted={bars.summary.restingTone || undefined}
             aria-hidden
             className="pointer-events-none absolute top-1/2 -translate-y-1/2"
             style={{
               insetInlineStart: `${bars.summary.from * 100}%`,
               width: `${Math.max((bars.summary.to - bars.summary.from) * 100, 0.5)}%`,
-            }}
+              // Same bitono layout as the live bars: resting pastel on the
+              // track, progress overlay tinted by the strong partner. When
+              // the consumer doesn't opt in, the muted-foreground classes
+              // remain (data-bar-tinted flips them off).
+              "--gantt-bar-tint": bars.summary.restingTone,
+              "--gantt-progress-tint": bars.summary.progressTone,
+            } as CSSProperties}
           >
             {viewConfig.renderSummary ? (
               // consumer-owned rollup: the positioned envelope wrapper stays
@@ -3520,11 +3660,11 @@ const GanttTimelineRow = memo(function GanttTimelineRow({
                   aria-hidden
                   className="bg-muted-foreground/50 absolute end-0 top-1/2 h-3 w-0.5 -translate-y-1/2 rounded-full"
                 />
-                <div className="bg-muted-foreground/20 relative h-1.5 overflow-hidden rounded-full">
+                <div className="bg-muted-foreground/20 data-bar-tinted:bg-(--gantt-bar-tint) relative h-1.5 overflow-hidden rounded-full">
                   {bars.summary.progress !== null && (
                     <div
                       data-slot="gantt-summary-progress"
-                      className="bg-muted-foreground/50 absolute inset-y-0 start-0 rounded-full"
+                      className="bg-muted-foreground/50 data-bar-tinted:bg-(--gantt-progress-tint) absolute inset-y-0 start-0 rounded-full"
                       style={{ width: `${bars.summary.progress}%` }}
                     />
                   )}
