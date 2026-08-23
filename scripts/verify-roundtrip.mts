@@ -12,7 +12,7 @@ import {
   SENTINEL,
   type UmeJsonEntity,
 } from "../src/lib/umejson/schema.ts"
-import { cascadeSchedule, wouldCreateCycle } from "../src/lib/umejson/schedule.ts"
+import { cascadeSchedule, dependentClosure, wouldCreateCycle } from "../src/lib/umejson/schedule.ts"
 import type { PlanJSON } from "../src/lib/plan-types.ts"
 
 const fails: string[] = []
@@ -363,6 +363,35 @@ for (const [label, input] of rejectionCases) {
   if (wouldCreateCycle(depPlan.dependencies ?? [], "a", "c")) {
     fail("cycle veto: clean edge rejected", "false positive")
   } else ok("cycle veto: clean edge allowed")
+
+  // ---- 9b. dependentClosure ----------------------------------------------
+  const diamondDeps: PlanDependency[] = [
+    { id: "d1", fromEventId: "a", toEventId: "b", type: "FS" },
+    { id: "d2", fromEventId: "a", toEventId: "c", type: "FS" },
+    { id: "d3", fromEventId: "b", toEventId: "d", type: "FS" },
+    { id: "d4", fromEventId: "c", toEventId: "d", type: "FS" },
+    { id: "d5", fromEventId: "a", toEventId: "e", type: "FS" },
+  ]
+  const closure = dependentClosure(diamondDeps, ["a"])
+  const expected = ["b", "c", "e", "d"]
+  if (
+    closure.length === expected.length &&
+    closure.every((id, i) => id === expected[i])
+  ) {
+    ok("closure: BFS order, diamond deduped")
+  } else {
+    fail("closure: BFS order, diamond deduped", `got ${JSON.stringify(closure)}`)
+  }
+  if (dependentClosure(diamondDeps, ["z"]).length === 0) {
+    ok("closure: no edges from seed")
+  } else {
+    fail("closure: no edges from seed", "non-empty")
+  }
+  if (dependentClosure(diamondDeps, []).length === 0) {
+    ok("closure: empty seed list")
+  } else {
+    fail("closure: empty seed list", "non-empty")
+  }
 
   // ---- 10. Decoder: rechazos y happy path del grafo -----------------------
   const withDeps = (dependencies: unknown): unknown => ({

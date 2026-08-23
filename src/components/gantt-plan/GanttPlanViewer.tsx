@@ -56,7 +56,7 @@ import {
   toGanttEvents,
   toGanttResources,
 } from "@/lib/plan-mapper"
-import { wouldCreateCycle, type ScheduleAdjustment } from "@/lib/umejson/schedule"
+import { wouldCreateCycle, dependentClosure, type ScheduleAdjustment } from "@/lib/umejson/schedule"
 import { applyOps, encodeUpdatedPlan, type ChangeOp } from "@/lib/umejson/codec"
 import { decodeUmePlan, type UmeJsonEntity, type ValidationError } from "@/lib/umejson/schema"
 import { wbsLevelStyle } from "@/lib/wbs-levels"
@@ -330,33 +330,13 @@ function GanttPlanViewerInner({
 
   // Re-baselining is an explicit, auditable action: it snapshots the CURRENT
   // dates into the append-only history. Drags never touch it - they only
-  // produce uncommitted ChangeOps until a save commits them.
-  const captureBaseline = useCallback((eventId: string) => {
-    setEvents((prev) =>
-      prev.map((ev) => {
-        if (ev.id !== eventId || !ev.data) return ev
-        const nextVersion =
-          ev.data.baselines?.reduce((max, b) => Math.max(max, b.version), 0) ??
-          0
-        return {
-          ...ev,
-          data: {
-            ...ev.data,
-            baselines: [
-              ...(ev.data.baselines ?? []),
-              {
-                version: nextVersion + 1,
-                start: ev.start.toISOString(),
-                end: ev.end.toISOString(),
-                capturedAt: new Date().toISOString(),
-                reason: "Captura manual",
-              },
-            ],
-          },
-        }
-      }),
-    )
-  }, [])
+  // produce uncommitted ChangeOps until a save commits them. The seed (the
+  // event the user picked) always captures; its transitive dependents along
+  // the dependency graph only capture when their live dates have drifted from
+  // their vigente baseline - a clean dependent gets no entry, so the bitácora
+  // never sprouts duplicates. All entries share the same capturedAt so the
+  // audit trail reads as one batch.
+  // (Declaration lives after `livePlan` is computed - see below.)
 
   // Opens the history panel anchored to the bar itself (not the cursor): the
   // tooltip freezes its anchor at open time, but a panel listing history
@@ -425,6 +405,86 @@ function GanttPlanViewerInner({
   const documentOut = useMemo(
     () => (ops.length ? encodeUpdatedPlan(entity, livePlan, ops.length) : null),
     [ops, entity, livePlan],
+  )
+
+  // Re-baselining is an explicit, auditable action: it snapshots the CURRENT
+  // dates into the append-only history. Drags never touch it - they only
+  // produce uncommitted ChangeOps until a save commits them. The seed (the
+  // event the user picked) always captures; its transitive dependents along
+  // the dependency graph only capture when their live dates have drifted from
+  // their vigente baseline - a clean dependent gets no entry, so the bitácora
+  // never sprouts duplicates. All entries share the same capturedAt so the
+  // audit trail reads as one batch.
+  const captureBaseline = useCallback(
+    (eventId: string) => {
+      const liveIds = new Set(events.map((ev) => ev.id))
+      const seed = events.find((ev) => ev.id === eventId)
+      if (!seed) return
+      const candidates = dependentClosure(
+        livePlan.dependencies ?? [],
+        [eventId],
+      ).filter((id) => liveIds.has(id))
+      const idSet = new Set(candidates)
+      const capturedAt = new Date().toISOString()
+      setEvents((prev) =>
+        prev.map((ev) => {
+          if (ev.id === eventId && ev.data) {
+            const nextVersion =
+              ev.data.baselines?.reduce(
+                (max, b) => Math.max(max, b.version),
+                0,
+              ) ?? 0
+            return {
+              ...ev,
+              data: {
+                ...ev.data,
+                baselines: [
+                  ...(ev.data.baselines ?? []),
+                  {
+                    version: nextVersion + 1,
+                    start: ev.start.toISOString(),
+                    end: ev.end.toISOString(),
+                    capturedAt,
+                    reason: APP_STRINGS_ES.baselineManualReason,
+                  },
+                ],
+              },
+            }
+          }
+          if (!idSet.has(ev.id) || !ev.data) return ev
+          const history = ev.data.baselines ?? []
+          const vigente = history.length
+            ? history.reduce((max, b) => (b.version > max.version ? b : max))
+            : null
+          if (!vigente) return ev
+          const drifted =
+            ev.start.getTime() !== new Date(vigente.start).getTime() ||
+            ev.end.getTime() !== new Date(vigente.end).getTime()
+          if (!drifted) return ev
+          const nextVersion = history.reduce(
+            (max, b) => Math.max(max, b.version),
+            0,
+          )
+          return {
+            ...ev,
+            data: {
+              ...ev.data,
+              baselines: [
+                ...history,
+                {
+                  version: nextVersion + 1,
+                  start: ev.start.toISOString(),
+                  end: ev.end.toISOString(),
+                  capturedAt,
+                  reason: APP_STRINGS_ES.baselineCascadeReason(seed.title),
+                },
+              ],
+            },
+          }
+        }),
+      )
+    },
+    [events, livePlan],
   )
 
   // Connectors read the LIVE engine events: a violation lights up during the

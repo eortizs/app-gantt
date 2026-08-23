@@ -66,6 +66,11 @@ export const APP_STRINGS_ES = {
   closePanel: "Cerrar",
   /** Reason persisted on the load-time LB1 snapshot (see plan-mapper). */
   baselineOriginalReason: "Carga inicial del plan",
+  /** Reason for the manually-captured entry (seed of a Fijar línea base). */
+  baselineManualReason: "Captura manual",
+  /** Reason for entries auto-captured on transitive dependents of a seed. */
+  baselineCascadeReason: (title: string) =>
+    `Refijada en cascada desde «${title}»`,
 
   // ----- dependencias -----
   /** Context-menu submenu over a bar: link this event to a successor. */

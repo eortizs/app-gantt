@@ -170,6 +170,45 @@ export function cascadeSchedule(
 }
 
 /**
+ * Transitive closure of successors reachable from `seedIds` along the
+ * `fromEventId -> toEventId` direction. Excludes the seeds themselves; a
+ * diamond (A->B, A->C, B->D, C->D) visits D once because of the visited
+ * set. Cycles are defensive - the decoder rejects them, but a DFS over a
+ * malformed plan would loop forever without it. Order is BFS, so the
+ * caller gets a predictable, dependency-distance-ordered traversal.
+ */
+export function dependentClosure(
+  dependencies: readonly PlanDependency[],
+  seedIds: readonly string[],
+): string[] {
+  if (!seedIds.length) return []
+  const succsOf = new Map<string, string[]>()
+  for (const dep of dependencies) {
+    const list = succsOf.get(dep.fromEventId)
+    if (list) list.push(dep.toEventId)
+    else succsOf.set(dep.fromEventId, [dep.toEventId])
+  }
+  const visited = new Set<string>(seedIds)
+  const queue: string[] = []
+  for (const seed of seedIds) {
+    for (const next of succsOf.get(seed) ?? []) {
+      if (!visited.has(next)) queue.push(next)
+    }
+  }
+  const result: string[] = []
+  for (let i = 0; i < queue.length; i++) {
+    const id = queue[i]!
+    if (visited.has(id)) continue
+    visited.add(id)
+    result.push(id)
+    for (const next of succsOf.get(id) ?? []) {
+      if (!visited.has(next)) queue.push(next)
+    }
+  }
+  return result
+}
+
+/**
  * Edit-time veto: would adding `from -> to` close a cycle (or self-loop)?
  * DFS from the target following existing edges; reaching the proposed
  * source means the new edge points backwards into its own ancestry.
