@@ -1538,6 +1538,19 @@ interface GanttViewConfig<TData = unknown> {
     event: GanttEvent<TData>
   }) => { resting?: string; progress?: string } | undefined
   /**
+   * Per-event extra classes for the LIVE bar element. This is the channel for
+   * consumer STATE chrome that must NOT borrow the fill (e.g. a critical-path
+   * stroke): resting/progress tones stay reserved for the bitono contract
+   * (light resting, strong progress). Classes are merged into the bar's own
+   * cn() tail, AFTER the engine classes, so utilities here win collisions;
+   * CSS vars like --gantt-event-color / --gantt-bar-tint are in scope on the
+   * bar. Memoize the callback - it runs inside per-row layout, and a fresh
+   * identity every render would rebuild every row.
+   */
+  getEventBarClassName?: (ctx: {
+    event: GanttEvent<TData>
+  }) => string | undefined
+  /**
    * Same contract as `getEventBarTone`, scoped to a parent group's summary
    * rollup. Receives the resource plus the descendant events so the consumer
    * can derive a phase color from the subtree (or return undefined to leave
@@ -1650,6 +1663,7 @@ const VIEW_CONFIG_KEYS: Array<keyof GanttViewConfig> = [
   "highlightedBaselineKeys",
   "eventBarOverlays",
   "getEventBarTone",
+  "getEventBarClassName",
   "getSummaryBarTone",
   "dependencies",
   "onDependencyClick",

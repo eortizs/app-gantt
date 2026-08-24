@@ -3510,6 +3510,11 @@ const GanttTimelineRow = memo(function GanttTimelineRow({
           })
           const barResting = barTone?.resting
           const barProgress = barTone?.progress
+          // State chrome (e.g. a critical-path stroke) rides the class
+          // channel so it can never borrow the resting/progress fills.
+          const barClassName = viewConfig.getEventBarClassName?.({
+            event: segment.occurrence.event,
+          })
           // Reproject this bar at a hovered baseline's dates when the
           // consumer asks (eventBarOverlays). Same clamping as the
           // baseline-mark row build so a hovered version off-screen gets
@@ -3598,7 +3603,7 @@ const GanttTimelineRow = memo(function GanttTimelineRow({
                 segment={segment}
                 labelOutside={placement !== "inside"}
                 rowTitle={row.resource.title}
-                className="h-full"
+                className={barClassName ? `h-full ${barClassName}` : "h-full"}
                 colorOverride={overlay?.color ?? barResting}
                 progressTintOverride={overlay?.progressColor ?? barProgress}
               />
