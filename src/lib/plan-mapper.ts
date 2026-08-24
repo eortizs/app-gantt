@@ -25,8 +25,9 @@ export function toGanttEvents(plan: PlanJSON): GanttEvent<EventData>[] {
     // history shipped in the plan, or an explicit «Fijar línea base». No
     // load-time LB1 is synthesized - a synthetic one anchored every bar's
     // original position, so each drag left a full-size colored remnant
-    // pinned at the old dates (read as a useless ghost). First explicit
-    // capture on a bare task yields a single-entry log.
+    // pinned at the old dates (read as a useless ghost). Instead, the first
+    // capture on a drifted bare task materializes LB1 lazily from these
+    // initial dates (see captureBaseline in the viewer).
     return {
       id: e.id,
       title: resource?.title ?? titleize(e.resourceId),

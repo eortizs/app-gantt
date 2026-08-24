@@ -62,6 +62,9 @@ export const APP_STRINGS_ES = {
   /** Drift of a baseline's end vs the current plan end, in whole days. */
   baselineDelta: (d: number) =>
     d === 0 ? "Δ 0 d" : `Δ ${d > 0 ? "+" : ""}${d} d`,
+  /** Sum of every entry's Δ vs the current plan, so nobody adds by hand. */
+  baselineTotalDelta: (d: number) =>
+    d === 0 ? "Σ Δ 0 d" : `Σ Δ ${d > 0 ? "+" : ""}${d} d`,
   /** Baseline span across calendar days. */
   baselineDurationDays: (d: number) => (d === 1 ? "1 día" : `${d} días`),
   /** Baseline span within a single calendar day. */
@@ -69,7 +72,7 @@ export const APP_STRINGS_ES = {
   versionShort: (v: number) => `LB${v}`,
   toggleHistoricalBaselines: "Líneas base",
   closePanel: "Cerrar",
-  /** Reason persisted on the load-time LB1 snapshot (see plan-mapper). */
+  /** Reason persisted on the LB1 materialized at first capture (see captureBaseline). */
   baselineOriginalReason: "Carga inicial del plan",
   /** Reason for the manually-captured entry (seed of a Fijar línea base). */
   baselineManualReason: "Captura manual",
@@ -105,4 +108,31 @@ export const APP_STRINGS_ES = {
   dependencyCycleBlocked: "(cerraría un ciclo)",
   /** Badge on a connector whose constraint the current dates violate. */
   dependencyViolated: "Fuera de secuencia",
+
+  // ----- CPM -----
+  /** Legend for the critical-path paint: saturated resting fill = float 0. */
+  criticalPathLegend: (n: number) =>
+    `Ruta crítica: ${n} ${n === 1 ? "evento" : "eventos"} con holgura 0 (relleno saturado)`,
+
+  // ----- EVM -----
+  evmTitle: "Valor ganado (EVM)",
+  evmDataDate: (d: string) => `Corte: ${d}`,
+  evmBac: "BAC",
+  evmPv: "PV",
+  evmEv: "EV",
+  evmAc: "AC",
+  evmSpi: "SPI",
+  evmCpi: "CPI",
+  evmEac: "EAC",
+  evmSv: "SV",
+  evmCv: "CV",
+  evmEtc: "ETC",
+  evmTcpi: "TCPI",
+  evmVac: "VAC",
+
+  // ----- carga del plan (backend) -----
+  loadingPlan: "Cargando plan…",
+  /** Shown when GET /api/plans/:id failed and the demo entity took over. */
+  offlineFallbackNote:
+    "Sin conexión al backend: usando el plan demo en memoria (sin persistencia).",
 } as const

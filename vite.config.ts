@@ -10,4 +10,11 @@ export default defineConfig({
       '@': path.resolve(import.meta.dirname, './src'),
     },
   },
+  server: {
+    proxy: {
+      // Dev-time proxy to the local gantt-api (same-origin /api in prod
+      // is handled by the nginx vhost).
+      '/api': 'http://127.0.0.1:4600',
+    },
+  },
 })

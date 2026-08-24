@@ -57,6 +57,8 @@ import {
   toGanttResources,
 } from "@/lib/plan-mapper"
 import { wouldCreateCycle, dependentClosure, type ScheduleAdjustment } from "@/lib/umejson/schedule"
+import { cpmSchedule } from "@/lib/umejson/cpm"
+import { isDrifted as isPlanDrifted, type DriftSubject } from "@/lib/umejson/baselines"
 import { applyOps, encodeUpdatedPlan, type ChangeOp } from "@/lib/umejson/codec"
 import { decodeUmePlan, type UmeJsonEntity, type ValidationError } from "@/lib/umejson/schema"
 import { wbsLevelStyle } from "@/lib/wbs-levels"
@@ -222,37 +224,9 @@ function GanttPlanViewerInner({
   )
 
   // ----- bitono: resting pastel / progress overlay per event -----
-  // Dirty = the LIVE event's dates differ from its drift reference (see
-  // `driftReference`): the vigente baseline when the bitácora has one, else
-  // the plan's original dates stamped by the mapper. When they line up,
-  // the resting fill is the phase's 80% pastel; when they don't, it's
-  // red-200 to signal "modified". The progress overlay keeps the phase's
-  // full color either way - only the resting surface shifts to communicate
-  // drift. Drag->release and Fijar línea base both flow through `events`,
-  // so this map stays in sync without an effect.
-  const barToneByEventId = useMemo(() => {
-    const map = new Map<
-      string,
-      { resting: string; progress: string } | undefined
-    >()
-    for (const ev of events) {
-      const tones = barTones(ev.color)
-      map.set(ev.id, {
-        resting: isDrifted(ev) ? DIRTY_TINT : tones.light,
-        progress: tones.dark,
-      })
-    }
-    return map
-  }, [events])
-
-  // STABLE identity: the engine's per-row layout memo calls this for every
-  // segment, and a fresh closure per render would rebuild every row. The
-  // map is the source of truth; the callback only looks up.
-  const getEventBarTone = useCallback(
-    ({ event }: { event: GanttEvent<EventData> }) =>
-      barToneByEventId.get(event.id),
-    [barToneByEventId],
-  )
+  // The resting fill encodes the bar's STATE (dirty > critical > resting
+  // pastel); the map itself now lives after `livePlan`, where the CPM
+  // critical set is computed. See the block below `livePlan`.
 
   // STABLE identity, same contract. The phase color for a group comes from
   // any descendant event (the plan maps phases per-resource and groups
@@ -403,6 +377,45 @@ function GanttPlanViewerInner({
     () => (ops.length ? applyOps(originalPlan, ops) : originalPlan),
     [ops, originalPlan],
   )
+
+  // Ruta crítica sobre el plan VIVO: reacciona a cada op (drag, cascada,
+  // borde nuevo) sin tocar el motor vendorizado.
+  const criticalIds = useMemo(
+    () => cpmSchedule(livePlan).critical,
+    [livePlan],
+  )
+
+  // Resting fill = estado de la barra: dirty (rojo) > crítica (fase
+  // full-strength) > pastel de fase. Dirty = las fechas vivas difieren de
+  // la referencia de drift (política promovida en `umejson/baselines.ts`);
+  // crítica = holgura total 0 según `umejson/cpm.ts` sobre el plan vivo.
+  // El overlay de avance conserva el full-strength de fase siempre - solo
+  // la superficie de resting comunica estado. STABLE identity: el memo
+  // del motor por fila llama este callback para cada segmento.
+  const barToneByEventId = useMemo(() => {
+    const map = new Map<
+      string,
+      { resting: string; progress: string } | undefined
+    >()
+    for (const ev of events) {
+      const tones = barTones(ev.color)
+      map.set(ev.id, {
+        resting: isDriftedEvent(ev)
+          ? DIRTY_TINT
+          : criticalIds.has(ev.id)
+            ? tones.dark
+            : tones.light,
+        progress: tones.dark,
+      })
+    }
+    return map
+  }, [events, criticalIds])
+
+  const getEventBarTone = useCallback(
+    ({ event }: { event: GanttEvent<EventData> }) =>
+      barToneByEventId.get(event.id),
+    [barToneByEventId],
+  )
   const documentOut = useMemo(
     () => (ops.length ? encodeUpdatedPlan(entity, livePlan, ops.length) : null),
     [ops, entity, livePlan],
@@ -431,35 +444,48 @@ function GanttPlanViewerInner({
       setEvents((prev) =>
         prev.map((ev) => {
           const involved = ev.id === eventId || idSet.has(ev.id)
-          if (!involved || !ev.data || !isDrifted(ev)) return ev
+          if (!involved || !ev.data || !isDriftedEvent(ev)) return ev
           const history = ev.data.baselines ?? []
           const nextVersion = history.reduce(
             (max, b) => Math.max(max, b.version),
             0,
           )
+          // Restored contract: the FIRST capture on a bare task materializes
+          // LB1 at the plan's original dates before appending the capture, so
+          // the log reads "original + capture". Lazy - only for drifted bars
+          // at capture time - so the timeline stays free of the ghosts the
+          // retired load-time LB1 painted under every unmoved bar.
+          const entries: PlanBaseline[] = []
+          if (!history.length && ev.data.initialStart && ev.data.initialEnd) {
+            entries.push({
+              version: 1,
+              start: ev.data.initialStart,
+              end: ev.data.initialEnd,
+              capturedAt: originalPlan.anchor,
+              reason: APP_STRINGS_ES.baselineOriginalReason,
+            })
+          }
+          entries.push({
+            version: nextVersion + entries.length + 1,
+            start: ev.start.toISOString(),
+            end: ev.end.toISOString(),
+            capturedAt,
+            reason:
+              ev.id === eventId
+                ? APP_STRINGS_ES.baselineManualReason
+                : APP_STRINGS_ES.baselineCascadeReason(seed.title),
+          })
           return {
             ...ev,
             data: {
               ...ev.data,
-              baselines: [
-                ...history,
-                {
-                  version: nextVersion + 1,
-                  start: ev.start.toISOString(),
-                  end: ev.end.toISOString(),
-                  capturedAt,
-                  reason:
-                    ev.id === eventId
-                      ? APP_STRINGS_ES.baselineManualReason
-                      : APP_STRINGS_ES.baselineCascadeReason(seed.title),
-                },
-              ],
+              baselines: [...history, ...entries],
             },
           }
         }),
       )
     },
-    [events, livePlan],
+    [events, livePlan, originalPlan],
   )
 
   // Connectors read the LIVE engine events: a violation lights up during the
@@ -739,6 +765,12 @@ function GanttPlanViewerInner({
           >
             Reiniciar plan
           </Button>
+          <span
+            className="text-muted-foreground text-xs"
+            data-slot="gantt-critical-legend"
+          >
+            {APP_STRINGS_ES.criticalPathLegend(criticalIds.size)}
+          </span>
         </div>
         <ChangesetPanel recorder={recorder} documentOut={documentOut} />
       </div>
@@ -755,39 +787,24 @@ function useRecorderOps(recorder: ChangesetRecorder): ChangeOp[] {
   return ops
 }
 
-/** Pure merge of cascade adjustments into an events array (by event id). */
 /**
- * The reference a bar's drift is measured against: the vigente baseline
- * (highest-version bitácora entry) when one exists, else the plan's
- * original dates stamped by the mapper. Shared by the dirty tone and the
- * cascade capture so both always agree on what "drifted" means. Null only
- * for events mapped before initialStart/initialEnd existed AND without
- * any capture.
+ * The drift policy lives in `umejson/baselines.ts` and speaks plan types
+ * (ISO strings); the engine's live events carry Dates. This adapter is
+ * the ONLY translation point - dirty tint, cascade capture and any future
+ * consumer (the change-request module) share one rule by construction.
  */
-function driftReference(
-  ev: GanttEvent<EventData>,
-): { start: Date; end: Date } | null {
-  const history = ev.data?.baselines ?? []
-  const vigente = history.length
-    ? history.reduce((max, b) => (b.version > max.version ? b : max))
-    : null
-  if (vigente) {
-    return { start: new Date(vigente.start), end: new Date(vigente.end) }
+function isDriftedEvent(ev: GanttEvent<EventData>): boolean {
+  const subject: DriftSubject = {
+    start: ev.start.toISOString(),
+    end: ev.end.toISOString(),
+    baselines: ev.data?.baselines,
+    initialStart: ev.data?.initialStart,
+    initialEnd: ev.data?.initialEnd,
   }
-  const s = ev.data?.initialStart
-  const e = ev.data?.initialEnd
-  return s && e ? { start: new Date(s), end: new Date(e) } : null
+  return isPlanDrifted(subject)
 }
 
-function isDrifted(ev: GanttEvent<EventData>): boolean {
-  const ref = driftReference(ev)
-  return (
-    !!ref &&
-    (ev.start.getTime() !== ref.start.getTime() ||
-      ev.end.getTime() !== ref.end.getTime())
-  )
-}
-
+/** Pure merge of cascade adjustments into an events array (by event id). */
 function applyAdjustmentsTo(
   events: GanttEvent<EventData>[],
   adjustments: readonly ScheduleAdjustment[],
@@ -948,6 +965,13 @@ function BaselineHistoryPanel({
     (a, b) => b.version - a.version,
   )
   const currentEndMs = event.end.getTime()
+  // One summed Δ for the whole bitácora: same per-entry rounding the rows
+  // use, so the total always equals what the user would add by hand.
+  const totalDeltaDays = history.reduce(
+    (sum, b) =>
+      sum + Math.round((currentEndMs - new Date(b.end).getTime()) / 86_400_000),
+    0,
+  )
   const left = Math.min(
     Math.max(anchor.x, HISTORY_CARD_HALF_W + 8),
     window.innerWidth - HISTORY_CARD_HALF_W - 8,
@@ -975,6 +999,16 @@ function BaselineHistoryPanel({
             {APP_STRINGS_ES.currentPlan}:{" "}
             {format(event.start, "d MMM yyyy", { locale: LOCALE_ES })} →{" "}
             {format(event.end, "d MMM yyyy", { locale: LOCALE_ES })}
+          </span>
+          <span
+            className={cn(
+              "font-medium tabular-nums",
+              totalDeltaDays > 0 && "text-destructive",
+              totalDeltaDays < 0 && "text-emerald-600 dark:text-emerald-400",
+              totalDeltaDays === 0 && "text-muted-foreground",
+            )}
+          >
+            {APP_STRINGS_ES.baselineTotalDelta(totalDeltaDays)}
           </span>
         </div>
         <button

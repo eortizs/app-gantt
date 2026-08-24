@@ -42,22 +42,77 @@ export type DecodeResult =
   | { ok: true; entity: UmeJsonEntity; plan: PlanJSON }
   | { ok: false; errors: ValidationError[] }
 
-const err = (path: string, code: string, message: string): ValidationError => ({
+// Shared validator DSL: exported so sibling decoders (change-request)
+// validate with the exact same primitives instead of forking their own.
+export const err = (path: string, code: string, message: string): ValidationError => ({
   path,
   code,
   message,
 })
 
-const isObject = (v: unknown): v is Record<string, unknown> =>
+export const isObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v)
 
-const isIsoDate = (s: unknown): s is string => {
+export const isIsoDate = (s: unknown): s is string => {
   if (typeof s !== "string") return false
   const t = Date.parse(s)
   return Number.isFinite(t)
 }
 
-const STATUSES: readonly UmeJsonStatus[] = ["active", "draft", "validation_required"]
+export const UME_STATUSES: readonly UmeJsonStatus[] = ["active", "draft", "validation_required"]
+
+/**
+ * Envelope validation shared by the sibling entity decoders (budget,
+ * actuals, ...): the exact checks `decodeUmePlan` runs on id / entityName
+ * / lifecycle / state / markdownDocumentation, parameterized by entity
+ * name. Payload validation stays each decoder's own business.
+ */
+export function validateUmeEnvelope(
+  input: Record<string, unknown>,
+  expectedEntityName: string,
+): ValidationError[] {
+  const errors: ValidationError[] = []
+  for (const req of ["id", "entityName", "dynamicProperties", "lifecycle", "state", "markdownDocumentation"]) {
+    if (!(req in input)) errors.push(err(req, "missing", `field "${req}" is required`))
+  }
+  if (typeof input.id !== "string" || input.id === "") {
+    errors.push(err("id", "type", "id must be a non-empty string"))
+  } else if (input.id === SENTINEL) {
+    errors.push(err("id", "sentinel", "id must not be RESERVED_FOR_SYSTEM (document not finalized)"))
+  }
+  if (input.entityName !== expectedEntityName) {
+    errors.push(err("entityName", "enum", `entityName must be "${expectedEntityName}"`))
+  }
+  if (typeof input.markdownDocumentation !== "string") {
+    errors.push(err("markdownDocumentation", "type", "markdownDocumentation must be a string"))
+  }
+  if (!isObject(input.dynamicProperties)) {
+    errors.push(err("dynamicProperties", "type", "dynamicProperties must be an object"))
+  }
+  if (!isObject(input.lifecycle)) {
+    errors.push(err("lifecycle", "type", "lifecycle must be an object"))
+  } else {
+    const lc = input.lifecycle
+    if (!isIsoDate(lc.createdAt)) errors.push(err("lifecycle.createdAt", "iso", "createdAt must be ISO date string"))
+    else if (lc.createdAt === SENTINEL) errors.push(err("lifecycle.createdAt", "sentinel", "createdAt must not be RESERVED_FOR_SYSTEM"))
+    if (!isIsoDate(lc.updatedAt)) errors.push(err("lifecycle.updatedAt", "iso", "updatedAt must be ISO date string"))
+    else if (lc.updatedAt === SENTINEL) errors.push(err("lifecycle.updatedAt", "sentinel", "updatedAt must not be RESERVED_FOR_SYSTEM"))
+    if (typeof lc.version !== "number" || !Number.isInteger(lc.version) || lc.version < 1) {
+      errors.push(err("lifecycle.version", "type", "version must be integer >= 1"))
+    }
+  }
+  if (!isObject(input.state)) {
+    errors.push(err("state", "type", "state must be an object"))
+  } else {
+    if (!UME_STATUSES.includes(input.state.current as UmeJsonStatus)) {
+      errors.push(err("state.current", "enum", `current must be one of ${UME_STATUSES.join(", ")}`))
+    }
+    if (!Array.isArray(input.state.statusLog)) {
+      errors.push(err("state.statusLog", "type", "statusLog must be an array"))
+    }
+  }
+  return errors
+}
 
 export function decodeUmePlan(input: unknown): DecodeResult {
   const errors: ValidationError[] = []
@@ -101,8 +156,8 @@ export function decodeUmePlan(input: unknown): DecodeResult {
     errors.push(err("state", "type", "state must be an object"))
   } else {
     const st = input.state as Record<string, unknown>
-    if (!STATUSES.includes(st.current as UmeJsonStatus)) {
-      errors.push(err("state.current", "enum", `current must be one of ${STATUSES.join(", ")}`))
+    if (!UME_STATUSES.includes(st.current as UmeJsonStatus)) {
+      errors.push(err("state.current", "enum", `current must be one of ${UME_STATUSES.join(", ")}`))
     }
     if (!Array.isArray(st.statusLog)) {
       errors.push(err("state.statusLog", "type", "statusLog must be an array"))

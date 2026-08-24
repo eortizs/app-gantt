@@ -12,7 +12,42 @@ import {
   SENTINEL,
   type UmeJsonEntity,
 } from "../src/lib/umejson/schema.ts"
-import { cascadeSchedule, dependentClosure, wouldCreateCycle } from "../src/lib/umejson/schedule.ts"
+import {
+  cascadeSchedule,
+  dependentClosure,
+  wouldCreateCycle,
+} from "../src/lib/umejson/schedule.ts"
+import { cpmSchedule } from "../src/lib/umejson/cpm.ts"
+import {
+  buildBudgetEntity,
+  decodeBudget,
+  type BudgetPayload,
+  type UmeBudgetEntity,
+} from "../src/lib/umejson/budget.ts"
+import {
+  buildActualsEntity,
+  decodeActuals,
+  type ActualsPayload,
+  type UmeActualsEntity,
+} from "../src/lib/umejson/actuals.ts"
+import { computeEvm, pvFraction } from "../src/lib/umejson/evm.ts"
+import {
+  vigenteBaseline,
+  driftReference,
+  isDrifted,
+  restoreBaselineOp,
+  driftDays,
+} from "../src/lib/umejson/baselines.ts"
+import {
+  buildImpactSnapshot,
+  createChangeRequest,
+  canTransition,
+  transitionChangeRequest,
+  encodeChangeRequest,
+  decodeChangeRequest,
+  ENTITY_NAME_CHANGE_REQUEST,
+  type UmeChangeRequestEntity,
+} from "../src/lib/umejson/change-request.ts"
 import type { PlanJSON } from "../src/lib/plan-types.ts"
 
 const fails: string[] = []
@@ -448,6 +483,636 @@ for (const [label, input] of rejectionCases) {
       fail("deps: preserved through encode", "graph differs after encode")
     } else ok("deps: preserved through encode")
   }
+}
+
+// ---- 11. Política de drift promovida (umejson/baselines.ts) --------------
+{
+  const t = (days: number) => new Date(Date.parse(ISO) + days * 86_400_000).toISOString()
+
+  // Vigente = highest version, NOT the last array position.
+  const shuffled = [
+    { version: 2, start: t(0), end: t(0), capturedAt: ISO },
+    { version: 3, start: t(0), end: t(0), capturedAt: ISO },
+    { version: 1, start: t(0), end: t(0), capturedAt: ISO },
+  ]
+  if (vigenteBaseline(shuffled)?.version !== 3) fail("drift-lib: vigente is highest version", String(vigenteBaseline(shuffled)?.version))
+  else ok("drift-lib: vigente is highest version")
+  if (vigenteBaseline([]) !== null || vigenteBaseline(undefined) !== null) fail("drift-lib: empty history", "not null")
+  else ok("drift-lib: empty history yields null")
+
+  // Reference: vigente wins over the initial anchor; fallback to initial;
+  // null when neither anchor exists.
+  const withHistory = driftReference({
+    start: t(1), end: t(2),
+    baselines: [{ version: 1, start: t(0), end: t(0), capturedAt: ISO }],
+    initialStart: t(9), initialEnd: t(9),
+  })
+  if (withHistory?.start !== t(0)) fail("drift-lib: vigente wins", JSON.stringify(withHistory))
+  else ok("drift-lib: vigente wins over initial anchor")
+  const withInitialOnly = driftReference({ start: t(1), end: t(2), initialStart: t(9), initialEnd: t(9) })
+  if (withInitialOnly?.start !== t(9)) fail("drift-lib: falls back to initial", JSON.stringify(withInitialOnly))
+  else ok("drift-lib: falls back to initial")
+  if (driftReference({ start: t(1), end: t(2) }) !== null) fail("drift-lib: no anchor", "not null")
+  else ok("drift-lib: no anchor yields null")
+
+  // Instants, not strings: same moment in differently-normalized ISO is
+  // NOT drift.
+  const bare = "2026-01-12T12:00:00Z"
+  const milli = "2026-01-12T12:00:00.000Z"
+  if (isDrifted({ start: bare, end: bare, initialStart: milli, initialEnd: milli })) {
+    fail("drift-lib: instant equality", "same instant flagged as drift")
+  } else ok("drift-lib: compares instants, not strings")
+
+  if (!isDrifted({ start: t(1), end: t(2), initialStart: t(0), initialEnd: t(1) })) fail("drift-lib: detects drift", "false negative")
+  else ok("drift-lib: detects drift")
+  if (isDrifted({ start: t(0), end: t(1), initialStart: t(0), initialEnd: t(1) })) fail("drift-lib: clean is clean", "false positive")
+  else ok("drift-lib: clean is clean")
+  if (isDrifted({ start: t(1), end: t(2) })) fail("drift-lib: no reference", "flagged without anchor")
+  else ok("drift-lib: no reference is not drift")
+
+  // Shared rounding: reports and the panel can never disagree.
+  if (driftDays(t(3), t(0)) !== 3 || driftDays(t(-2), t(0)) !== -2) fail("drift-lib: driftDays rounding", String(driftDays(t(3), t(0))))
+  else ok("drift-lib: driftDays rounding")
+}
+
+// ---- 12. restoreBaselineOp: reversión como datos --------------------------
+{
+  const t = (days: number) => new Date(Date.parse(ISO) + days * 86_400_000).toISOString()
+  const history = [
+    { version: 1, start: t(0), end: t(2), capturedAt: ISO },
+    { version: 2, start: t(4), end: t(6), capturedAt: ISO },
+  ]
+  const op = restoreBaselineOp("e1", history, 2)
+  if (!op || op.op !== "update" || op.id !== "e1" || op.patch.start !== t(4) || op.patch.end !== t(6)) {
+    fail("restore: op patches to LB dates", JSON.stringify(op))
+  } else ok("restore: op patches to LB dates")
+  if (restoreBaselineOp("e1", history, 9) !== null) fail("restore: unknown version", "returned an op")
+  else ok("restore: unknown version yields null")
+}
+
+// ---- 13. buildImpactSnapshot: blast radius congelada ----------------------
+{
+  const t = (days: number) => new Date(Date.parse(ISO) + days * 86_400_000).toISOString()
+  const plan: PlanJSON = {
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: [
+      { id: "a", resourceId: "r", start: t(0), end: t(2), progress: 0 },
+      { id: "b", resourceId: "r", start: t(1), end: t(3), progress: 0 },
+      { id: "c", resourceId: "r", start: t(2), end: t(4), progress: 0 },
+    ],
+    dependencies: [
+      { id: "d1", fromEventId: "a", toEventId: "b", type: "FS" },
+      { id: "d2", fromEventId: "b", toEventId: "c", type: "FS" },
+    ],
+  }
+
+  // Seed-only ops: b and c land in the blast radius via closure even
+  // though no op moves them - their proposed dates equal the base, so
+  // their drift against the plan's own dates is 0 (honest fan-out).
+  const snapSeed = buildImpactSnapshot(plan, [
+    { op: "update", id: "a", patch: { start: t(5), end: t(7) } },
+  ])
+  const byIdSeed = new Map(snapSeed.entries.map((e) => [e.eventId, e]))
+  const aS = byIdSeed.get("a")
+  const bS = byIdSeed.get("b")
+  if (
+    snapSeed.entries.length !== 3 ||
+    aS?.driftDays !== 5 ||
+    bS?.driftDays !== 0 ||
+    byIdSeed.get("c")?.driftDays !== 0
+  ) {
+    fail("impact: closure fan-out", JSON.stringify(snapSeed.entries))
+  } else ok("impact: closure fan-out with frozen drift")
+
+  // With the cascade ops the recorder would emit, dependents show their
+  // own drift (b end t(9) vs base t(3) = +6; c end t(11) vs t(4) = +7).
+  const snapCascade = buildImpactSnapshot(plan, [
+    { op: "update", id: "a", patch: { start: t(5), end: t(7) } },
+    { op: "update", id: "b", patch: { start: t(7), end: t(9) } },
+    { op: "update", id: "c", patch: { start: t(9), end: t(11) } },
+  ])
+  const byIdCascade = new Map(snapCascade.entries.map((e) => [e.eventId, e]))
+  if (byIdCascade.get("a")?.driftDays !== 5 || byIdCascade.get("b")?.driftDays !== 6 || byIdCascade.get("c")?.driftDays !== 7) {
+    fail("impact: cascade drift", JSON.stringify(snapCascade.entries))
+  } else ok("impact: cascade ops surface per-event drift")
+
+  // A created event has no anchor: entry present, reference/drift absent.
+  const snapCreate = buildImpactSnapshot(plan, [
+    {
+      op: "create",
+      event: {
+        id: "n", resourceId: "r", start: t(1), end: t(2), progress: 0,
+        title: "N", data: { responsable: "—", fase: "", status: "Pendiente" },
+      },
+    },
+  ])
+  const nEntry = snapCreate.entries.find((e) => e.eventId === "n")
+  if (!nEntry || "reference" in nEntry || "driftDays" in nEntry) {
+    fail("impact: created event has no anchor", JSON.stringify(nEntry))
+  } else ok("impact: created event has no anchor")
+
+  // A deleted seed produces no entry (gone, not "impacted").
+  const snapDelete = buildImpactSnapshot(plan, [{ op: "delete", id: "a" }])
+  if (snapDelete.entries.length !== 0) fail("impact: deleted seed", JSON.stringify(snapDelete.entries))
+  else ok("impact: deleted seed yields no entry")
+
+  // Purity: the snapshot never mutates the base plan.
+  const before = JSON.parse(JSON.stringify(plan))
+  buildImpactSnapshot(plan, [
+    { op: "update", id: "a", patch: { start: t(5), end: t(7) } },
+    { op: "addDependency", dependency: { id: "d9", fromEventId: "c", toEventId: "a", type: "SS" } },
+  ])
+  if (!deepEqual(plan, before)) fail("impact: purity", "base plan mutated")
+  else ok("impact: purity")
+
+  // A baseline in force re-anchors the drift (policy: vigente ?? original).
+  const anchored: PlanJSON = {
+    ...plan,
+    events: plan.events.map((e) =>
+      e.id === "a"
+        ? { ...e, baselines: [{ version: 1, start: t(4), end: t(6), capturedAt: ISO }] }
+        : e,
+    ),
+  }
+  const snapAnchored = buildImpactSnapshot(anchored, [
+    { op: "update", id: "a", patch: { start: t(7), end: t(9) } },
+  ])
+  const aAnchored = snapAnchored.entries.find((e) => e.eventId === "a")
+  if (aAnchored?.driftDays !== 3 || aAnchored.reference?.end !== t(6)) {
+    fail("impact: vigente re-anchors drift", JSON.stringify(aAnchored))
+  } else ok("impact: vigente re-anchors drift")
+}
+
+// ---- 14. Contrato de change request (umejson/change-request.ts) -----------
+{
+  const t = (days: number) => new Date(Date.parse(ISO) + days * 86_400_000).toISOString()
+  const plan: PlanJSON = {
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: [
+      { id: "a", resourceId: "r", start: t(0), end: t(2), progress: 0 },
+      { id: "b", resourceId: "r", start: t(1), end: t(3), progress: 0 },
+    ],
+    dependencies: [{ id: "d1", fromEventId: "a", toEventId: "b", type: "FS" }],
+  }
+  const ops: ChangeOp[] = [
+    { op: "update", id: "a", patch: { start: t(5), end: t(7) } },
+    {
+      op: "update",
+      id: "b",
+      patch: { start: t(7), end: t(9) },
+      cause: { kind: "dependency-cascade", sourceEventId: "a", type: "FS", shiftDays: 6 },
+    },
+  ]
+
+  // Proposal born coherent: snapshot computed from the SAME plan it binds to.
+  const cr = createChangeRequest({ planEntityId: "plan-1", planAnchor: plan.anchor, basePlan: plan, ops })
+  if (
+    cr.status !== "proposed" ||
+    cr.statusLog.length !== 1 ||
+    cr.statusLog[0]?.status !== "proposed" ||
+    cr.requestedBy !== SENTINEL ||
+    cr.impact.entries.length !== 2
+  ) {
+    fail("cr: proposal shape", JSON.stringify({ status: cr.status, log: cr.statusLog.length, impact: cr.impact.entries.length }))
+  } else ok("cr: proposal born with coherent impact")
+
+  // Legal/illegal transitions.
+  const approved = transitionChangeRequest(cr, "approved", "Aprobado por PMO")
+  if (!approved || approved.status !== "approved" || approved.statusLog.length !== 2 || approved.decidedBy !== SENTINEL) {
+    fail("cr: proposed -> approved", JSON.stringify(approved?.statusLog))
+  } else ok("cr: proposed -> approved (decidedBy stamped)")
+  if (transitionChangeRequest(cr, "applied") !== null) fail("cr: proposed -> applied is illegal", "returned a payload")
+  else ok("cr: proposed -> applied is illegal")
+  const rejected = transitionChangeRequest(cr, "rejected")
+  if (!rejected || transitionChangeRequest(rejected, "approved") !== null) fail("cr: rejected is terminal", "resurrected")
+  else ok("cr: rejected is terminal")
+  const applied = approved ? transitionChangeRequest(approved, "applied") : null
+  if (!applied || applied.statusLog.length !== 3) fail("cr: approved -> applied", JSON.stringify(applied?.statusLog))
+  else ok("cr: approved -> applied")
+  if (canTransition("proposed", "approved") === false || canTransition("applied", "applied")) {
+    fail("cr: canTransition table", "wrong answer")
+  } else ok("cr: canTransition table")
+
+  // Envelope discipline mirrors encodeUpdatedPlan: clone + sentinel
+  // updatedAt + appended statusLog; input untouched.
+  const crEntity: UmeChangeRequestEntity = {
+    id: "00000000-0000-4000-8000-000000000002",
+    entityName: ENTITY_NAME_CHANGE_REQUEST,
+    dynamicProperties: { changeRequest: cr },
+    lifecycle: { createdAt: ISO, updatedAt: ISO, deletedAt: null, version: 1 },
+    state: { current: "active", statusLog: [] },
+    markdownDocumentation: "# cr",
+  }
+  const appliedPayload = applied ?? cr
+  const encoded = encodeChangeRequest(crEntity, appliedPayload)
+  if (
+    encoded === crEntity ||
+    encoded.lifecycle.updatedAt !== SENTINEL ||
+    encoded.state.statusLog[0]?.reason !== `change-request: ${appliedPayload.status}` ||
+    crEntity.lifecycle.updatedAt !== ISO
+  ) {
+    fail("cr: encode discipline", JSON.stringify({ updatedAt: encoded.lifecycle.updatedAt, reason: encoded.state.statusLog[0]?.reason }))
+  } else ok("cr: encode discipline (sentinel + statusLog + input untouched)")
+
+  // Round-trip: decode the PRE-encode envelope; the payload survives
+  // untouched (ops, causes, impact, audit log).
+  const preEncode: UmeChangeRequestEntity = { ...crEntity, dynamicProperties: { changeRequest: appliedPayload } }
+  const decoded = decodeChangeRequest(preEncode, plan, "plan-1")
+  if (!decoded.ok) fail("cr: decode happy path with plan binding", decoded.errors[0]?.message ?? "rejected")
+  else if (!deepEqual(decoded.cr, appliedPayload)) fail("cr: round-trip payload", "differs after decode")
+  else ok("cr: round-trip preserves payload + plan binding")
+
+  // The ENCODED envelope is for the backend: sentinel updatedAt must be
+  // rejected by this same client (same asymmetry as the plan codec).
+  if (decodeChangeRequest(encoded).ok) fail("cr: encoded envelope is not re-decodable", "accepted sentinel updatedAt")
+  else ok("cr: encoded envelope is not re-decodable")
+
+  const crPayload = (patch: Record<string, unknown>): unknown => ({
+    ...crEntity,
+    dynamicProperties: { changeRequest: { ...appliedPayload, ...patch } },
+  })
+  const crRejections: Array<[string, unknown]> = [
+    ["wrong entityName", { ...crEntity, entityName: "Other", dynamicProperties: { changeRequest: appliedPayload } }],
+    ["schemaVersion 2", crPayload({ schemaVersion: 2 })],
+    ["unknown status", crPayload({ status: "paused" })],
+    ["empty statusLog", crPayload({ statusLog: [] })],
+    ["log head not proposed", crPayload({ status: "approved", statusLog: [{ status: "approved", timestamp: ISO }] })],
+    ["illegal transition in log", crPayload({ status: "applied", statusLog: [
+      { status: "proposed", timestamp: ISO },
+      { status: "applied", timestamp: ISO },
+    ] })],
+    ["log tail mismatches status", crPayload({ status: "approved" })],
+    ["malformed update op", crPayload({ ops: [{ op: "update", id: "a", patch: { start: "nope", end: t(1) } }] })],
+    ["addDependency bad type", crPayload({ ops: [{ op: "addDependency", dependency: { id: "x", fromEventId: "a", toEventId: "b", type: "XX" } }] })],
+    ["bad cause shape", crPayload({ ops: [{ op: "update", id: "a", patch: { start: t(0), end: t(1) }, cause: { kind: "manual" } }] })],
+  ]
+  for (const [label, input] of crRejections) {
+    const d = decodeChangeRequest(input)
+    if (d.ok) fail(`reject cr: ${label}`, "decoder accepted it")
+    else ok(`reject cr: ${label}`)
+  }
+
+  // Revision binding, checked against a supplied plan.
+  const driftedPlan: PlanJSON = { ...plan, anchor: t(99) }
+  if (decodeChangeRequest(preEncode, driftedPlan).ok) fail("reject cr: anchor mismatch", "accepted a CR bound to another revision")
+  else ok("reject cr: anchor mismatch")
+  if (decodeChangeRequest(preEncode, plan, "other-plan").ok) fail("reject cr: plan entity mismatch", "accepted")
+  else ok("reject cr: plan entity mismatch")
+  const ghostOp = crPayload({ ops: [{ op: "update", id: "ghost", patch: { start: t(0), end: t(1) } }], status: "proposed", statusLog: [{ status: "proposed", timestamp: ISO }] })
+  if (decodeChangeRequest(ghostOp, plan).ok) fail("reject cr: unknown op target", "accepted")
+  else ok("reject cr: unknown op target")
+}
+
+// ---- 15. CPM: forward/backward pass, holguras y conjunto crítico -------
+{
+  const t = (days: number) => Date.parse(ISO) + days * 86_400_000
+  const planWith = (
+    events: Array<{ id: string; s: number; e: number }>,
+    deps: Array<{ id: string; from: string; to: string; type: "FS" | "SS" | "FF" | "SF"; lag?: number }>,
+  ): PlanJSON => ({
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: events.map((x) => ({
+      id: x.id,
+      resourceId: "r",
+      start: new Date(x.s).toISOString(),
+      end: new Date(x.e).toISOString(),
+      progress: 0,
+    })),
+    dependencies: deps.map((d) => ({
+      id: d.id,
+      fromEventId: d.from,
+      toEventId: d.to,
+      type: d.type,
+      ...(d.lag !== undefined ? { lagDays: d.lag } : {}),
+    })),
+  })
+  const day = (v: number | undefined) => (v === undefined ? undefined : Math.round((v - Date.parse(ISO)) / 86_400_000))
+
+  // Branch with an FS lag: A(0-2) -> B lag+1 (3-6), A -> C (2-7).
+  // C ends last and binds A; B banks one day of float.
+  {
+    const r = cpmSchedule(planWith(
+      [{ id: "a", s: t(0), e: t(2) }, { id: "b", s: t(3), e: t(6) }, { id: "c", s: t(2), e: t(7) }],
+      [
+        { id: "d1", from: "a", to: "b", type: "FS", lag: 1 },
+        { id: "d2", from: "a", to: "c", type: "FS" },
+      ],
+    ))
+    if (r.projectEnd !== t(7)) fail("cpm: branch project end", String(day(r.projectEnd)))
+    else if (day(r.es.get("a")) !== 0 || day(r.ef.get("a")) !== 2) fail("cpm: branch a es/ef", JSON.stringify([...r.es]))
+    else if (day(r.es.get("b")) !== 3 || day(r.es.get("c")) !== 2) fail("cpm: branch successor es (lag)", JSON.stringify([...r.es]))
+    else if (r.floatDays.get("a") !== 0 || r.floatDays.get("b") !== 1 || r.floatDays.get("c") !== 0) {
+      fail("cpm: branch floats", JSON.stringify([...r.floatDays]))
+    } else if (
+      r.critical.size !== 2 || !r.critical.has("a") || !r.critical.has("c") || r.critical.has("b")
+    ) {
+      fail("cpm: branch critical set", JSON.stringify([...r.critical]))
+    } else ok("cpm: FS branch with lag (floats + critical set)")
+  }
+
+  // SS + FF semantics: X(0-4), Y SS X (0-3), Z FF X (2-4).
+  {
+    const r = cpmSchedule(planWith(
+      [{ id: "x", s: t(0), e: t(4) }, { id: "y", s: t(0), e: t(3) }, { id: "z", s: t(2), e: t(4) }],
+      [
+        { id: "d1", from: "x", to: "y", type: "SS" },
+        { id: "d2", from: "x", to: "z", type: "FF" },
+      ],
+    ))
+    if (r.projectEnd !== t(4)) fail("cpm: ss/ff project end", String(day(r.projectEnd)))
+    else if (day(r.es.get("y")) !== 0 || day(r.es.get("z")) !== 2) fail("cpm: ss/ff forward", JSON.stringify([...r.es]))
+    else if (day(r.ls.get("y")) !== 1) fail("cpm: ss backward (y ls)", JSON.stringify([...r.ls]))
+    else if (r.floatDays.get("y") !== 1 || r.floatDays.get("x") !== 0 || r.floatDays.get("z") !== 0) {
+      fail("cpm: ss/ff floats", JSON.stringify([...r.floatDays]))
+    } else if (r.critical.size !== 2 || !r.critical.has("x") || !r.critical.has("z")) {
+      fail("cpm: ss/ff critical set", JSON.stringify([...r.critical]))
+    } else ok("cpm: SS/FF constraints drive both passes")
+  }
+
+  // Diamond: A(0-2) -> B(2-4) and C(2-5) -> D(5-7). C's chain binds.
+  {
+    const r = cpmSchedule(planWith(
+      [{ id: "a", s: t(0), e: t(2) }, { id: "b", s: t(2), e: t(4) }, { id: "c", s: t(2), e: t(5) }, { id: "d", s: t(5), e: t(7) }],
+      [
+        { id: "d1", from: "a", to: "b", type: "FS" },
+        { id: "d2", from: "a", to: "c", type: "FS" },
+        { id: "d3", from: "b", to: "d", type: "FS" },
+        { id: "d4", from: "c", to: "d", type: "FS" },
+      ],
+    ))
+    if (r.floatDays.get("b") !== 1) fail("cpm: diamond b float", String(r.floatDays.get("b")))
+    else if (r.critical.size !== 3 || !r.critical.has("a") || !r.critical.has("c") || !r.critical.has("d") || r.critical.has("b")) {
+      fail("cpm: diamond critical set", JSON.stringify([...r.critical]))
+    } else ok("cpm: diamond takes the binding branch")
+  }
+
+  // Negative lag (lead): A(0-2) -> B FS lag -1 (1-3). Both critical.
+  {
+    const r = cpmSchedule(planWith(
+      [{ id: "a", s: t(0), e: t(2) }, { id: "b", s: t(1), e: t(3) }],
+      [{ id: "d", from: "a", to: "b", type: "FS", lag: -1 }],
+    ))
+    if (day(r.es.get("b")) !== 1) fail("cpm: lead forward", JSON.stringify([...r.es]))
+    else if (r.floatDays.get("a") !== 0 || r.floatDays.get("b") !== 0) fail("cpm: lead floats", JSON.stringify([...r.floatDays]))
+    else ok("cpm: negative lag (lead) respected")
+  }
+
+  // Isolated task: its own critical path.
+  {
+    const r = cpmSchedule(planWith([{ id: "solo", s: t(10), e: t(13) }], []))
+    if (r.projectEnd !== t(13)) fail("cpm: isolated project end", String(day(r.projectEnd)))
+    else if (r.floatDays.get("solo") !== 0 || r.critical.size !== 1 || !r.critical.has("solo")) {
+      fail("cpm: isolated critical", JSON.stringify([...r.critical]))
+    } else ok("cpm: isolated task is its own critical path")
+  }
+
+  // Empty plan: structured nothing, not a crash.
+  {
+    const r = cpmSchedule(planWith([], []))
+    if (r.projectEnd !== null || r.critical.size !== 0 || r.es.size !== 0) {
+      fail("cpm: empty plan", JSON.stringify({ projectEnd: r.projectEnd, critical: r.critical.size }))
+    } else ok("cpm: empty plan yields empty result")
+  }
+
+  // As-planned floor: a successor scheduled LATER than its constraint
+  // demands cannot bank that gap as float — it still binds the project.
+  {
+    const r = cpmSchedule(planWith(
+      [{ id: "a", s: t(0), e: t(2) }, { id: "b", s: t(4), e: t(6) }],
+      [{ id: "d", from: "a", to: "b", type: "FS" }],
+    ))
+    if (day(r.es.get("b")) !== 4) fail("cpm: as-planned floor es", String(day(r.es.get("b"))))
+    else if (r.floatDays.get("b") !== 0 || !r.critical.has("b")) fail("cpm: as-planned floor float", JSON.stringify([...r.floatDays]))
+    else ok("cpm: as-planned floor (banked start is not float)")
+  }
+}
+
+// ---- 16. Entidades contables: GanttBudget / GanttActuals -----------------
+{
+  const t = (days: number) => new Date(Date.parse(ISO) + days * 86_400_000).toISOString()
+  const plan: PlanJSON = {
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: [
+      { id: "a", resourceId: "r", start: t(0), end: t(4), progress: 50 },
+      {
+        id: "b",
+        resourceId: "r",
+        start: t(4),
+        end: t(8),
+        progress: 0,
+        baselines: [{ version: 1, start: t(4), end: t(6), capturedAt: ISO }],
+      },
+    ],
+  }
+  const budgetPayload: BudgetPayload = {
+    schemaVersion: 1,
+    currency: "MXN",
+    timePhasing: "uniform",
+    bacByEvent: { a: 100_000, b: 40_000 },
+  }
+  const budgetEntity: UmeBudgetEntity = buildBudgetEntity({
+    id: "00000000-0000-4000-8000-000000000002",
+    planEntityId: "plan-1",
+    planAnchor: ISO,
+    budget: budgetPayload,
+  })
+  const actualsPayload: ActualsPayload = {
+    schemaVersion: 1,
+    dataDate: t(4),
+    planAnchor: ISO,
+    acByEvent: { a: 60_000 },
+    baselineVersionByEvent: { b: 1 },
+  }
+  const actualsEntity: UmeActualsEntity = buildActualsEntity({
+    id: "00000000-0000-4000-8000-000000000003",
+    planEntityId: "plan-1",
+    actuals: actualsPayload,
+  })
+
+  // Happy paths + round-trip + plan binding.
+  const dBudget = decodeBudget(budgetEntity, plan, "plan-1")
+  if (!dBudget.ok) fail("budget: happy path", dBudget.errors[0]?.message ?? "rejected")
+  else if (!deepEqual(dBudget.budget, budgetPayload)) fail("budget: round-trip", "payload differs")
+  else ok("budget: decodes with plan binding (round-trip)")
+  const dActuals = decodeActuals(actualsEntity, plan, "plan-1")
+  if (!dActuals.ok) fail("actuals: happy path", dActuals.errors[0]?.message ?? "rejected")
+  else if (!deepEqual(dActuals.actuals, actualsPayload)) fail("actuals: round-trip", "payload differs")
+  else ok("actuals: decodes with plan binding (round-trip)")
+
+  const budgetWith = (patch: Record<string, unknown>): unknown => ({
+    ...budgetEntity,
+    dynamicProperties: { budget: { ...budgetPayload, ...patch } },
+  })
+  const actualsWith = (patch: Record<string, unknown>): unknown => ({
+    ...actualsEntity,
+    dynamicProperties: { actuals: { ...actualsPayload, ...patch } },
+  })
+  const budgetRejects: Array<[string, unknown]> = [
+    ["budget: wrong entityName", { ...budgetEntity, entityName: "Other" }],
+    ["budget: negative BAC", budgetWith({ bacByEvent: { a: -1 } })],
+    ["budget: non-numeric BAC", budgetWith({ bacByEvent: { a: "mucho" } })],
+    ["budget: front-loaded phasing", budgetWith({ timePhasing: "front-loaded" })],
+    ["budget: empty currency", budgetWith({ currency: "" })],
+    ["budget: schemaVersion 2", budgetWith({ schemaVersion: 2 })],
+    ["budget: sentinel updatedAt", { ...budgetEntity, lifecycle: { ...budgetEntity.lifecycle, updatedAt: SENTINEL } }],
+  ]
+  const actualsRejects: Array<[string, unknown]> = [
+    ["actuals: wrong entityName", { ...actualsEntity, entityName: "Other" }],
+    ["actuals: non-ISO dataDate", actualsWith({ dataDate: "nope" })],
+    ["actuals: sentinel dataDate", actualsWith({ dataDate: SENTINEL })],
+    ["actuals: negative AC", actualsWith({ acByEvent: { a: -5 } })],
+    ["actuals: baseline version 0", actualsWith({ baselineVersionByEvent: { b: 0 } })],
+  ]
+  for (const [label, input] of budgetRejects) {
+    if (decodeBudget(input).ok) fail(`reject contable: ${label}`, "decoder accepted it")
+    else ok(`reject contable: ${label}`)
+  }
+  for (const [label, input] of actualsRejects) {
+    if (decodeActuals(input).ok) fail(`reject contable: ${label}`, "decoder accepted it")
+    else ok(`reject contable: ${label}`)
+  }
+
+  // Ref checks against the supplied plan.
+  if (decodeBudget(budgetWith({ bacByEvent: { ghost: 1 } }), plan).ok) {
+    fail("reject contable: budgeted unknown event", "accepted")
+  } else ok("reject contable: budgeted unknown event")
+  if (decodeActuals(actualsWith({ acByEvent: { ghost: 1 } }), plan).ok) {
+    fail("reject contable: AC unknown event", "accepted")
+  } else ok("reject contable: AC unknown event")
+  if (decodeActuals(actualsWith({ baselineVersionByEvent: { b: 7 } }), plan).ok) {
+    fail("reject contable: anchored version not in bitácora", "accepted")
+  } else ok("reject contable: anchored version not in bitácora")
+  const wrongRelBudget: unknown = {
+    ...budgetEntity,
+    relations: [{ targetEntity: "GanttPlan", targetId: "other-plan", type: "one-to-one" }],
+  }
+  if (decodeBudget(wrongRelBudget, plan, "plan-1").ok) {
+    fail("reject contable: budget bound to other plan", "accepted")
+  } else ok("reject contable: budget bound to other plan")
+  const wrongRelActuals: unknown = {
+    ...actualsEntity,
+    relations: [{ targetEntity: "GanttBudget", targetId: "plan-1", type: "one-to-one" }],
+  }
+  if (decodeActuals(wrongRelActuals, plan, "plan-1").ok) {
+    fail("reject contable: relation to non-plan entity", "accepted")
+  } else ok("reject contable: relation to non-plan entity")
+}
+
+// ---- 17. EVM: PV/EV/AC y derivadas contra caso calculado a mano ----------
+{
+  const t = (days: number) => new Date(Date.parse(ISO) + days * 86_400_000).toISOString()
+  const approx = (got: number, want: number, eps = 1e-9) => Math.abs(got - want) < eps
+  const plan: PlanJSON = {
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: [
+      { id: "a", resourceId: "r", start: t(0), end: t(4), progress: 50 },
+      {
+        id: "b",
+        resourceId: "r",
+        start: t(4),
+        end: t(8),
+        progress: 0,
+        baselines: [{ version: 1, start: t(4), end: t(6), capturedAt: ISO }],
+      },
+      { id: "c", resourceId: "r", start: t(1), end: t(2), progress: 30 }, // sin BAC
+    ],
+  }
+  const budget: BudgetPayload = {
+    schemaVersion: 1,
+    currency: "MXN",
+    timePhasing: "uniform",
+    bacByEvent: { a: 100_000, b: 40_000 },
+  }
+  const actuals: ActualsPayload = {
+    schemaVersion: 1,
+    dataDate: t(4),
+    planAnchor: ISO,
+    acByEvent: { a: 60_000 },
+  }
+
+  // Hand case: PMB 100k, 50% progress, dataDate at plan end, AC 60k
+  // → CPI 5/6 ≈ 0.83, EAC 120k, SV −50k, CV −10k, TCPI 1.25, VAC −20k.
+  {
+    const r = computeEvm(plan, budget, actuals)
+    const a = r.byEvent.get("a")!
+    if (
+      !approx(a.pv, 100_000) || !approx(a.ev, 50_000) || !approx(a.ac, 60_000) ||
+      !approx(a.sv, -50_000) || !approx(a.cv, -10_000) ||
+      !approx(a.spi ?? 0, 0.5) || !approx(a.cpi ?? 0, 5 / 6, 1e-12) ||
+      !approx(a.eac ?? 0, 120_000) || !approx(a.etc ?? 0, 60_000) ||
+      !approx(a.tcpi ?? 0, 1.25) || !approx(a.vac ?? 0, -20_000)
+    ) {
+      fail("evm: hand case", JSON.stringify(a))
+    } else ok("evm: hand case (PMB 100k, 50%, AC 60k → CPI 0.83, EAC 120k)")
+
+    // PV over the VIGENTE BASELINE window, not the live dates: b's PMB
+    // spans LB1 t(4)..t(6); at dataDate t(4) the fraction is 0.
+    const b = r.byEvent.get("b")!
+    if (!approx(b.pv, 0)) fail("evm: baseline window PV", String(b.pv))
+    else ok("evm: PV phases over the vigente baseline window")
+
+    // Project roll-up: same formulas over the sums (EAC = BAC/CPI).
+    const p = r.project
+    if (
+      !approx(p.bac, 140_000) || !approx(p.pv, 100_000) || !approx(p.ev, 50_000) ||
+      !approx(p.ac, 60_000) || !approx(p.eac ?? 0, 168_000)
+    ) {
+      fail("evm: project roll-up", JSON.stringify(p))
+    } else ok("evm: project roll-up (EAC 168k over summed BAC)")
+
+    // Events without BAC participate with zeroed metrics, no crash.
+    const c = r.byEvent.get("c")!
+    if (c.bac !== 0 || c.ev !== 0 || c.spi !== null || c.eac !== null) {
+      fail("evm: event without BAC", JSON.stringify(c))
+    } else ok("evm: event without BAC is zeroed, not fatal")
+  }
+
+  // CPI 0 (spent, earned nothing): EAC/ETC/VAC null; TCPI still meaningful.
+  {
+    const zeroPlan: PlanJSON = { ...plan, events: [plan.events[1]!] } // b: progress 0
+    const zr = computeEvm(zeroPlan, budget, {
+      ...actuals,
+      dataDate: t(4),
+      acByEvent: { b: 24_000 },
+    })
+    const z = zr.byEvent.get("b")!
+    if (z.cpi !== 0 || z.eac !== null || z.etc !== null || z.vac !== null) {
+      fail("evm: CPI 0 edge", JSON.stringify(z))
+    } else if (!approx(z.tcpi ?? 0, 2.5)) {
+      fail("evm: CPI 0 tcpi", String(z.tcpi))
+    } else ok("evm: CPI 0 → EAC/ETC/VAC null, TCPI finite")
+  }
+
+  // Data date outside the windows clamps instead of extrapolating.
+  {
+    const late = computeEvm(plan, budget, { ...actuals, dataDate: t(99) })
+    if (!approx(late.byEvent.get("a")!.pv, 100_000)) fail("evm: late PV clamp", String(late.byEvent.get("a")!.pv))
+    else ok("evm: dataDate after the window clamps PV to BAC")
+    const early = computeEvm(plan, budget, { ...actuals, dataDate: t(-9) })
+    const e = early.byEvent.get("a")!
+    if (e.pv !== 0 || e.spi !== null) fail("evm: early PV clamp", JSON.stringify(e))
+    else ok("evm: dataDate before the window → PV 0, SPI null")
+  }
+
+  // Degenerate window (milestone): all-or-nothing.
+  if (pvFraction(10, 10, 10) !== 1 || pvFraction(9, 10, 10) !== 0) {
+    fail("evm: degenerate window", "milestone fraction wrong")
+  } else ok("evm: degenerate (zero-span) window is all-or-nothing")
 }
 
 if (fails.length) {

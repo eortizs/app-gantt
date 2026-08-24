@@ -1,21 +1,36 @@
 # app-gantt · Módulo Gantt — Construcción de departamento
 
-Viewer Gantt editable construido con **React 19 + Vite 8 + TypeScript**, que consume el motor headless `@reui/gantt` (adaptado del árbol `src/components/reui/gantt/`) y un set de datos sintéticos de una obra (departamento) generado al cargar el módulo.
+Viewer Gantt editable construido con **React 19 + Vite 8 + TypeScript**, que consume el motor headless `@reui/gantt` (adaptado del árbol `src/components/reui/gantt/`), un set de datos sintéticos de una obra (departamento) y — desde la v2 del módulo — el **backend `gantt-api`** (Fastify + pg, workspace pnpm `server/`) que persiste el plan como documento umeJSON en PostgreSQL.
 
-- **Stack**: React 19.2, Vite 8.2, TypeScript 6.0, Tailwind v4, `date-fns` 4, `@base-ui/react` 1.7, `react-day-picker` 10, `lucide-react`.
+- **Stack frontend**: React 19.2, Vite 8.2, TypeScript 6.0, Tailwind v4, `date-fns` 4, `@base-ui/react` 1.7, `react-day-picker` 10, `lucide-react`.
+- **Stack backend**: Fastify 5 + `pg`, Node ≥ 22.18 (TypeScript nativo por strip-types, sin transpilador), PostgreSQL 16.
 - **Lint**: `oxlint` (config en `.oxlintrc.json`).
 - **Build artefact**: `dist/` (servido por nginx en `/var/www/apps/gantt/` → `https://gantt.aeon-ia.com/`).
 
 ## Scripts
 
+Raíz (workspace pnpm: app + `server/`; **no usar npm** — reescribe el lockfile):
+
 ```bash
-pnpm install        # instala dependencias (NO usar npm — reescribe el lockfile)
-pnpm dev            # vite dev server (http://localhost:5173)
-pnpm build          # tsc -b && vite build → dist/
-pnpm preview        # sirve dist/ en local
-pnpm lint           # oxlint
-pnpm verify         # round-trip del codec umeJSON (Node --experimental-strip-types)
+pnpm install                     # instala ambos paquetes del workspace
+pnpm dev                         # vite dev server (http://localhost:5173, proxy /api → 127.0.0.1:4600)
+pnpm build                       # tsc -b && vite build → dist/
+pnpm preview                     # sirve dist/ en local
+pnpm lint                        # oxlint
+pnpm verify                      # round-trip + invariantes del contrato umeJSON (Node strip-types)
 ```
+
+Backend (`server/`):
+
+```bash
+pnpm --filter server dev         # node --watch src/index.ts (127.0.0.1:4600)
+pnpm --filter server start       # node src/index.ts (producción, systemd)
+pnpm --filter server typecheck   # tsc noEmit
+pnpm --filter server migrate     # runner de migraciones idempotente (server/src/db/migrations/*.sql)
+pnpm --filter server seed        # upsert idempotente del plan demo + budget + actuals (ON CONFLICT DO NOTHING)
+```
+
+Orden de verificación tras un cambio: `pnpm lint && pnpm build && pnpm verify` (frontend + contrato); cambios de backend agregan `pnpm --filter server typecheck && pnpm --filter server migrate` + smoke `curl -s localhost:4600/api/health`.
 
 ## Estructura
 
@@ -23,38 +38,55 @@ pnpm verify         # round-trip del codec umeJSON (Node --experimental-strip-ty
 src/
 ├── components/
 │   ├── gantt-plan/
-│   │   ├── GanttPlanViewer.tsx   # vista principal: monta <Gantt> con plan sintético + slider de profundidad
-│   │   └── ChangesetPanel.tsx    # panel inferior: muestra el contrato JSON (cambios)
+│   │   ├── GanttPlanViewer.tsx   # vista principal (caja negra umeJSON): bitono dirty/crítico, bitácora, dependencias
+│   │   ├── ChangesetPanel.tsx    # panel inferior: muestra el contrato JSON (cambios)
+│   │   └── EvmPanel.tsx          # tarjetas BAC/PV/EV/AC/SPI/CPI/EAC sobre el plan vivo
 │   ├── reui/gantt/               # motor gantt headless (gantt.tsx, gantt-view.tsx, ...)
 │   └── ui/                       # primitivos shadcn-style (button, slider, scroll-area, tooltip, ...)
 ├── data/
-│   └── plan-departamento.ts      # plan sintético (schema v2): WBS de 4–5 niveles, 7 fases, ~28 eventos
+│   ├── plan-departamento.ts      # plan sintético (schema v2): WBS de 4–5 niveles, 7 fases, ~31 eventos
+│   ├── demo-entity.ts            # envelope umeJSON demo (única definición: fallback App + seed backend)
+│   └── demo-contables.ts         # builders demo de GanttBudget / GanttActuals (tarifa×días, wiggle determinista)
 ├── lib/
 │   ├── plan-types.ts             # tipos PlanJSON v2 + EventData (compartidos data ↔ lib ↔ umejson)
 │   ├── plan-mapper.ts            # PlanJSON → GanttEvent[] + GanttResource[] (puro sobre el plan recibido)
 │   ├── wbs-levels.ts             # paleta L0–L4 + helper wbsLevelStyle(depth)
-│   ├── changeset.ts              # recorder de operaciones (drag/resize/create); re-exporta ChangeOp
-│   ├── umejson/
-│   │   ├── schema.ts             # tipos UmeJsonEntity + decoder hand-rolled (envelope + payload)
-│   │   └── codec.ts              # ChangeOp + applyOps() + encodeUpdatedPlan() (capa anti-corrupción)
+│   ├── changeset.ts              # recorder de operaciones (drag/resize/create/dependencias); re-exporta ChangeOp
+│   ├── umejson/                  # CONTRATO (runtime-puro, imports relativos .ts — lo importa el backend verbatim)
+│   │   ├── schema.ts             # UmeJsonEntity + decodeUmePlan() + validateUmeEnvelope() (DSL compartido)
+│   │   ├── codec.ts              # ChangeOp + applyOps() + encodeUpdatedPlan() (capa anti-corrupción)
+│   │   ├── schedule.ts           # grafo: cascadeSchedule (push-forward), dependentClosure, wouldCreateCycle
+│   │   ├── baselines.ts          # política de drift: vigenteBaseline, driftReference/isDrifted, driftDays
+│   │   ├── change-request.ts     # contrato del módulo de control de cambios (entidad propia, transiciones legales)
+│   │   ├── cpm.ts                # CPM runtime-puro: ES/EF/LS/LF, holgura total, conjunto crítico
+│   │   ├── budget.ts             # entidad hermana GanttBudget (BAC por evento, uniform) + decodeBudget
+│   │   ├── actuals.ts            # entidad hermana GanttActuals (AC + dataDate + ancla baseline) + decodeActuals
+│   │   └── evm.ts                # EVM runtime-pura: PV/EV/AC + SV/CV/SPI/CPI/EAC/ETC/TCPI/VAC
 │   ├── i18n-es.ts                # traducciones + locale es-AR
 │   └── utils.ts                  # cn() y helpers
-├── scripts/
-│   └── verify-roundtrip.mts      # round-trip + invariantes del codec (corre con pnpm verify)
-├── App.tsx                       # shell: construye la entidad umeJSON demo + monta GanttPlanViewer
-├── App.tsx                       # shell (header + GanttPlanViewer)
+├── App.tsx                       # shell: fetch del bundle (plan+budget+actuals) con fallback demo + EVM
 ├── main.tsx                      # entrypoint React 19 createRoot
 └── index.css                     # tailwind v4 + tokens del tema
+server/                           # gantt-api (paquete del workspace)
+├── src/
+│   ├── index.ts                  # Fastify 127.0.0.1:4600: health + GET/PUT plans + budget|actuals
+│   ├── config.ts                 # carga server/.env manual (fail-fast al boot)
+│   ├── entities.ts               # store híbrido JSONB + columnas promovidas + stampSentinels + lock optimista
+│   └── db/
+│       ├── pool.ts               # pool pg (max 10)
+│       ├── migrate.ts            # runner de migraciones (schema_migrations, transacción por archivo)
+│       └── migrations/           # 001_ume_entities.sql, 002_sibling_lookup_index.sql
+└── scripts/seed.ts               # seed idempotente (plan + budget + actuals, decodificado antes de persistir)
 public/                           # assets estáticos (favicon, íconos)
 ```
 
 ## Ejemplo: plan sintético de departamento
 
-El módulo carga, en cada mount, un plan de obra generado a partir del inicio de la semana actual (`src/data/plan-departamento.ts:72`). Consta de:
+El módulo carga, en cada mount, un plan de obra generado a partir del inicio de la semana actual (`src/data/plan-departamento.ts:57`). Consta de:
 
 - **7 fases** (groups L1): Preliminares · Cimentación · Estructura · Albañilería · Instalaciones · Acabados · Entrega.
 - **~45 recursos** estructurados como WBS plano de 4–5 niveles (L0 proyecto → L1 fases → L2 paquetes → L3/L4 tareas). Cada `PlanResource` apunta a su padre con `parentId` y hereda el color de fase vía `phaseId` (resuelto en `plan-mapper.ts`).
-- **~28 eventos** (schedules) con duraciones, offsets relativos al ancla, avance (`progress`) y responsable (`Cuadrilla A/B`, `Ing. Ríos`, `Mtro. Solís`, `Electricista`, etc.).
+- **~31 eventos** (schedules) con duraciones, offsets relativos al ancla, avance (`progress`) y responsable (`Cuadrilla A/B`, `Ing. Ríos`, `Mtro. Solís`, `Electricista`, etc.).
 
 El timeline arranca en escala `month` (por defecto), centrado en `now`, con `infiniteScroll`, `nowIndicator`, `dragCreate`, `displayScheduleHint` y `summaryBars` activados — la UI replica un Gantt de obra real: navegación por mes con flechas, cambio de escala (Día / Semana / Mes / Trimestre / Año), botón **Hoy**, fechas en español y tooltips localizados.
 
@@ -140,11 +172,11 @@ export type ChangeOp = UpdateOp | CreateOp | DeleteOp
 
 El panel `ChangesetPanel` inferior muestra dos secciones: el **`Op[]`** acumulado y, cuando hay cambios, el **documento umeJSON actualizado** (entidad lista para POST). Ambos con **Copiar JSON**.
 
-> **Nota sobre borrado**: la UI aún no expone borrado de eventos (la API del engine lo soporta vía `GanttApi.removeEvent` pero no hay interacción cableada). `DeleteOp` queda en el contrato y `applyOps` lo entiende, pero el recorder no lo emite hoy.
+> **Nota sobre borrado**: el menú contextual de cada barra expone borrado (`DeleteOp` vía `recorder.onEventDelete` + `GanttApi.removeEvent`); `applyOps` poda las dependencias incidentes para que el documento nunca quede con refs colgantes.
 
 ## Pipeline umeJSON (caja negra)
 
-El módulo Gantt consume y produce **una sola entidad umeJSON** (`entityName: "GanttPlan"`, `dynamicProperties.plan` = `PlanJSON` v2 completo). La frontera entre el documento externo y el dominio interno cruza por un codec puro en `src/lib/umejson/`.
+El módulo Gantt consume y produce **una sola entidad umeJSON** (`entityName: "GanttPlan"`, `dynamicProperties.plan` = `PlanJSON` v2 completo), ahora servida por `GET /api/plans/:id`. La frontera entre el documento externo y el dominio interno cruza por un codec puro en `src/lib/umejson/`.
 
 ```
        ┌─────────────────────────────────────────────────────────────┐
@@ -188,17 +220,67 @@ out ──▶│  ChangeOp[]  +  entityOut  ──▶  ChangesetPanel           
 pnpm verify   # node --experimental-strip-types scripts/verify-roundtrip.mts
 ```
 
-Cubre: round-trip del payload, `applyOps(update+create+delete)`, rechazos (schemaVersion≠2, fecha malformada, `resourceId` huérfano, sentinel en `id`, `entityName` incorrecto) e inmutabilidad del input.
+Cubre: round-trip del payload, `applyOps(update+create+delete+dependencias)`, cascada documentada, política de drift, contrato de change requests, CPM (lag, SS/FF, diamante, lead, tarea aislada, vacío), entidades contables (decode happy/rejections/refs) y EVM (caso calculado a mano, CPI 0, cortes fuera de rango).
+
+## Backend `gantt-api` (`server/`)
+
+Servicio Fastify + pg que escucha **solo en 127.0.0.1:4600** (nginx proxyea `/api/` desde el vhost TLS — mismo origen, sin CORS, `limit_req` 10r/s burst 20). Importa los módulos de `src/lib/umejson/` **verbatim**: la misma validación que corre el frontend corre en el borde del backend — única fuente de verdad del contrato. Node ≥ 22.18 ejecuta el TS nativo (strip-types), sin transpilador.
+
+### Endpoints
+
+| Ruta | Descripción |
+|---|---|
+| `GET /api/health` | `{ ok, db, revision }` (smoke; `db: false` → 503) |
+| `GET /api/plans/:id` | Documento umeJSON del plan (404 si no existe); los bytes persistidos se devuelven tal cual |
+| `PUT /api/plans/:id` | Body `{ entity, expectedRevision }`; ver abajo |
+| `GET/PUT /api/plans/:planId/budget` | Entidad hermana `GanttBudget` del plan (la más reciente) |
+| `GET/PUT /api/plans/:planId/actuals` | Entidad hermana `GanttActuals` del plan |
+
+### Pipeline del PUT
+
+1. **Estampado de sentinels** (idempotente): `lifecycle.updatedAt` y cada `statusLog[].timestamp == RESERVED_FOR_SYSTEM` → `now`. Persistencia limpia: la DB jamás contiene sentinels.
+2. **Versión**: `lifecycle.version = expectedRevision + 1` — el server es el único escritor del contador.
+3. **Decode en el borde**: `decodeUmePlan` / `decodeBudget` / `decodeActuals` rechazan con **422** cualquier violación del contrato (incluidos sentinels remanentes).
+4. **Identidad**: `entity.id` debe matchear la ruta; las hermanas deben relacionarse (`relations[0].targetId`) con el plan de la ruta.
+5. **Upsert con lock optimista**: `INSERT ... ON CONFLICT (id) DO UPDATE ... WHERE ume_entities.revision = $expected` — 0 filas → **409** con la revisión actual.
+
+### Persistencia híbrida
+
+`ume_entities`: documento íntegro en JSONB (fuente de verdad) + columnas promovidas (`status`, `revision`, `plan_entity_id`) mantenidas por el servidor en cada write (escritor único = sin drift), con índices GIN sobre el documento y btree para lookups de hermanos y health. Migraciones: archivos `.sql` en `server/src/db/migrations/`, aplicadas en orden por el runner (`pnpm --filter server migrate`); el servicio también las corre al boot (transacción por archivo, tabla `schema_migrations`).
+
+### Configuración
+
+`server/.env` (gitignored, mode 640 root:gantt; template en `server/.env.example`): `DATABASE_URL` (rol `system`, owner de `db_umejson`) y `PORT=4600`. Carga manual sin dotenv, fail-fast al boot. Credenciales jamás en archivos trackeados.
+
+## Entidades contables y EVM
+
+El schema del plan queda **congelado en v2**; los datos contables viven en entidades umeJSON hermanas vinculadas por `relations[]`:
+
+- **`GanttBudget`** (`budget.ts`): BAC por evento + moneda + time-phasing `uniform` (única política de la v1). `decodeBudget(input, plan?, planEntityId?)` valida BAC ≥ 0 finito y refs contra el plan suministrado.
+- **`GanttActuals`** (`actuals.ts`): AC acumulado por evento + `dataDate` de corte + `baselineVersionByEvent` (qué versión vigente de la bitácora era la referencia al cortar — cross-checkeada contra la bitácora real).
+- **EVM** (`evm.ts`, runtime-pura — nada se persiste, es una lente): `computeEvm(plan, budget, actuals)` produce PV (BAC distribuido uniformemente sobre la ventana de referencia de drift = baseline anclada/vigente, clamped [0, BAC]), EV (BAC × progress), AC (corte) y SV/CV/SPI/CPI/EAC/ETC/TCPI/VAC por evento y proyecto. Los índices son `null` cuando el denominador no tiene sentido (PV 0, AC 0); CPI 0 con AC > 0 es una respuesta real. El `EvmPanel` pinta tarjetas con semáforo (rojo < 0.9, ámbar < 1, verde ≥ 1) sobre el **plan vivo** (`applyOps(basePlan, ops)`).
+
+Demo: `demo-contables.ts` genera montos sintéticos realistas (tarifa por fase × días para BAC; BAC × avance × wiggle determinista [0.85–1.15] para AC) — el fallback offline de `App.tsx` y el seed del backend usan los mismos builders.
+
+## CPM (ruta crítica)
+
+`cpmSchedule(plan)` (`cpm.ts`, runtime-pura) computa el forward pass (ES/EF, reusando `earliestStart` del cascade — misma semántica de restricciones), backward pass (LS/LF desde el fin del proyecto = max EF), **holgura total** (LS−ES, días corridos) y el conjunto crítico (float 0). Convención **as-planned**: ES = max(inicio planificado, restricciones) — la holgura que el planificador "guardó" arrancando tarde no es float. El viewer pinta las barras críticas con resting saturado (fase full-strength) vía los hooks de bitono; el tint dirty (drift vs referencia) tiene prioridad.
 
 ## Despliegue
 
-`dist/` se sincroniza al directorio servido por nginx:
+Frontend — `dist/` se sincroniza al directorio servido por nginx:
 
 ```bash
-npm run build && rsync -a --delete dist/ /var/www/apps/gantt/
+pnpm build && rsync -a --delete dist/ /var/www/apps/gantt/
 ```
 
-El host virtual (`/etc/nginx/sites-enabled/gantt.aeon-ia.com`) sirve ese directorio como `https://gantt.aeon-ia.com/`.
+Backend — corre como unidad systemd:
+
+- `gantt-api.service`: `User=gantt`, `EnvironmentFile=server/.env`, `ExecStart=node server/src/index.ts`, `Restart=always`, hardening (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=read-only`).
+- Cambios de código necesitan `systemctl restart gantt-api.service`.
+- nginx (`/etc/nginx/sites-enabled/gantt.aeon-ia.com`): `location /api/` → `proxy_pass http://127.0.0.1:4600` con `limit_req` (zona `gantt_api` en `/etc/nginx/conf.d/gantt-api-limit.conf`, 10r/s burst 20, 429).
+
+El host virtual sirve el estático de `/var/www/apps/gantt` como `https://gantt.aeon-ia.com/`.
 
 ## Convenciones
 

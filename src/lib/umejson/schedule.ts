@@ -33,9 +33,10 @@ const lagMs = (dep: PlanDependency): number => (dep.lagDays ?? 0) * DAY_MS
  * Earliest instant the successor's `start` may sit at, given the
  * predecessor's current range and the constraint type. FS/SS bound the
  * start directly; FF/SF bound the END, so the start backs off by the
- * successor's preserved duration.
+ * successor's preserved duration. Exported for CPM's forward pass: both
+ * computations must agree on what a constraint demands, byte for byte.
  */
-function earliestStart(
+export function earliestStart(
   predStartMs: number,
   predEndMs: number,
   succDurationMs: number,
