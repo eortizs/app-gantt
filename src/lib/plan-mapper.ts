@@ -9,7 +9,6 @@ import type {
   PlanJSON,
   PlanResource,
 } from "@/lib/plan-types"
-import { APP_STRINGS_ES } from "@/lib/i18n-es"
 
 export function toGanttEvents(plan: PlanJSON): GanttEvent<EventData>[] {
   const byId = new Map(plan.resources.map((r) => [r.id, r]))
@@ -22,23 +21,12 @@ export function toGanttEvents(plan: PlanJSON): GanttEvent<EventData>[] {
   return plan.events.map((e) => {
     const phaseId = resolvePhaseId(e.resourceId, byId) ?? ""
     const resource = byId.get(e.resourceId)
-    // Load-time snapshot: every event carries at least LB1, the plan AS
-    // LOADED. Events with a persisted history keep theirs (their LB1 was
-    // captured when the document was authored); the rest get one synthesized
-    // from their own dates. This is what makes the first explicit capture a
-    // TWO-entry log - the default line plus the new one.
-    const baselines =
-      e.baselines && e.baselines.length > 0
-        ? e.baselines
-        : [
-            {
-              version: 1,
-              start: e.start,
-              end: e.end,
-              capturedAt: plan.anchor,
-              reason: APP_STRINGS_ES.baselineOriginalReason,
-            },
-          ]
+    // Baselines exist ONLY where a real capture happened: the seeded demo
+    // history shipped in the plan, or an explicit «Fijar línea base». No
+    // load-time LB1 is synthesized - a synthetic one anchored every bar's
+    // original position, so each drag left a full-size colored remnant
+    // pinned at the old dates (read as a useless ghost). First explicit
+    // capture on a bare task yields a single-entry log.
     return {
       id: e.id,
       title: resource?.title ?? titleize(e.resourceId),
@@ -52,7 +40,14 @@ export function toGanttEvents(plan: PlanJSON): GanttEvent<EventData>[] {
         responsable: resource?.responsable ?? "—",
         fase: phaseId,
         status: statusFor(e.progress),
-        baselines,
+        // Original dates: the drift anchor for tasks that never captured
+        // a baseline. Kept in EventData (not PlanEvent) so the bitácora
+        // stays append-only and «Reiniciar plan» re-stamps fresh ones.
+        initialStart: e.start,
+        initialEnd: e.end,
+        ...(e.baselines && e.baselines.length > 0
+          ? { baselines: e.baselines }
+          : {}),
       },
     }
   })

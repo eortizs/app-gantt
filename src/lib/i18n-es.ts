@@ -28,6 +28,11 @@ export const I18N_ES: GanttI18nOverrides = {
     startDate: "Fecha de inicio",
     endDate: "Fecha de fin",
     continues: "continúa",
+    connectHandleTitle: "Arrastra hasta otra tarea para crear una dependencia",
+    announceConnected: (from, to) =>
+      `Dependencia creada: ${from} → ${to}`,
+    announceConnectBlocked: (from) =>
+      `No se puede ligar desde ${from}: cerraría un ciclo, ya existe o apunta a la misma tarea`,
     scales: {
       day: "Día",
       week: "Semana",

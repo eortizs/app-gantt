@@ -133,6 +133,19 @@ interface GanttCallbacks<TData = unknown> {
    * (a toast) - the destructive drop indicator already shows it live.
    */
   onResourceReorderReject?: (proposal: GanttResourceReorder) => void
+  /**
+   * Live veto while hovering during a connect-drag between two events.
+   * `false` blocks the drop on the candidate target (destructive indicator,
+   * `not-allowed` cursor, no commit). Default true.
+   */
+  canConnectEvents?: (ctx: { fromEventId: string; toEventId: string }) => boolean
+  /**
+   * Commit fired when the user releases a connect-drag on a valid target.
+   * The engine never mutates events: the consumer wires this to its own
+   * dependency pipeline (ChangeOps, persistence, cascade). Domain-free on
+   * purpose; the consumer decides type/lag/lifecycle.
+   */
+  onEventConnect?: (ctx: { fromEventId: string; toEventId: string }) => void
 }
 
 interface UseGanttStateOptions<TData = unknown> extends GanttCallbacks<TData> {
@@ -1700,6 +1713,8 @@ const OPTION_KEYS: Array<keyof UseGanttStateOptions> = [
   "onResourceReorder",
   "onResourceReorderReject",
   "canReorderResource",
+  "canConnectEvents",
+  "onEventConnect",
 ]
 
 function shallowEqualRecord(

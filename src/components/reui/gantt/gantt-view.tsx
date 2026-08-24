@@ -3602,6 +3602,45 @@ const GanttTimelineRow = memo(function GanttTimelineRow({
                 colorOverride={overlay?.color ?? barResting}
                 progressTintOverride={overlay?.progressColor ?? barProgress}
               />
+              {settings.onEventConnect && segment.isStart && (
+                <span
+                  data-slot="gantt-connect-handle"
+                  data-edge="start"
+                  aria-hidden
+                  title={settings.i18n.labels.connectHandleTitle}
+                  // Fully OUTSIDE the bar edge horizontally: a strip
+                  // straddling the edge would sit above the bar button
+                  // (later positioned sibling wins the hit-test) and steal
+                  // the resize grips and edge grabs that used to start a
+                  // move. It also PROTRUDES vertically past the bar: the
+                  // dependency connectors anchor at the edge's mid-height
+                  // and their fat clickable stroke (12px) swallows any grab
+                  // there - the protrusions stay the corridor-free grab
+                  // zone. The dot centers on the bar's mid-height: the same
+                  // height where connectors anchor and where the connect
+                  // drag's preview line starts, so the three always line up.
+                  className="absolute -inset-y-2 -start-3 flex w-3 cursor-crosshair items-center justify-center opacity-0 group-hover/gantt-seg:opacity-100 pointer-coarse:opacity-100"
+                  onPointerDown={(e) =>
+                    gestures.beginConnect(e, segment.occurrence.event.id)
+                  }
+                >
+                  <span className="bg-foreground/60 size-2 rounded-full" />
+                </span>
+              )}
+              {settings.onEventConnect && segment.isEnd && (
+                <span
+                  data-slot="gantt-connect-handle"
+                  data-edge="end"
+                  aria-hidden
+                  title={settings.i18n.labels.connectHandleTitle}
+                  className="absolute -inset-y-2 -end-3 flex w-3 cursor-crosshair items-center justify-center opacity-0 group-hover/gantt-seg:opacity-100 pointer-coarse:opacity-100"
+                  onPointerDown={(e) =>
+                    gestures.beginConnect(e, segment.occurrence.event.id)
+                  }
+                >
+                  <span className="bg-foreground/60 size-2 rounded-full" />
+                </span>
+              )}
               {placement !== "inside" && (
                 <span
                   data-slot="gantt-bar-label"

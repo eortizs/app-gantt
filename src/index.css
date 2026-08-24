@@ -154,3 +154,22 @@
     @apply font-sans;
     }
 }
+
+/* Connect-drag target highlighting: a per-frame imperative attribute on the
+   bar under the cursor. UNLAYERED on purpose: these must beat the bar's own
+   `outline-none` utility, and in Tailwind v4 the utilities layer wins over
+   every @layer — inside layers the ring never painted and detection was
+   invisible. Unlayered CSS outranks all layers. */
+[data-slot="gantt-bar"][data-connect-target="valid"] {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px color-mix(in oklab, var(--color-primary) 22%, transparent);
+}
+[data-slot="gantt-bar"][data-connect-target="invalid"] {
+  outline: 2px dashed var(--color-destructive);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px color-mix(in oklab, var(--color-destructive) 22%, transparent);
+}
+[data-slot="gantt-connect-overlay"] {
+  color: var(--color-foreground);
+}

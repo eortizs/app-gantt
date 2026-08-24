@@ -48,6 +48,12 @@ interface GanttI18nConfig {
     endDate: string
     /** Appended to the bar aria-label when its segment is clipped by the range. */
     continues: string
+    /** Hover/focus title for the edge handle that starts a connect-drag. */
+    connectHandleTitle: string
+    /** Screen-reader message after a successful connect drop. */
+    announceConnected: (fromTitle: string, toTitle: string) => string
+    /** Screen-reader message when a connect drop is blocked (cycle / dup / self). */
+    announceConnectBlocked: (fromTitle: string) => string
     scales: {
       day: string
       week: string
@@ -117,6 +123,9 @@ const DEFAULT_LABELS: GanttI18nConfig["labels"] = {
   startDate: "Start Date",
   endDate: "End Date",
   continues: "continues",
+  connectHandleTitle: "Drag to another task to link a dependency",
+  announceConnected: (from, to) => `Dependency created: ${from} → ${to}`,
+  announceConnectBlocked: (from) => `Cannot link ${from}: would close a cycle, already exists, or points to the same task`,
   scales: {
     day: "Day",
     week: "Week",

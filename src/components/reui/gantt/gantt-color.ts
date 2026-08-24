@@ -188,7 +188,14 @@ const PAST_BASELINE_RAMP: ReadonlyArray<{ pastel: string; strong: string }> = [
   { pastel: "#67e8f9", strong: "#06b6d4" }, // cyan
 ]
 
-export const DIRTY_LIGHT = "#e5e7eb" // gray-200
+/**
+ * Resting tint for a modified/drifted bar: red-200. The retired gray-200
+ * sat at the same OKLCH lightness as every resting pastel (L≈93, chroma
+ * ≈0) and was invisible next to them; red-200 is darker (L 88.5) and
+ * chromatic (C 0.059), so drift reads at a glance while dark text on the
+ * bar stays legible.
+ */
+export const DIRTY_TINT = "#fecaca" // red-200
 
 /**
  * Bitono pairs for the LIVE bar resting/progress surfaces, derived from the

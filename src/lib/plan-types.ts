@@ -70,6 +70,14 @@ export type EventData = {
   responsable: string
   fase: string
   status: string
+  /**
+   * Dates the event had when the plan was mapped. Hidden anchor for the
+   * "modified vs original" signal: tasks without a captured baseline
+   * measure drift against these. NOT a bitácora entry — it never renders
+   * as a baseline mark.
+   */
+  initialStart?: string
+  initialEnd?: string
   /** Baseline history carried through to the gantt engine's event data. */
   baselines?: PlanBaseline[]
 }

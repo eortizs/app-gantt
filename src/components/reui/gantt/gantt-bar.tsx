@@ -450,11 +450,16 @@ className: cn(
       // resize: keep the original event exactly, just fade it to a soft
       // placeholder behind the dashed preview - no dramatic restyle
       "data-[drag-kind=resize-start]:opacity-40 data-[drag-kind=resize-end]:opacity-40",
-      // hover/selected: subtle alpha on the resting translucent look; the
-      // opaque (tinted) layer can't darken with alpha, so a thin black wash
-      // lays over the bar instead - dark text on top stays legible.
-      "hover:bg-(--gantt-bar-tint)/30 data-bar-tinted:hover:bg-black/5",
-      "data-selected:bg-(--gantt-bar-tint)/30 data-bar-tinted:data-selected:bg-black/5",
+      // hover/selected: subtle alpha on the resting translucent look. The
+      // opaque (tinted) layer must stay OPAQUE in every state: a translucent
+      // background-color here would REPLACE the tint and make the bar go
+      // see-through exactly when the pointer rests on it (e.g. right after
+      // a drag), leaving the baseline lip underneath as the only visible
+      // paint. So: re-assert the opaque tint under hover/selected, and lay
+      // the darkening wash as a background-IMAGE, which stacks OVER the
+      // background-color instead of replacing it.
+      "hover:bg-(--gantt-bar-tint)/30 data-bar-tinted:hover:bg-(--gantt-bar-tint) data-bar-tinted:hover:bg-[linear-gradient(rgb(0_0_0/0.05),rgb(0_0_0/0.05))]",
+      "data-selected:bg-(--gantt-bar-tint)/30 data-bar-tinted:data-selected:bg-(--gantt-bar-tint) data-bar-tinted:data-selected:bg-[linear-gradient(rgb(0_0_0/0.05),rgb(0_0_0/0.05))]",
       segment.continuesBefore && "rounded-s-none",
       segment.continuesAfter && "rounded-e-none",
       viewConfig.classNames?.event,

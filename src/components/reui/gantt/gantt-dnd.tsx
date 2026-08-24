@@ -31,7 +31,7 @@ const GANTT_ACTIVATION = {
   touchTolerancePx: 5,
 } as const
 
-type GestureKind = "move" | "resize-start" | "resize-end" | "create"
+type GestureKind = "move" | "resize-start" | "resize-end" | "create" | "connect"
 
 interface GanttSurface {
   rect: DOMRect
@@ -136,6 +136,13 @@ interface BeginGestureConfig<TData> {
   customResizeOverlay?: boolean
   /** View-level cardinality default; a node's own scheduleMode wins. */
   scheduleMode?: GanttScheduleMode
+  /**
+   * Source event for a "connect" gesture (predecessor). When set, the gesture
+   * ignores `segment.occurrence` and treats this as the immutable `from` end
+   * of a prospective dependency. The target is resolved per-frame by hit-
+   * testing against `[data-slot=gantt-bar]`.
+   */
+  fromEventId?: string
 }
 
 function beginGesture<TData>(config: BeginGestureConfig<TData>) {
@@ -427,12 +434,214 @@ function beginGesture<TData>(config: BeginGestureConfig<TData>) {
   // resize activates immediately, so its indicator mounts with the gesture
   if (active) createResizeOverlay()
 
+  // ----- "connect" gesture state -----
+  // Hit-test against `[data-slot=gantt-bar]` per frame, highlight the target
+  // bar imperatively (no React state per move), and trace a dashed preview
+  // line from the source handle to the pointer. Commit goes through the
+  // consumer's onEventConnect; the engine never mutates the dependency graph.
+  const fromEventId =
+    config.fromEventId ?? (kind === "connect" ? occurrence?.event.id : undefined)
+  let connectOverlay: SVGSVGElement | null = null
+  let connectLine: SVGLineElement | null = null
+  let lastConnectTargetEl: HTMLElement | null = null
+  let lastConnectValid: boolean | null = null
+  let lastConnectToTitle: string | null = null
+  // Frozen at activation so a source bar that unmounts mid-gesture still
+  // anchors the preview from its last known rect.
+  let connectOriginRect: DOMRect | null = null
+  // Element-keyed memo for the occurrence lookup: bars are stable DOM nodes
+  // and the connect gesture is read-only, so each bar pays the O(n)
+  // getOccurrences() scan once per gesture instead of per pointermove.
+  const connectOccByEl = new WeakMap<
+    HTMLElement,
+    { toEventId: string; toTitle: string } | null
+  >()
+
+  const ensureConnectOverlay = () => {
+    if (connectOverlay) return
+    if (!ganttRoot) return
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg")
+    svg.setAttribute("data-slot", "gantt-connect-overlay")
+    // RTL-safe by construction: client-space coordinates mirror with the
+    // page, so a physical x1/y1 -> x2/y2 line never needs the scaleX(-1)
+    // the dependency overlay has to apply.
+    svg.className.baseVal =
+      "pointer-events-none fixed inset-0 z-100 overflow-visible"
+    adoptRootTypography(svg as unknown as HTMLElement)
+    const line = document.createElementNS(
+      "http://www.w3.org/2000/svg",
+      "line"
+    )
+    line.setAttribute("stroke-width", "2")
+    line.setAttribute("stroke-dasharray", "4 4")
+    line.setAttribute("stroke-linecap", "round")
+    line.setAttribute("x1", "0")
+    line.setAttribute("y1", "0")
+    line.setAttribute("x2", "0")
+    line.setAttribute("y2", "0")
+    svg.appendChild(line)
+    document.body.appendChild(svg)
+    connectOverlay = svg
+    connectLine = line
+  }
+
+  const clearConnectTarget = () => {
+    if (!lastConnectTargetEl) return
+    lastConnectTargetEl.removeAttribute("data-connect-target")
+    lastConnectTargetEl = null
+    lastConnectValid = null
+    lastConnectToTitle = null
+  }
+
+  /**
+   * Resolve the event id under the pointer by hit-testing document for a bar,
+   * then mapping its occurrence key back to an event id. Returns null when
+   * the pointer isn't over a bar (empty track, baseline marks, summary rollup,
+   * the source bar itself, etc.).
+   */
+  const hitConnectTarget = (
+    x: number,
+    y: number
+  ): { el: HTMLElement; toEventId: string; toTitle: string } | null => {
+    const el = document
+      .elementFromPoint(x, y)
+      ?.closest<HTMLElement>('[data-slot="gantt-bar"]')
+    if (!el) return null
+    const occKey = el.dataset.occurrenceKey
+    if (!occKey) return null
+    if (!connectOccByEl.has(el)) {
+      const occ = api
+        .getOccurrences()
+        .find((o) => o.key === occKey)
+      connectOccByEl.set(
+        el,
+        occ && (!fromEventId || occ.event.id !== fromEventId)
+          ? { toEventId: occ.event.id, toTitle: occ.event.title }
+          : null,
+      )
+    }
+    const resolved = connectOccByEl.get(el)
+    return resolved ? { el, ...resolved } : null
+  }
+
+  const positionConnectLine = (e: PointerEvent) => {
+    if (!connectLine || !connectOverlay) return
+    if (!connectOriginRect) {
+      const barEl = origin.closest<HTMLElement>("[data-slot=gantt-bar]")
+      connectOriginRect = (barEl ?? origin).getBoundingClientRect()
+    }
+    const rect = connectOriginRect
+    // Anchor the preview at the source bar's geometric center on its own
+    // edge: the handle is a sibling, but the bar's center is a stable
+    // visual anchor that survives the handle's exact offset.
+    const x1 = snapToPixel(rect.left + rect.width / 2)
+    const y1 = snapToPixel(rect.top + rect.height / 2)
+    const x2 = snapToPixel(e.clientX)
+    const y2 = snapToPixel(e.clientY)
+    connectLine.setAttribute("x1", String(x1))
+    connectLine.setAttribute("y1", String(y1))
+    connectLine.setAttribute("x2", String(x2))
+    connectLine.setAttribute("y2", String(y2))
+    // No explicit width/height writes: the overlay is `fixed inset-0` with
+    // overflow visible, so CSS already sizes the viewport and client-space
+    // coordinates map 1:1 - per-move clientWidth/Height reads would only
+    // thrash layout at input rate.
+  }
+
+  /**
+   * Hit-test, highlight the target imperatively, and color the preview line.
+   * `lastConnectValid` is the predicate outcome for the CURRENT target; we
+   * only flip `not-allowed` + the destructive color when it goes false.
+   */
+  const applyConnect = (e: PointerEvent) => {
+    if (kind !== "connect" || !fromEventId) return
+    ensureConnectOverlay()
+    positionConnectLine(e)
+    const hit = hitConnectTarget(e.clientX, e.clientY)
+    if (!hit) {
+      if (lastConnectTargetEl) clearConnectTarget()
+      setBodyDragging(true, false)
+      if (connectLine) connectLine.setAttribute("stroke", "currentColor")
+      return
+    }
+    const valid =
+      settings.canConnectEvents?.({
+        fromEventId,
+        toEventId: hit.toEventId,
+      }) ?? true
+    if (hit.el !== lastConnectTargetEl) {
+      clearConnectTarget()
+      hit.el.setAttribute(
+        "data-connect-target",
+        valid ? "valid" : "invalid"
+      )
+      lastConnectTargetEl = hit.el
+    } else if (valid !== lastConnectValid) {
+      hit.el.setAttribute(
+        "data-connect-target",
+        valid ? "valid" : "invalid"
+      )
+    }
+    lastConnectValid = valid
+    lastConnectToTitle = hit.toTitle
+    setBodyDragging(true, !valid)
+    if (connectLine) {
+      connectLine.setAttribute(
+        "stroke",
+        valid ? "var(--color-primary)" : "var(--color-destructive)"
+      )
+      connectLine.setAttribute(
+        "stroke-opacity",
+        valid ? "0.9" : "0.85"
+      )
+    }
+  }
+
+  // Per-frame batching: pointermove outruns the frame budget, and the
+  // hit-test inside applyConnect (elementFromPoint + occurrence lookup)
+  // belongs on the render cadence, not the input cadence. Intermediate
+  // moves are dropped - only the last pointer position paints.
+  let connectRaf: number | null = null
+  const scheduleConnect = (e: PointerEvent) => {
+    lastPointer = e
+    if (connectRaf != null) return
+    connectRaf = requestAnimationFrame(() => {
+      connectRaf = null
+      applyConnect(lastPointer)
+    })
+  }
+  // Release-time sync: a pointerup can land before the last scheduled frame
+  // fires; resolve the hover state NOW so the commit snapshot below reads
+  // the actual release position (fast flicks included).
+  const flushConnect = () => {
+    if (connectRaf == null) return
+    cancelAnimationFrame(connectRaf)
+    connectRaf = null
+    applyConnect(lastPointer)
+  }
+
+  // Capture the source bar's rect lazily on first pointermove so an
+  // origin detached before activation still has a stable anchor.
+  const captureConnectOrigin = () => {
+    if (connectOriginRect) return
+    const barEl = origin.closest<HTMLElement>("[data-slot=gantt-bar]")
+    connectOriginRect = (barEl ?? origin).getBoundingClientRect()
+  }
+
+  if (kind === "connect") captureConnectOrigin()
+
   const activationDistance =
     kind === "create" ? activation.createDistancePx : activation.moveDistancePx
 
   // Each gesture keeps its own cursor: a resize must stay ew-resize for the
-  // whole drag (flipping to grabbing reads as a move), a move grabs.
-  const gestureCursor = kind.startsWith("resize") ? "ew-resize" : "grabbing"
+  // whole drag (flipping to grabbing reads as a move), a move grabs, a
+  // connect drags a crosshair over targets that flip to not-allowed.
+  const gestureCursor =
+    kind === "connect"
+      ? "crosshair"
+      : kind.startsWith("resize")
+        ? "ew-resize"
+        : "grabbing"
   const setBodyDragging = (on: boolean, invalid = false) => {
     document.body.classList.toggle("gantt-dragging", on)
     document.body.style.cursor = on
@@ -466,6 +675,10 @@ function beginGesture<TData>(config: BeginGestureConfig<TData>) {
       barHeight = rect.height
       grabOffsetPx = startX - rect.left
       createMoveOverlay()
+    }
+    if (kind === "connect") {
+      captureConnectOrigin()
+      ensureConnectOverlay()
     }
     setBodyDragging(true)
   }
@@ -703,20 +916,46 @@ function beginGesture<TData>(config: BeginGestureConfig<TData>) {
     if (finished || !active || !surface || !timelineViewport) return
     const paneRect = timelineViewport.getBoundingClientRect()
     const x = lastPointer.clientX
-    let speed = 0
+    const y = lastPointer.clientY
+    let dx = 0
     if (x < paneRect.left + AUTO_SCROLL_EDGE_PX) {
-      speed =
+      dx =
         -((paneRect.left + AUTO_SCROLL_EDGE_PX - x) / AUTO_SCROLL_EDGE_PX) *
         AUTO_SCROLL_MAX_SPEED
     } else if (x > paneRect.right - AUTO_SCROLL_EDGE_PX) {
-      speed =
+      dx =
         ((x - (paneRect.right - AUTO_SCROLL_EDGE_PX)) / AUTO_SCROLL_EDGE_PX) *
         AUTO_SCROLL_MAX_SPEED
     }
-    if (speed === 0) return
-    const before = timelineViewport.scrollLeft
-    timelineViewport.scrollLeft = before + speed
-    if (timelineViewport.scrollLeft === before) return // parked on the end
+    // Vertical: only the CONNECT gesture crosses rows, so only it gets the
+    // Y axis. Move/resize are horizontal-only - scrolling the view vertically
+    // under them has no functional purpose and disorients (rows slide away
+    // from a stationary pointer parked near the pane's edge).
+    let dy = 0
+    if (kind === "connect") {
+      if (y < paneRect.top + AUTO_SCROLL_EDGE_PX) {
+        dy =
+          -((paneRect.top + AUTO_SCROLL_EDGE_PX - y) / AUTO_SCROLL_EDGE_PX) *
+          AUTO_SCROLL_MAX_SPEED
+      } else if (y > paneRect.bottom - AUTO_SCROLL_EDGE_PX) {
+        dy =
+          ((y - (paneRect.bottom - AUTO_SCROLL_EDGE_PX)) / AUTO_SCROLL_EDGE_PX) *
+          AUTO_SCROLL_MAX_SPEED
+      }
+    }
+    if (dx === 0 && dy === 0) return
+    let scrolled = false
+    if (dx !== 0) {
+      const before = timelineViewport.scrollLeft
+      timelineViewport.scrollLeft = before + dx
+      if (timelineViewport.scrollLeft !== before) scrolled = true
+    }
+    if (dy !== 0) {
+      const before = timelineViewport.scrollTop
+      timelineViewport.scrollTop = before + dy
+      if (timelineViewport.scrollTop !== before) scrolled = true
+    }
+    if (!scrolled) return // parked on the end
     const axis = viewRoot?.querySelector<HTMLElement>("[data-gantt-axis]")
     if (axis) surface.rect = axis.getBoundingClientRect()
     applyProposal(lastPointer)
@@ -746,12 +985,17 @@ function beginGesture<TData>(config: BeginGestureConfig<TData>) {
     window.removeEventListener("blur", onWindowBlur)
     window.removeEventListener("keydown", onKeyDown, true)
     if (touchTimer) clearTimeout(touchTimer)
+    if (connectRaf != null) cancelAnimationFrame(connectRaf)
     // consumer-rendered overlays are React-owned: they unmount when the drag
     // state clears, so the engine must never removeChild them itself
     if (!customMoveOverlay) overlay?.remove()
     overlay = null
     if (!customResizeOverlay) resizeOverlay?.remove()
     resizeOverlay = null
+    connectOverlay?.remove()
+    connectOverlay = null
+    connectLine = null
+    clearConnectTarget()
     setBodyDragging(false)
   }
 
@@ -787,6 +1031,15 @@ function beginGesture<TData>(config: BeginGestureConfig<TData>) {
       }
       if (distance < activationDistance) return
       activate()
+      // connect has no proposal pipeline: run the hit-test as soon as the
+      // gesture is live so the target + preview line follow the pointer
+      if (kind === "connect") scheduleConnect(e)
+      return
+    }
+    if (kind === "connect") {
+      scheduleConnect(e)
+      scheduleAutoScroll()
+      return
     }
     applyProposal(e)
     positionOverlay(e)
@@ -796,6 +1049,20 @@ function beginGesture<TData>(config: BeginGestureConfig<TData>) {
 
   const onPointerUp = (e: PointerEvent) => {
     if (e.pointerId !== pointerId) return
+    // connect: resolve any frame still pending so the snapshot below reads
+    // the hover state for the RELEASE position, not one frame stale.
+    if (kind === "connect") flushConnect()
+    // connect: snapshot the hover verdict BEFORE cleanup() - clearConnectTarget
+    // inside it would wipe the very state the commit below reads, and every
+    // drop (valid or not) would take the blocked branch
+    const pendingConnect =
+      kind === "connect"
+        ? {
+            el: lastConnectTargetEl,
+            valid: lastConnectValid,
+            title: lastConnectToTitle,
+          }
+        : null
     cleanup()
     if (!active) return
     lastGestureEndedAt = performance.now()
@@ -809,6 +1076,30 @@ function beginGesture<TData>(config: BeginGestureConfig<TData>) {
           slot: { start: draft.start, end: draft.end, allDay: draft.allDay },
         })
         settings.onSelectSlot?.(draft)
+      }
+      return
+    }
+    if (kind === "connect") {
+      const hit = pendingConnect?.el && pendingConnect.valid !== false
+        ? hitConnectTarget(e.clientX, e.clientY)
+        : null
+      const toEventId = hit?.toEventId ?? null
+      const toTitle = hit?.toTitle ?? pendingConnect?.title ?? ""
+      const fromTitle =
+        api
+          .getOccurrences()
+          .find((o) => o.event.id === fromEventId)?.event.title ?? ""
+      if (toEventId && pendingConnect?.valid !== false) {
+        settings.onEventConnect?.({ fromEventId: fromEventId!, toEventId })
+        if (announcer && fromTitle && toTitle) {
+          announcer.textContent = settings.i18n.labels.announceConnected(
+            fromTitle,
+            toTitle
+          )
+        }
+      } else if (announcer && fromTitle) {
+        announcer.textContent =
+          settings.i18n.labels.announceConnectBlocked(fromTitle)
       }
       return
     }
@@ -873,7 +1164,8 @@ function beginGesture<TData>(config: BeginGestureConfig<TData>) {
   if (isTouch && !active) {
     touchTimer = setTimeout(() => {
       activate()
-      applyProposal(lastPointer)
+      if (kind === "connect") applyConnect(lastPointer)
+      else applyProposal(lastPointer)
     }, activation.touchDelayMs)
   }
 }
@@ -957,7 +1249,24 @@ function useGanttGestures<TData = unknown>() {
     [instance]
   )
 
-  return { beginMove, beginResize, beginCreate, canDrag, canResize }
+  const beginConnect = useCallback(
+    (e: React.PointerEvent, fromEventId: string) => {
+      if (e.button !== 0) return
+      if (!instance.settings.onEventConnect) return
+      e.stopPropagation()
+      e.preventDefault()
+      beginGesture({
+        instance,
+        kind: "connect",
+        origin: e.currentTarget as HTMLElement,
+        startEvent: e.nativeEvent,
+        fromEventId,
+      })
+    },
+    [instance]
+  )
+
+  return { beginMove, beginResize, beginCreate, beginConnect, canDrag, canResize }
 }
 
 export {

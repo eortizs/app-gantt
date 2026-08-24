@@ -22,7 +22,7 @@ import {
   GanttTitle,
 } from "@/components/reui/gantt/gantt-nav"
 import { GanttView } from "@/components/reui/gantt/gantt-view"
-import { barTones, baselineTones, DIRTY_LIGHT } from "@/components/reui/gantt/gantt-color"
+import { barTones, baselineTones, DIRTY_TINT } from "@/components/reui/gantt/gantt-color"
 import type {
   GanttEvent,
   GanttOccurrence,
@@ -190,13 +190,21 @@ function GanttPlanViewerInner({
 
   // STABLE identity is load-bearing: the engine's per-row layout memo depends
   // on this callback, and a fresh closure per render would rebuild every row.
+  //
+  // Marks are OPT-IN via the historical toggle: by default nothing paints.
+  // Painting the newest entry by default stamped a twin under the live bar at
+  // the exact moment Fijar línea base captured it, and the twin only revealed
+  // itself once the bar moved - reading as a stray bar nobody asked for.
+  // Drift against the vigente reference is already signaled by the dirty
+  // tint, so the ambient timeline stays clean; the toggle fans the whole
+  // bitácora out for whoever wants the history on canvas.
   const getEventBaselines = useCallback(
     ({ event }: { event: GanttEvent<EventData> }): GanttBaselineMark[] => {
+      if (!showAllBaselines) return []
       const history = event.data?.baselines ?? []
       if (!history.length) return []
       const ordered = [...history].sort((a, b) => a.version - b.version)
-      const visible = showAllBaselines ? ordered : ordered.slice(-1)
-      return visible.map((b) => ({
+      return ordered.map((b) => ({
         key: `${event.id}::baseline-v${b.version}`,
         label: APP_STRINGS_ES.versionShort(b.version),
         color: event.color,
@@ -214,11 +222,12 @@ function GanttPlanViewerInner({
   )
 
   // ----- bitono: resting pastel / progress overlay per event -----
-  // Dirty = the LIVE event's dates differ from the vigente baseline (the
-  // highest-version entry of data.baselines). When they line up, the
-  // resting fill is the phase's 80% pastel; when they don't, it's gray-200
-  // to signal "unsynced". The progress overlay keeps the phase's full
-  // color either way - only the resting surface shifts to communicate
+  // Dirty = the LIVE event's dates differ from its drift reference (see
+  // `driftReference`): the vigente baseline when the bitácora has one, else
+  // the plan's original dates stamped by the mapper. When they line up,
+  // the resting fill is the phase's 80% pastel; when they don't, it's
+  // red-200 to signal "modified". The progress overlay keeps the phase's
+  // full color either way - only the resting surface shifts to communicate
   // drift. Drag->release and Fijar línea base both flow through `events`,
   // so this map stays in sync without an effect.
   const barToneByEventId = useMemo(() => {
@@ -227,17 +236,9 @@ function GanttPlanViewerInner({
       { resting: string; progress: string } | undefined
     >()
     for (const ev of events) {
-      const history = ev.data?.baselines ?? []
-      const vigente = history.length
-        ? history.reduce((max, b) => (b.version > max.version ? b : max))
-        : null
-      const dirty =
-        !!vigente &&
-        (ev.start.getTime() !== new Date(vigente.start).getTime() ||
-          ev.end.getTime() !== new Date(vigente.end).getTime())
       const tones = barTones(ev.color)
       map.set(ev.id, {
-        resting: dirty ? DIRTY_LIGHT : tones.light,
+        resting: isDrifted(ev) ? DIRTY_TINT : tones.light,
         progress: tones.dark,
       })
     }
@@ -409,12 +410,13 @@ function GanttPlanViewerInner({
 
   // Re-baselining is an explicit, auditable action: it snapshots the CURRENT
   // dates into the append-only history. Drags never touch it - they only
-  // produce uncommitted ChangeOps until a save commits them. The seed (the
-  // event the user picked) always captures; its transitive dependents along
-  // the dependency graph only capture when their live dates have drifted from
-  // their vigente baseline - a clean dependent gets no entry, so the bitácora
-  // never sprouts duplicates. All entries share the same capturedAt so the
-  // audit trail reads as one batch.
+  // produce uncommitted ChangeOps until a save commits them. Only bars whose
+  // live dates have DRIFTED from their drift reference (vigente baseline,
+  // else the original dates) capture - the seed follows the same rule as its
+  // transitive dependents along the dependency graph. Snapshotting an unmoved
+  // bar would append an entry identical to its reference: a duplicate whose
+  // only effect was a ghost twin painted under the live bar. All entries
+  // share the same capturedAt so the audit trail reads as one batch.
   const captureBaseline = useCallback(
     (eventId: string) => {
       const liveIds = new Set(events.map((ev) => ev.id))
@@ -428,39 +430,9 @@ function GanttPlanViewerInner({
       const capturedAt = new Date().toISOString()
       setEvents((prev) =>
         prev.map((ev) => {
-          if (ev.id === eventId && ev.data) {
-            const nextVersion =
-              ev.data.baselines?.reduce(
-                (max, b) => Math.max(max, b.version),
-                0,
-              ) ?? 0
-            return {
-              ...ev,
-              data: {
-                ...ev.data,
-                baselines: [
-                  ...(ev.data.baselines ?? []),
-                  {
-                    version: nextVersion + 1,
-                    start: ev.start.toISOString(),
-                    end: ev.end.toISOString(),
-                    capturedAt,
-                    reason: APP_STRINGS_ES.baselineManualReason,
-                  },
-                ],
-              },
-            }
-          }
-          if (!idSet.has(ev.id) || !ev.data) return ev
+          const involved = ev.id === eventId || idSet.has(ev.id)
+          if (!involved || !ev.data || !isDrifted(ev)) return ev
           const history = ev.data.baselines ?? []
-          const vigente = history.length
-            ? history.reduce((max, b) => (b.version > max.version ? b : max))
-            : null
-          if (!vigente) return ev
-          const drifted =
-            ev.start.getTime() !== new Date(vigente.start).getTime() ||
-            ev.end.getTime() !== new Date(vigente.end).getTime()
-          if (!drifted) return ev
           const nextVersion = history.reduce(
             (max, b) => Math.max(max, b.version),
             0,
@@ -476,7 +448,10 @@ function GanttPlanViewerInner({
                   start: ev.start.toISOString(),
                   end: ev.end.toISOString(),
                   capturedAt,
-                  reason: APP_STRINGS_ES.baselineCascadeReason(seed.title),
+                  reason:
+                    ev.id === eventId
+                      ? APP_STRINGS_ES.baselineManualReason
+                      : APP_STRINGS_ES.baselineCascadeReason(seed.title),
                 },
               ],
             },
@@ -516,6 +491,30 @@ function GanttPlanViewerInner({
     [recorder, applyAdjustments],
   )
 
+  // Connect-drag (engine → consumer) wiring. canConnectEvents owns the live
+  // veto: the same predicates the menu uses (self / duplicate / cycle) so
+  // both affordances never disagree. onEventConnect reuses the existing
+  // FS-add pipeline so drag-connects get the same changeset + cascade path.
+  const canConnectEvents = useCallback(
+    ({ fromEventId, toEventId }: { fromEventId: string; toEventId: string }) => {
+      if (fromEventId === toEventId) return false
+      const deps = livePlan.dependencies ?? []
+      if (
+        deps.some(
+          (d) => d.fromEventId === fromEventId && d.toEventId === toEventId,
+        )
+      )
+        return false
+      return !wouldCreateCycle(deps, fromEventId, toEventId)
+    },
+    [livePlan],
+  )
+  const onEventConnect = useCallback(
+    ({ fromEventId, toEventId }: { fromEventId: string; toEventId: string }) =>
+      handleAddDependency(fromEventId, toEventId),
+    [handleAddDependency],
+  )
+
   useEffect(() => {
     onOpsChange?.(ops)
   }, [ops, onOpsChange])
@@ -541,6 +540,8 @@ function GanttPlanViewerInner({
         onDependencyClick={(mark, e) =>
           setDependencyTarget({ mark, x: e.clientX, y: e.clientY })
         }
+        canConnectEvents={canConnectEvents}
+        onEventConnect={onEventConnect}
         defaultScale="month"
         locale={LOCALE_ES}
         i18n={I18N_ES}
@@ -755,6 +756,38 @@ function useRecorderOps(recorder: ChangesetRecorder): ChangeOp[] {
 }
 
 /** Pure merge of cascade adjustments into an events array (by event id). */
+/**
+ * The reference a bar's drift is measured against: the vigente baseline
+ * (highest-version bitácora entry) when one exists, else the plan's
+ * original dates stamped by the mapper. Shared by the dirty tone and the
+ * cascade capture so both always agree on what "drifted" means. Null only
+ * for events mapped before initialStart/initialEnd existed AND without
+ * any capture.
+ */
+function driftReference(
+  ev: GanttEvent<EventData>,
+): { start: Date; end: Date } | null {
+  const history = ev.data?.baselines ?? []
+  const vigente = history.length
+    ? history.reduce((max, b) => (b.version > max.version ? b : max))
+    : null
+  if (vigente) {
+    return { start: new Date(vigente.start), end: new Date(vigente.end) }
+  }
+  const s = ev.data?.initialStart
+  const e = ev.data?.initialEnd
+  return s && e ? { start: new Date(s), end: new Date(e) } : null
+}
+
+function isDrifted(ev: GanttEvent<EventData>): boolean {
+  const ref = driftReference(ev)
+  return (
+    !!ref &&
+    (ev.start.getTime() !== ref.start.getTime() ||
+      ev.end.getTime() !== ref.end.getTime())
+  )
+}
+
 function applyAdjustmentsTo(
   events: GanttEvent<EventData>[],
   adjustments: readonly ScheduleAdjustment[],
