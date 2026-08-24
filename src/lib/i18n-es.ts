@@ -110,9 +110,9 @@ export const APP_STRINGS_ES = {
   dependencyViolated: "Fuera de secuencia",
 
   // ----- CPM -----
-  /** Legend for the critical-path paint: saturated resting fill = float 0. */
+  /** Legend for the critical-path paint: phase-color stroke = float 0. */
   criticalPathLegend: (n: number) =>
-    `Ruta crítica: ${n} ${n === 1 ? "evento" : "eventos"} con holgura 0 (relleno saturado)`,
+    `Ruta crítica: ${n} ${n === 1 ? "evento" : "eventos"} con holgura 0 (borde de color de fase)`,
 
   // ----- EVM -----
   evmTitle: "Valor ganado (EVM)",
@@ -135,4 +135,53 @@ export const APP_STRINGS_ES = {
   /** Shown when GET /api/plans/:id failed and the demo entity took over. */
   offlineFallbackNote:
     "Sin conexión al backend: usando el plan demo en memoria (sin persistencia).",
+
+  // ----- solicitudes de cambio -----
+  /** Proposes the recorded ops as a CR (server builds + freezes impact). */
+  proposeChangeRequest: "Proponer solicitud de cambio",
+  proposeReasonPlaceholder: "Motivo (opcional)",
+  /** Shown after the server accepted the proposal. */
+  crProposedNote:
+    "Solicitud propuesta: el impacto quedó congelado para el aprobador.",
+  /** Error text when the propose POST failed. */
+  crProposeError: (detail: string) => `No se pudo proponer la solicitud (${detail}).`,
+  /** Queue panel title. */
+  crTitle: "Solicitudes de cambio",
+  /** Empty queue placeholder. */
+  crEmpty: "Todavía no hay solicitudes de cambio.",
+  /** Status badge labels. */
+  crStatusLabels: {
+    proposed: "Propuesta",
+    approved: "Aprobada",
+    rejected: "Rechazada",
+    applied: "Aplicada",
+  } as const,
+  /** Affectation count of a frozen impact snapshot. */
+  crImpactEvents: (n: number) =>
+    `${n} ${n === 1 ? "evento afectado" : "eventos afectados"}`,
+  /** Signed Σ drift of a frozen impact snapshot. */
+  crImpactDrift: (d: number) =>
+    d === 0 ? "Σ desliz 0 d" : `Σ desliz ${d > 0 ? "+" : ""}${d} d`,
+  /** Days added to the labor calendar (positive drifts only). */
+  crExtendedDays: (d: number) =>
+    d === 1 ? "1 día de extensión" : `${d} días de extensión`,
+  /** Frozen cost projection label. */
+  crProjectedCost: "Costo proyectado",
+  /** Suffix clarifying the labor-burn model. */
+  crProjectedCostHint: "solo mano de obra",
+  /** Decision buttons. */
+  crApprove: "Aprobar",
+  crReject: "Rechazar",
+  crApply: "Aplicar",
+  /** Row-level error when a decision POST failed. */
+  crDecisionError: (detail: string) => `No se pudo decidir (${detail}).`,
+  /** Stale CR: bound to a plan revision that already moved — must be re-proposed. */
+  crRevisionConflict: (bound: number, current: number) =>
+    `Anclada a la rev ${bound} y el plan va por la rev ${current}: otras solicitudes se aplicaron después de proponerla. Re-propón los cambios para evaluarlos sobre el plan vigente.`,
+  /** Decision reason for the apply statusLog entry. */
+  crApplyReason: "Aplicada desde la cola de solicitudes",
+
+  // ----- RRHH (workforce) -----
+  /** Tree-panel column naming the crew assigned to each row. */
+  crewColumn: "Cuadrilla",
 } as const

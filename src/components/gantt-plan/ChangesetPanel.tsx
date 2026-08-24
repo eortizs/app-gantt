@@ -1,21 +1,51 @@
-import { useSyncExternalStore } from "react"
+import { useState, useSyncExternalStore } from "react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import type { ChangesetRecorder } from "@/lib/changeset"
 import { APP_STRINGS_ES } from "@/lib/i18n-es"
 import type { UmeJsonEntity } from "@/lib/umejson/schema"
+import type { ChangeOp } from "@/lib/umejson/codec"
 
 export function ChangesetPanel({
   recorder,
   documentOut,
+  onPropose,
 }: {
   recorder: ChangesetRecorder
   documentOut: UmeJsonEntity | null
+  /** Present only online: proposes the recorded ops as a change request. */
+  onPropose?: (ops: ChangeOp[], reason?: string) => Promise<void>
 }) {
   const ops = useSyncExternalStore(recorder.subscribe, recorder.getSnapshot)
+  const [reason, setReason] = useState("")
+  const [pending, setPending] = useState(false)
+  const [note, setNote] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
 
   const copyJson = (text: string) => {
     void navigator.clipboard.writeText(text)
+  }
+
+  // The recorder is NOT reset here: the reset arrives with the remount
+  // after an apply (see the viewer key by plan revision in App).
+  const propose = () => {
+    if (!onPropose || ops.length === 0 || pending) return
+    setPending(true)
+    setNote(null)
+    setError(null)
+    onPropose(ops, reason.trim() || undefined)
+      .then(() => {
+        setReason("")
+        setNote(APP_STRINGS_ES.crProposedNote)
+      })
+      .catch((err: unknown) => {
+        setError(
+          APP_STRINGS_ES.crProposeError(
+            err instanceof Error ? err.message : "error",
+          ),
+        )
+      })
+      .finally(() => setPending(false))
   }
 
   return (
@@ -50,6 +80,32 @@ export function ChangesetPanel({
             <p className="text-muted-foreground mt-2 text-xs">
               {APP_STRINGS_ES.cascadeCauseLegend}
             </p>
+          )}
+          {onPropose && (
+            <div className="mt-3 flex flex-col gap-2" data-slot="gantt-cr-propose">
+              <div className="flex items-center gap-2">
+                <input
+                  value={reason}
+                  onChange={(e) => setReason(e.target.value)}
+                  placeholder={APP_STRINGS_ES.proposeReasonPlaceholder}
+                  aria-label={APP_STRINGS_ES.proposeReasonPlaceholder}
+                  className="bg-background ring-ring/20 placeholder:text-muted-foreground h-8 min-w-0 flex-1 rounded-md px-2.5 text-xs outline-none ring-1 focus-visible:ring-2"
+                />
+                <Button
+                  size="sm"
+                  onClick={propose}
+                  disabled={ops.length === 0 || pending}
+                >
+                  {APP_STRINGS_ES.proposeChangeRequest}
+                </Button>
+              </div>
+              {note && (
+                <p className="text-emerald-600 dark:text-emerald-400 text-xs">
+                  {note}
+                </p>
+              )}
+              {error && <p className="text-destructive text-xs">{error}</p>}
+            </div>
           )}
         </CardContent>
       </Card>

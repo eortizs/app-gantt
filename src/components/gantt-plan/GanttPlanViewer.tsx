@@ -61,16 +61,30 @@ import { cpmSchedule } from "@/lib/umejson/cpm"
 import { isDrifted as isPlanDrifted, type DriftSubject } from "@/lib/umejson/baselines"
 import { applyOps, encodeUpdatedPlan, type ChangeOp } from "@/lib/umejson/codec"
 import { decodeUmePlan, type UmeJsonEntity, type ValidationError } from "@/lib/umejson/schema"
+import type { WorkforcePayload } from "@/lib/umejson/workforce"
 import { wbsLevelStyle } from "@/lib/wbs-levels"
 import { ChangesetPanel } from "@/components/gantt-plan/ChangesetPanel"
 import type { GanttDependencyMark } from "@/components/reui/gantt/gantt-types"
 import { cn } from "@/lib/utils"
+
+/**
+ * Critical-path chrome: a hairline phase-color stroke around the bar. It
+ * deliberately does NOT touch the fills — the bitono contract reserves the
+ * resting surface for light tones and the strong tone for progress, so
+ * criticality rides the class channel (`getEventBarClassName`).
+ * `--gantt-event-color` is the concrete phase hex pinned on the bar itself.
+ */
+const CRITICAL_BAR_CLASS = "inset-ring-1 inset-ring-(--gantt-event-color)"
 
 export interface GanttPlanViewerProps {
   document: UmeJsonEntity
   onError?: (errors: ValidationError[]) => void
   onOpsChange?: (ops: ChangeOp[]) => void
   onDocumentChange?: (entity: UmeJsonEntity) => void
+  /** RRHH sibling: adds the «Cuadrilla» column to the tree panel. */
+  workforce?: WorkforcePayload
+  /** Present only online: proposes the recorded ops as a change request. */
+  onProposeChangeRequest?: (ops: ChangeOp[], reason?: string) => Promise<void>
 }
 
 export function GanttPlanViewer({
@@ -78,6 +92,8 @@ export function GanttPlanViewer({
   onError,
   onOpsChange,
   onDocumentChange,
+  workforce,
+  onProposeChangeRequest,
 }: GanttPlanViewerProps) {
   const decoded = useMemo(() => decodeUmePlan(document), [document])
   const validationError = !decoded.ok ? decoded.errors : null
@@ -111,6 +127,8 @@ export function GanttPlanViewer({
       originalPlan={decoded.plan}
       onOpsChange={onOpsChange}
       onDocumentChange={onDocumentChange}
+      workforce={workforce}
+      onProposeChangeRequest={onProposeChangeRequest}
     />
   )
 }
@@ -120,11 +138,15 @@ function GanttPlanViewerInner({
   originalPlan,
   onOpsChange,
   onDocumentChange,
+  workforce,
+  onProposeChangeRequest,
 }: {
   entity: UmeJsonEntity
   originalPlan: PlanJSON
   onOpsChange?: (ops: ChangeOp[]) => void
   onDocumentChange?: (entity: UmeJsonEntity) => void
+  workforce?: WorkforcePayload
+  onProposeChangeRequest?: (ops: ChangeOp[], reason?: string) => Promise<void>
 }) {
   const apiRef = useRef<GanttApi<EventData> | null>(null)
   const recorderRef = useRef<ChangesetRecorder | null>(null)
@@ -224,9 +246,11 @@ function GanttPlanViewerInner({
   )
 
   // ----- bitono: resting pastel / progress overlay per event -----
-  // The resting fill encodes the bar's STATE (dirty > critical > resting
-  // pastel); the map itself now lives after `livePlan`, where the CPM
-  // critical set is computed. See the block below `livePlan`.
+  // The resting fill is ALWAYS a light tone (dirty pastel > phase pastel);
+  // the strong tone belongs to the progress overlay ONLY. Criticality is
+  // signaled through a stroke (getEventBarClassName), never through the
+  // fill. The map itself lives after `livePlan`, where the CPM critical
+  // set is computed. See the block below `livePlan`.
 
   // STABLE identity, same contract. The phase color for a group comes from
   // any descendant event (the plan maps phases per-resource and groups
@@ -342,6 +366,16 @@ function GanttPlanViewerInner({
     : null
   const activeHistory = historyTarget && historyEvent ? historyTarget : null
 
+  // The bitácora panel closes through several paths (click-outside,
+  // Escape, nested scroll, resize, or the event disappearing): the hovered
+  // entry unmounts without ever firing mouseleave/blur, so the
+  // version-preview overlay would stay painted FOREVER — the bar keeps the
+  // hovered version's tone (a phase pastel) instead of its dirty/critical
+  // state. Derived reset: panel gone → highlight gone.
+  useEffect(() => {
+    if (!activeHistory) setHighlightedBaseline(null)
+  }, [activeHistory])
+
   const maxDepth = useMemo(() => depthOf(resources), [resources])
   const [level, setLevel] = useState(maxDepth)
   const collapsedGroups = useMemo(() => {
@@ -357,8 +391,8 @@ function GanttPlanViewerInner({
     return ids
   }, [resources, level])
 
-  const columns: GanttColumn[] = useMemo(
-    () => [
+  const columns: GanttColumn[] = useMemo(() => {
+    const cols: GanttColumn[] = [
       {
         id: "responsable",
         title: "Responsable",
@@ -368,9 +402,29 @@ function GanttPlanViewerInner({
           return r?.responsable ?? "—"
         },
       },
-    ],
-    [originalPlan],
-  )
+    ]
+    // Cuadrilla: the demo plan is 1:1 resource↔event, so the row's
+    // resource names the event whose assignment we render.
+    if (workforce) {
+      const eventByResource = new Map(
+        originalPlan.events.map((e) => [e.resourceId, e]),
+      )
+      const crewById = new Map(workforce.crews.map((c) => [c.id, c]))
+      cols.push({
+        id: "cuadrilla",
+        title: APP_STRINGS_ES.crewColumn,
+        width: 150,
+        render: (ctx: { resource: { id: string } }) => {
+          const event = eventByResource.get(ctx.resource.id)
+          const assignment =
+            event && workforce.assignmentByEvent[event.id]
+          const crew = assignment && crewById.get(assignment.crewId)
+          return crew ? `${crew.title} · ${assignment!.headcount}` : "—"
+        },
+      })
+    }
+    return cols
+  }, [originalPlan, workforce])
 
   const ops = useRecorderOps(recorder)
   const livePlan = useMemo(
@@ -385,13 +439,16 @@ function GanttPlanViewerInner({
     [livePlan],
   )
 
-  // Resting fill = estado de la barra: dirty (rojo) > crítica (fase
-  // full-strength) > pastel de fase. Dirty = las fechas vivas difieren de
-  // la referencia de drift (política promovida en `umejson/baselines.ts`);
-  // crítica = holgura total 0 según `umejson/cpm.ts` sobre el plan vivo.
-  // El overlay de avance conserva el full-strength de fase siempre - solo
-  // la superficie de resting comunica estado. STABLE identity: el memo
-  // del motor por fila llama este callback para cada segmento.
+  // Resting fill = tono CLARO siempre (invariante bitono): dirty (red-200,
+  // pastel) > pastel de fase. El full-strength de fase queda reservado en
+  // exclusiva al overlay de avance — una barra crítica al 0% NO puede pintar
+  // su cuerpo fuerte (se leería como avance que no existe). Dirty = las
+  // fechas vivas difieren de la referencia de drift (política promovida en
+  // `umejson/baselines.ts`); la ruta crítica (holgura 0 según
+  // `umejson/cpm.ts` sobre el plan vivo) se señaliza con un TRAZO de fase
+  // (`getEventBarClassName`), un canal que no colisiona con avance.
+  // STABLE identity: el memo del motor por fila llama estos callbacks para
+  // cada segmento.
   const barToneByEventId = useMemo(() => {
     const map = new Map<
       string,
@@ -400,21 +457,22 @@ function GanttPlanViewerInner({
     for (const ev of events) {
       const tones = barTones(ev.color)
       map.set(ev.id, {
-        resting: isDriftedEvent(ev)
-          ? DIRTY_TINT
-          : criticalIds.has(ev.id)
-            ? tones.dark
-            : tones.light,
+        resting: isDriftedEvent(ev) ? DIRTY_TINT : tones.light,
         progress: tones.dark,
       })
     }
     return map
-  }, [events, criticalIds])
+  }, [events])
 
   const getEventBarTone = useCallback(
     ({ event }: { event: GanttEvent<EventData> }) =>
       barToneByEventId.get(event.id),
     [barToneByEventId],
+  )
+  const getEventBarClassName = useCallback(
+    ({ event }: { event: GanttEvent<EventData> }) =>
+      criticalIds.has(event.id) ? CRITICAL_BAR_CLASS : undefined,
+    [criticalIds],
   )
   const documentOut = useMemo(
     () => (ops.length ? encodeUpdatedPlan(entity, livePlan, ops.length) : null),
@@ -552,6 +610,8 @@ function GanttPlanViewerInner({
   const handleReset = () => {
     setEvents(toGanttEvents(originalPlan))
     setDependencyTarget(null)
+    setHistoryTarget(null)
+    setHighlightedBaseline(null)
     recorder.reset()
   }
 
@@ -597,6 +657,7 @@ function GanttPlanViewerInner({
         highlightedBaselineKeys={highlightedBaselineKeys}
         eventBarOverlays={eventBarOverlays}
         getEventBarTone={getEventBarTone}
+        getEventBarClassName={getEventBarClassName}
         getSummaryBarTone={getSummaryBarTone}
         renderTooltipExtras={({ occurrence, dismiss }) => {
           const count = occurrence.event.data?.baselines?.length ?? 0
@@ -772,7 +833,11 @@ function GanttPlanViewerInner({
             {APP_STRINGS_ES.criticalPathLegend(criticalIds.size)}
           </span>
         </div>
-        <ChangesetPanel recorder={recorder} documentOut={documentOut} />
+        <ChangesetPanel
+          recorder={recorder}
+          documentOut={documentOut}
+          onPropose={onProposeChangeRequest}
+        />
       </div>
     </div>
   )
