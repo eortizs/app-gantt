@@ -39,6 +39,13 @@ import {
   driftDays,
 } from "../src/lib/umejson/baselines.ts"
 import {
+  buildWorkforceEntity,
+  decodeWorkforce,
+  type WorkforcePayload,
+  type UmeWorkforceEntity,
+} from "../src/lib/umejson/workforce.ts"
+import {
+  buildChangeRequestEntity,
   buildImpactSnapshot,
   createChangeRequest,
   canTransition,
@@ -48,6 +55,10 @@ import {
   ENTITY_NAME_CHANGE_REQUEST,
   type UmeChangeRequestEntity,
 } from "../src/lib/umejson/change-request.ts"
+import { PLAN } from "../src/data/plan-departamento.ts"
+import { DEMO_PLAN_ID } from "../src/data/demo-entity.ts"
+import { buildDemoBudget } from "../src/data/demo-contables.ts"
+import { buildDemoWorkforce } from "../src/data/demo-workforce.ts"
 import type { PlanJSON } from "../src/lib/plan-types.ts"
 
 const fails: string[] = []
@@ -671,12 +682,19 @@ for (const [label, input] of rejectionCases) {
   ]
 
   // Proposal born coherent: snapshot computed from the SAME plan it binds to.
-  const cr = createChangeRequest({ planEntityId: "plan-1", planAnchor: plan.anchor, basePlan: plan, ops })
+  const cr = createChangeRequest({
+    planEntityId: "plan-1",
+    planAnchor: plan.anchor,
+    planRevision: 3,
+    basePlan: plan,
+    ops,
+  })
   if (
     cr.status !== "proposed" ||
     cr.statusLog.length !== 1 ||
     cr.statusLog[0]?.status !== "proposed" ||
     cr.requestedBy !== SENTINEL ||
+    cr.planRevision !== 3 ||
     cr.impact.entries.length !== 2
   ) {
     fail("cr: proposal shape", JSON.stringify({ status: cr.status, log: cr.statusLog.length, impact: cr.impact.entries.length }))
@@ -751,6 +769,17 @@ for (const [label, input] of rejectionCases) {
     ["malformed update op", crPayload({ ops: [{ op: "update", id: "a", patch: { start: "nope", end: t(1) } }] })],
     ["addDependency bad type", crPayload({ ops: [{ op: "addDependency", dependency: { id: "x", fromEventId: "a", toEventId: "b", type: "XX" } }] })],
     ["bad cause shape", crPayload({ ops: [{ op: "update", id: "a", patch: { start: t(0), end: t(1) }, cause: { kind: "manual" } }] })],
+    ["planRevision missing", crPayload({ planRevision: undefined })],
+    ["planRevision 0", crPayload({ planRevision: 0 })],
+    ["planRevision non-integer", crPayload({ planRevision: 1.5 })],
+    ["costImpact not an object", crPayload({ impact: { entries: [], costImpact: "gratis" } })],
+    ["costImpact bad projection", crPayload({ impact: { entries: [], costImpact: { currency: "MXN", projectedExtraCost: "mucho", extendedDays: 0 } } })],
+    ["costImpact negative extendedDays", crPayload({ impact: { entries: [], costImpact: { currency: "MXN", projectedExtraCost: 0, extendedDays: -1 } } })],
+    ["relation to other plan", {
+      ...crEntity,
+      relations: [{ targetEntity: "GanttPlan", targetId: "other-plan", type: "one-to-one" }],
+      dynamicProperties: { changeRequest: appliedPayload },
+    }],
   ]
   for (const [label, input] of crRejections) {
     const d = decodeChangeRequest(input)
@@ -1113,6 +1142,299 @@ for (const [label, input] of rejectionCases) {
   if (pvFraction(10, 10, 10) !== 1 || pvFraction(9, 10, 10) !== 0) {
     fail("evm: degenerate window", "milestone fraction wrong")
   } else ok("evm: degenerate (zero-span) window is all-or-nothing")
+}
+
+// ---- 18. CR: binding de revisión + costo labor-burn ------------------------
+{
+  const t = (days: number) => new Date(Date.parse(ISO) + days * 86_400_000).toISOString()
+  const approx = (got: number, want: number, eps = 1e-9) => Math.abs(got - want) < eps
+  const plan: PlanJSON = {
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: [
+      { id: "a", resourceId: "r", start: t(0), end: t(10), progress: 0 },
+      { id: "b", resourceId: "r", start: t(0), end: t(10), progress: 0 },
+    ],
+  }
+  const ops: ChangeOp[] = [
+    { op: "update", id: "a", patch: { start: t(0), end: t(13) } }, // +3 d
+    { op: "update", id: "b", patch: { start: t(0), end: t(8) } }, // −2 d
+  ]
+  const budget: BudgetPayload = {
+    schemaVersion: 1,
+    currency: "MXN",
+    timePhasing: "uniform",
+    bacByEvent: { a: 100_000, b: 100_000 },
+    breakdownByEvent: {
+      a: { labor: 60_000, material: 30_000, equipment: 10_000 },
+      b: { labor: 50_000, material: 30_000, equipment: 20_000 },
+    },
+  }
+
+  // Hand case: burns are labor/duration — 60k/10d × 3 = +18k on a,
+  // 50k/10d × (−2) = −10k on b → +8k total; extendedDays counts ONLY the
+  // positive drift (3).
+  {
+    const snap = buildImpactSnapshot(plan, ops, budget)
+    const ci = snap.costImpact
+    if (!ci) fail("cr-cost: attached", "no costImpact with budget+breakdown")
+    else if (ci.currency !== "MXN" || !approx(ci.projectedExtraCost, 8_000) || ci.extendedDays !== 3) {
+      fail("cr-cost: hand case", JSON.stringify(ci))
+    } else ok("cr-cost: labor-burn hand case (+18k −10k → 8k, extended 3d)")
+
+    // Sin budget → sin costImpact: nothing to project against.
+    const noBudget = buildImpactSnapshot(plan, ops)
+    if ("costImpact" in noBudget) fail("cr-cost: sin budget", "costImpact attached without a budget")
+    else ok("cr-cost: sin budget → sin costImpact")
+
+    // Sin desglose → burn 0: the projection exists but nothing extends.
+    const bare: BudgetPayload = { ...budget, breakdownByEvent: undefined }
+    const bareSnap = buildImpactSnapshot(plan, ops, bare)
+    const bareCi = bareSnap.costImpact
+    if (!bareCi || !approx(bareCi.projectedExtraCost, 0) || bareCi.extendedDays !== 3) {
+      fail("cr-cost: sin desglose", JSON.stringify(bareCi))
+    } else ok("cr-cost: sin desglose → burn 0 (extendedDays still counted)")
+
+    // The proposal carries the frozen projection end to end.
+    const cr = createChangeRequest({
+      planEntityId: "plan-1",
+      planAnchor: plan.anchor,
+      planRevision: 2,
+      basePlan: plan,
+      ops,
+      budget,
+    })
+    if (cr.planRevision !== 2 || !approx(cr.impact.costImpact?.projectedExtraCost ?? NaN, 8_000)) {
+      fail("cr-cost: createChangeRequest carries it", JSON.stringify(cr.impact.costImpact))
+    } else ok("cr-cost: proposal born with the frozen projection")
+
+    // buildChangeRequestEntity: fresh envelope, bound to the plan, and
+    // decodable (payload sentinels are legal pre-persist).
+    const entity = buildChangeRequestEntity({ payload: cr })
+    if (
+      entity.id === "" ||
+      entity.entityName !== ENTITY_NAME_CHANGE_REQUEST ||
+      entity.relations?.[0]?.targetId !== "plan-1" ||
+      entity.lifecycle.version !== 1
+    ) {
+      fail("cr-entity: envelope shape", JSON.stringify({ id: entity.id, rel: entity.relations?.[0] }))
+    } else ok("cr-entity: fresh envelope bound to the plan")
+    const decodedEntity = decodeChangeRequest(entity, plan, "plan-1")
+    if (!decodedEntity.ok) fail("cr-entity: decodes at the border", decodedEntity.errors[0]?.message ?? "rejected")
+    else ok("cr-entity: decodes at the border (uuid + relation)")
+
+    // Purity: neither the builder nor the snapshot mutated the inputs.
+    const planBefore = JSON.parse(JSON.stringify(plan))
+    const crBefore = JSON.parse(JSON.stringify(cr))
+    buildChangeRequestEntity({ payload: cr })
+    buildImpactSnapshot(plan, ops, budget)
+    if (!deepEqual(plan, planBefore)) fail("cr-entity: purity", "plan mutated")
+    else if (!deepEqual(cr, crBefore)) fail("cr-entity: purity", "payload mutated")
+    else ok("cr-entity: purity (inputs untouched)")
+  }
+}
+
+// ---- 19. Budget: desglose por evento (partición exacta del BAC) -----------
+{
+  const t = (days: number) => new Date(Date.parse(ISO) + days * 86_400_000).toISOString()
+  const plan: PlanJSON = {
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: [
+      { id: "a", resourceId: "r", start: t(0), end: t(4), progress: 0 },
+      { id: "b", resourceId: "r", start: t(4), end: t(8), progress: 0 },
+    ],
+  }
+  const base = buildBudgetEntity({
+    id: "00000000-0000-4000-8000-000000000002",
+    planEntityId: "plan-1",
+    planAnchor: ISO,
+    budget: {
+      schemaVersion: 1,
+      currency: "MXN",
+      timePhasing: "uniform",
+      bacByEvent: { a: 100_000, b: 40_000 },
+    },
+  })
+  const breakdownWith = (breakdownByEvent: unknown): unknown => ({
+    ...base,
+    dynamicProperties: {
+      budget: { ...base.dynamicProperties.budget, breakdownByEvent },
+    },
+  })
+
+  // Exact partition decodes (and round-trips).
+  const happy = breakdownWith({
+    a: { labor: 60_000, material: 30_000, equipment: 10_000 },
+    b: { labor: 20_000, material: 15_000, equipment: 5_000 },
+  })
+  const dHappy = decodeBudget(happy, plan, "plan-1")
+  if (!dHappy.ok) fail("budget-breakdown: happy path", dHappy.errors[0]?.message ?? "rejected")
+  else ok("budget-breakdown: exact partition decodes")
+
+  const breakdownRejections: Array<[string, unknown]> = [
+    ["sum mismatch", breakdownWith({ a: { labor: 500, material: 300, equipment: 100 } })],
+    ["negative part", breakdownWith({ a: { labor: -1, material: 30_000, equipment: 70_001 } })],
+    ["entry not an object", breakdownWith({ a: "reparto" })],
+    ["missing part", breakdownWith({ a: { labor: 100_000, material: 0 } })],
+    ["no BAC to partition", breakdownWith({ c: { labor: 0, material: 0, equipment: 0 } })],
+    ["breakdown not an object", breakdownWith("nope")],
+  ]
+  for (const [label, input] of breakdownRejections) {
+    if (decodeBudget(input).ok) fail(`reject budget-breakdown: ${label}`, "decoder accepted it")
+    else ok(`reject budget-breakdown: ${label}`)
+  }
+  // Ref check against the supplied plan.
+  if (decodeBudget(breakdownWith({ ghost: { labor: 0, material: 0, equipment: 0 } }), plan).ok) {
+    fail("reject budget-breakdown: unknown event", "accepted")
+  } else ok("reject budget-breakdown: unknown event")
+}
+
+// ---- 20. GanttWorkforce: entidad hermana de RRHH ---------------------------
+{
+  const t = (days: number) => new Date(Date.parse(ISO) + days * 86_400_000).toISOString()
+  const plan: PlanJSON = {
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: [
+      { id: "a", resourceId: "r", start: t(0), end: t(4), progress: 0 },
+      { id: "b", resourceId: "r", start: t(4), end: t(8), progress: 0 },
+    ],
+  }
+  const workforce: WorkforcePayload = {
+    schemaVersion: 1,
+    crews: [
+      { id: "c1", title: "Cuadrilla A", specialty: "Albañilería", headcount: 6, dayRate: 950 },
+      { id: "c2", title: "Electricista", specialty: "Eléctrica", headcount: 2, dayRate: 1_100 },
+    ],
+    assignmentByEvent: {
+      a: { crewId: "c1", headcount: 4 },
+      b: { crewId: "c2", headcount: 2 },
+    },
+  }
+  const entity: UmeWorkforceEntity = buildWorkforceEntity({
+    id: "00000000-0000-4000-8000-000000000004",
+    planEntityId: "plan-1",
+    planAnchor: ISO,
+    workforce,
+  })
+
+  const d = decodeWorkforce(entity, plan, "plan-1")
+  if (!d.ok) fail("workforce: happy path", d.errors[0]?.message ?? "rejected")
+  else if (!deepEqual(d.workforce, workforce)) fail("workforce: round-trip", "payload differs")
+  else ok("workforce: decodes with plan binding (round-trip)")
+
+  const workforceWith = (patch: Record<string, unknown>): unknown => ({
+    ...entity,
+    dynamicProperties: { workforce: { ...workforce, ...patch } },
+  })
+  const workforceRejects: Array<[string, unknown]> = [
+    ["wrong entityName", { ...entity, entityName: "Other" }],
+    ["schemaVersion 2", workforceWith({ schemaVersion: 2 })],
+    ["duplicate crew id", workforceWith({ crews: [
+      { id: "c1", title: "A", specialty: "s", headcount: 3, dayRate: 850 },
+      { id: "c1", title: "B", specialty: "s", headcount: 3, dayRate: 850 },
+    ] })],
+    ["crew headcount 0", workforceWith({ crews: [
+      { id: "c1", title: "A", specialty: "s", headcount: 0, dayRate: 850 },
+    ] })],
+    ["negative dayRate", workforceWith({ crews: [
+      { id: "c1", title: "A", specialty: "s", headcount: 3, dayRate: -1 },
+    ] })],
+    ["assignment to unknown crew", workforceWith({ assignmentByEvent: {
+      a: { crewId: "ghost", headcount: 2 },
+    } })],
+    ["assignment headcount 0", workforceWith({ assignmentByEvent: {
+      a: { crewId: "c1", headcount: 0 },
+    } })],
+    ["assignment not an object", workforceWith({ assignmentByEvent: { a: "todos" } })],
+    ["assignmentByEvent not an object", workforceWith({ assignmentByEvent: "nope" })],
+    ["crew missing specialty", workforceWith({ crews: [
+      { id: "c1", title: "A", headcount: 3, dayRate: 850 },
+    ] })],
+  ]
+  for (const [label, input] of workforceRejects) {
+    if (decodeWorkforce(input).ok) fail(`reject workforce: ${label}`, "decoder accepted it")
+    else ok(`reject workforce: ${label}`)
+  }
+  // Ref checks against the supplied plan + relation binding.
+  if (decodeWorkforce(workforceWith({ assignmentByEvent: {
+    ghost: { crewId: "c1", headcount: 2 },
+  } }), plan).ok) {
+    fail("reject workforce: unknown event", "accepted")
+  } else ok("reject workforce: unknown event")
+  const wrongPlanRel: unknown = {
+    ...entity,
+    relations: [{ targetEntity: "GanttPlan", targetId: "other-plan", type: "one-to-one" }],
+  }
+  if (decodeWorkforce(wrongPlanRel, plan, "plan-1").ok) fail("reject workforce: bound to other plan", "accepted")
+  else ok("reject workforce: bound to other plan")
+  const nonPlanRel: unknown = {
+    ...entity,
+    relations: [{ targetEntity: "GanttBudget", targetId: "plan-1", type: "one-to-one" }],
+  }
+  if (decodeWorkforce(nonPlanRel).ok) fail("reject workforce: relation to non-plan entity", "accepted")
+  else ok("reject workforce: relation to non-plan entity")
+
+  // Purity: the builder leaves the payload alone.
+  const before = JSON.parse(JSON.stringify(workforce))
+  buildWorkforceEntity({ id: "00000000-0000-4000-8000-000000000004", planEntityId: "plan-1", planAnchor: ISO, workforce })
+  if (!deepEqual(workforce, before)) fail("workforce: builder purity", "payload mutated")
+  else ok("workforce: builder purity")
+}
+
+// ---- 21. Demo builders: hermanas sintéticas pasan su propio contrato ------
+{
+  // Budget: every breakdown partitions its BAC EXACTLY (integers, no
+  // negative equipment remainder) and the document decodes against PLAN.
+  const budget = buildDemoBudget(PLAN)
+  const dBudget = decodeBudget(budget, PLAN, DEMO_PLAN_ID)
+  if (!dBudget.ok) {
+    fail("demo: budget decodes against PLAN", dBudget.errors[0]?.message ?? "rejected")
+  } else {
+    let sumsOk = true
+    let breakdownCount = 0
+    for (const [eventId, bac] of Object.entries(dBudget.budget.bacByEvent)) {
+      const b = dBudget.budget.breakdownByEvent?.[eventId]
+      if (!b) continue
+      breakdownCount++
+      if (
+        !Number.isInteger(b.labor) || !Number.isInteger(b.material) || !Number.isInteger(b.equipment) ||
+        b.labor < 0 || b.material < 0 || b.equipment < 0 ||
+        b.labor + b.material + b.equipment !== bac
+      ) {
+        sumsOk = false
+        fail("demo: breakdown partitions BAC", JSON.stringify({ eventId, bac, b }))
+        break
+      }
+    }
+    if (sumsOk && breakdownCount === Object.keys(dBudget.budget.bacByEvent).length) {
+      ok(`demo: breakdown partitions every BAC exactly (${breakdownCount} events)`)
+    }
+  }
+
+  // Workforce: crews derived from the plan's own responsables, every
+  // event assigned, decodes against PLAN, and PLAN itself untouched.
+  const planBefore = JSON.parse(JSON.stringify(PLAN))
+  const workforceEntity = buildDemoWorkforce(PLAN)
+  const dWorkforce = decodeWorkforce(workforceEntity, PLAN, DEMO_PLAN_ID)
+  if (!dWorkforce.ok) {
+    fail("demo: workforce decodes against PLAN", dWorkforce.errors[0]?.message ?? "rejected")
+  } else if (Object.keys(dWorkforce.workforce.assignmentByEvent).length !== PLAN.events.length) {
+    fail("demo: workforce assigns every event", `${Object.keys(dWorkforce.workforce.assignmentByEvent).length}/${PLAN.events.length}`)
+  } else if (new Set(dWorkforce.workforce.crews.map((c) => c.id)).size !== dWorkforce.workforce.crews.length) {
+    fail("demo: crew ids unique", "duplicates found")
+  } else if (!deepEqual(PLAN, planBefore)) {
+    fail("demo: workforce builder purity", "PLAN mutated")
+  } else {
+    ok(`demo: workforce (${dWorkforce.workforce.crews.length} crews, all events assigned, PLAN untouched)`)
+  }
 }
 
 if (fails.length) {

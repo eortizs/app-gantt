@@ -57,13 +57,38 @@ const wiggleOf = (id: string): number => {
 
 const round100 = (v: number): number => Math.round(v / 100) * 100
 
-/** BAC por evento: duración × tarifa de fase, redondeado a centenas. */
+/**
+ * Labor/material base shares per phase; equipment absorbs the rest. Labor
+ * stays within [0.45, 0.60] (per-event nudge) and material within its own
+ * base, so the three parts always partition the BAC with margin.
+ */
+const SHARES_BY_PHASE: Record<string, { labor: number; material: number }> = {
+  preliminares: { labor: 0.55, material: 0.35 },
+  cimentacion: { labor: 0.45, material: 0.4 },
+  estructura: { labor: 0.5, material: 0.35 },
+  albanileria: { labor: 0.6, material: 0.3 },
+  instalaciones: { labor: 0.55, material: 0.35 },
+  acabados: { labor: 0.5, material: 0.4 },
+  entrega: { labor: 0.5, material: 0.35 },
+}
+const DEFAULT_SHARES = { labor: 0.5, material: 0.375 }
+
+/**
+ * BAC por evento: duración × tarifa de fase, redondeado a centenas. Cada
+ * BAC lleva además un desglose labor/material/equipo que suma EXACTO
+ * (enteros; equipo absorbe el redondeo) — alimenta el modelo de costo
+ * labor-burn de las solicitudes de cambio.
+ */
 export function buildDemoBudget(
   plan: PlanJSON = PLAN,
   planEntityId: string = DEMO_PLAN_ID,
 ): UmeBudgetEntity {
   const resources = new Map(plan.resources.map((r) => [r.id, r]))
   const bacByEvent: Record<string, number> = {}
+  const breakdownByEvent: Record<
+    string,
+    { labor: number; material: number; equipment: number }
+  > = {}
   for (const event of plan.events) {
     const phaseId = resolvePhaseId(event.resourceId, resources)
     const rate = (phaseId && RATE_BY_PHASE[phaseId]) || DEFAULT_RATE
@@ -71,13 +96,33 @@ export function buildDemoBudget(
       1,
       Math.round((Date.parse(event.end) - Date.parse(event.start)) / DAY_MS),
     )
-    bacByEvent[event.id] = round100(days * rate)
+    const bac = round100(days * rate)
+    bacByEvent[event.id] = bac
+    const shares = (phaseId && SHARES_BY_PHASE[phaseId]) || DEFAULT_SHARES
+    const t = (wiggleOf(event.id) - 0.85) / 0.3 // [0, 1]
+    const laborShare = Math.min(
+      0.6,
+      Math.max(0.45, shares.labor + (t - 0.5) * 0.1),
+    )
+    const labor = Math.round(bac * laborShare)
+    const material = Math.round(bac * shares.material)
+    breakdownByEvent[event.id] = {
+      labor,
+      material,
+      equipment: bac - labor - material,
+    }
   }
   return buildBudgetEntity({
     id: DEMO_BUDGET_ID,
     planEntityId,
     planAnchor: plan.anchor,
-    budget: { schemaVersion: 1, currency: "MXN", timePhasing: "uniform", bacByEvent },
+    budget: {
+      schemaVersion: 1,
+      currency: "MXN",
+      timePhasing: "uniform",
+      bacByEvent,
+      breakdownByEvent,
+    },
   })
 }
 

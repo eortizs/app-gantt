@@ -25,6 +25,17 @@ export const BUDGET_SCHEMA_VERSION = 1
 /** The only time-phasing policy budget schema v1 defines. */
 export type TimePhasingPolicy = "uniform"
 
+/**
+ * Per-event split of the BAC. When present, `labor + material +
+ * equipment` must equal `bacByEvent[eventId]` EXACTLY — the breakdown is
+ * a partition, not an extra budget. Feeds the CR cost model (labor-burn).
+ */
+export interface CostBreakdown {
+  labor: number
+  material: number
+  equipment: number
+}
+
 export interface BudgetPayload {
   schemaVersion: 1
   /** ISO 4217 code the amounts are denominated in ("MXN"). */
@@ -32,6 +43,8 @@ export interface BudgetPayload {
   timePhasing: TimePhasingPolicy
   /** Budget at completion, per event id. Events absent carry no BAC. */
   bacByEvent: Record<string, number>
+  /** Optional per-event breakdown of the BAC (additive; schema stays 1). */
+  breakdownByEvent?: Record<string, CostBreakdown>
 }
 
 export interface UmeBudgetEntity {
@@ -94,6 +107,38 @@ export function decodeBudget(
         }
       }
     }
+    // Desglose opcional: cada parte finita >= 0 y la suma EXACTA al BAC
+    // del mismo evento (partición, no presupuesto extra).
+    if (budget.breakdownByEvent !== undefined) {
+      if (!isObject(budget.breakdownByEvent)) {
+        errors.push(err(`${P}.breakdownByEvent`, "type", "breakdownByEvent must be an object"))
+      } else {
+        for (const [eventId, breakdown] of Object.entries(budget.breakdownByEvent)) {
+          const bp = `${P}.breakdownByEvent["${eventId}"]`
+          if (!isObject(breakdown)) {
+            errors.push(err(bp, "type", "breakdown must be an object"))
+            continue
+          }
+          let sum = 0
+          for (const part of ["labor", "material", "equipment"] as const) {
+            const v = breakdown[part]
+            if (!isFiniteNumber(v) || v < 0) {
+              errors.push(err(`${bp}.${part}`, "range", `${part} must be a finite number >= 0`))
+            } else {
+              sum += v
+            }
+          }
+          const bac = isObject(budget.bacByEvent)
+            ? (budget.bacByEvent as Record<string, unknown>)[eventId]
+            : undefined
+          if (!isFiniteNumber(bac)) {
+            errors.push(err(bp, "ref", `breakdown for "${eventId}" has no BAC to partition`))
+          } else if (sum !== bac) {
+            errors.push(err(bp, "sum", `labor+material+equipment (${sum}) must equal the BAC (${bac}) exactly`))
+          }
+        }
+      }
+    }
   }
 
   // Binding: relations[0] must point at a GanttPlan; when the plan is
@@ -119,6 +164,13 @@ export function decodeBudget(
     for (const eventId of Object.keys(budget.bacByEvent)) {
       if (!known.has(eventId)) {
         errors.push(err(`${P}.bacByEvent["${eventId}"]`, "ref", `budgeted event "${eventId}" is not an event of the supplied plan`))
+      }
+    }
+    if (isObject(budget.breakdownByEvent)) {
+      for (const eventId of Object.keys(budget.breakdownByEvent)) {
+        if (!known.has(eventId)) {
+          errors.push(err(`${P}.breakdownByEvent["${eventId}"]`, "ref", `broken-down event "${eventId}" is not an event of the supplied plan`))
+        }
       }
     }
   }

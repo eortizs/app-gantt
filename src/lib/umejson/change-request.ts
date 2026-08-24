@@ -23,8 +23,10 @@ import { applyOps, type ChangeOp } from "./codec.ts"
 import type { PlanJSON } from "../plan-types.ts"
 import { dependentClosure } from "./schedule.ts"
 import { vigenteBaseline, driftDays } from "./baselines.ts"
+import type { BudgetPayload } from "./budget.ts"
 import {
   SENTINEL,
+  ENTITY_NAME,
   UME_STATUSES,
   err,
   isIsoDate,
@@ -38,6 +40,8 @@ import {
 
 export const ENTITY_NAME_CHANGE_REQUEST = "GanttChangeRequest"
 export const CR_SCHEMA_VERSION = 1
+
+const DAY_MS = 86_400_000
 
 export type ChangeRequestStatus = "proposed" | "approved" | "rejected" | "applied"
 
@@ -79,6 +83,26 @@ export interface ImpactEntry {
   driftDays?: number
 }
 
+/**
+ * Labor-burn cost model of a slip: only the labor component of a task
+ * extends with the schedule, so a drifted end burns
+ * `dailyLaborBurn = breakdown.labor / referenceDurationDays` extra per
+ * day of drift. Frozen at proposal time with the rest of the snapshot —
+ * an approver decides on THIS number, never on a live recomputation.
+ * Events without a breakdown contribute burn 0 (nothing to extend).
+ */
+export interface CostImpact {
+  /** ISO 4217 the projection is denominated in (from the budget). */
+  currency: string
+  /**
+   * Σ driftDays × dailyLaborBurn over the impacted entries, signed:
+   * NEGATIVE is a projected saving (work finishing earlier).
+   */
+  projectedExtraCost: number
+  /** Σ of POSITIVE driftDays only — days added to the labor calendar. */
+  extendedDays: number
+}
+
 export interface ImpactSnapshot {
   /**
    * Frozen at proposal time: an approver decides on THIS, never on a live
@@ -86,6 +110,8 @@ export interface ImpactSnapshot {
    * never cross-checks it against the ops - it is evidence, not a cache.
    */
   entries: ImpactEntry[]
+  /** Attached when a budget is supplied at proposal time. */
+  costImpact?: CostImpact
 }
 
 export interface ChangeRequestStatusEntry {
@@ -101,6 +127,14 @@ export interface ChangeRequestPayload {
   planEntityId: string
   /** Anchor of the plan revision this CR was proposed against. */
   planAnchor: string
+  /**
+   * Revision of the plan entity this CR was proposed against (>= 1).
+   * The binding that actually protects the apply: `planAnchor` is a date
+   * that `applyOps` preserves verbatim, so intermediate edits would slip
+   * through it. Applying against a different revision is a 409, and the
+   * CR must be re-proposed.
+   */
+  planRevision: number
   ops: ChangeOp[]
   status: ChangeRequestStatus
   impact: ImpactSnapshot
@@ -133,6 +167,7 @@ export interface UmeChangeRequestEntity {
 export function buildImpactSnapshot(
   basePlan: PlanJSON,
   ops: readonly ChangeOp[],
+  budget?: BudgetPayload,
 ): ImpactSnapshot {
   const next = applyOps(basePlan, [...ops])
   const baseById = new Map(basePlan.events.map((e) => [e.id, e]))
@@ -172,7 +207,34 @@ export function buildImpactSnapshot(
         : { eventId: id, start: nextEv.start, end: nextEv.end },
     )
   }
-  return { entries }
+  const snapshot: ImpactSnapshot = { entries }
+  // Cost model (labor-burn): only when a budget backs the projection.
+  // Events the budget doesn't break down contribute burn 0 - present in
+  // the sum, honest about what they cost to extend.
+  if (budget) {
+    let projected = 0
+    let extended = 0
+    for (const entry of entries) {
+      if (entry.driftDays === undefined) continue
+      if (entry.driftDays > 0) extended += entry.driftDays
+      const breakdown = budget.breakdownByEvent?.[entry.eventId]
+      if (!breakdown || !entry.reference) continue
+      const refDays = Math.max(
+        1,
+        Math.round(
+          (Date.parse(entry.reference.end) - Date.parse(entry.reference.start)) /
+            DAY_MS,
+        ),
+      )
+      projected += (entry.driftDays * breakdown.labor) / refDays
+    }
+    snapshot.costImpact = {
+      currency: budget.currency,
+      projectedExtraCost: Math.round(projected * 100) / 100,
+      extendedDays: extended,
+    }
+  }
+  return snapshot
 }
 
 /**
@@ -183,18 +245,30 @@ export function buildImpactSnapshot(
 export function createChangeRequest(input: {
   planEntityId: string
   planAnchor: string
+  planRevision: number
   basePlan: PlanJSON
   ops: readonly ChangeOp[]
+  /** Budget feeding the frozen cost projection, when one exists. */
+  budget?: BudgetPayload
+  /** Proposal reason, kept as the head statusLog entry's reason. */
+  reason?: string
 }): ChangeRequestPayload {
   const ops = [...input.ops]
   return {
     schemaVersion: CR_SCHEMA_VERSION,
     planEntityId: input.planEntityId,
     planAnchor: input.planAnchor,
+    planRevision: input.planRevision,
     ops,
     status: "proposed",
-    impact: buildImpactSnapshot(input.basePlan, ops),
-    statusLog: [{ status: "proposed", timestamp: SENTINEL }],
+    impact: buildImpactSnapshot(input.basePlan, ops, input.budget),
+    statusLog: [
+      {
+        status: "proposed",
+        timestamp: SENTINEL,
+        ...(input.reason ? { reason: input.reason } : {}),
+      },
+    ],
     requestedBy: SENTINEL,
   }
 }
@@ -257,6 +331,40 @@ export function encodeChangeRequest(
 export type DecodeChangeRequestResult =
   | { ok: true; entity: UmeChangeRequestEntity; cr: ChangeRequestPayload }
   | { ok: false; errors: ValidationError[] }
+
+/**
+ * Envelope for a NEW change-request document (the backend's propose
+ * endpoint): fresh uuid, lifecycle v1, relation to the bound plan. The
+ * payload's sentinel slots (statusLog timestamps, actors) survive here -
+ * `stampChangeRequestSentinels` on the server is what finalizes them.
+ */
+export function buildChangeRequestEntity(input: {
+  payload: ChangeRequestPayload
+  markdownDocumentation?: string
+}): UmeChangeRequestEntity {
+  const now = new Date().toISOString()
+  return {
+    id: crypto.randomUUID(),
+    entityName: ENTITY_NAME_CHANGE_REQUEST,
+    dynamicProperties: { changeRequest: input.payload },
+    lifecycle: { createdAt: now, updatedAt: now, deletedAt: null, version: 1 },
+    state: {
+      current: "active",
+      statusLog: [
+        { status: "active", timestamp: now, reason: `change request ${input.payload.status}` },
+      ],
+    },
+    markdownDocumentation:
+      input.markdownDocumentation ??
+      `# Solicitud de cambio\n\nCR sobre el plan ${input.payload.planEntityId} (revisión ${input.payload.planRevision}, ancla ${input.payload.planAnchor}): ${input.payload.ops.length} ops, estado ${input.payload.status}.`,
+    relations: [{
+      targetEntity: ENTITY_NAME,
+      targetId: input.payload.planEntityId,
+      type: "one-to-one",
+      context: "change-request-for",
+    }],
+  }
+}
 
 const DEP_TYPES = ["FS", "SS", "FF", "SF"] as const
 
@@ -468,6 +576,13 @@ export function decodeChangeRequest(
     if (!isIsoDate(cr.planAnchor)) {
       errors.push(err(`${P}.planAnchor`, "iso", "planAnchor must be ISO date string"))
     }
+    if (
+      typeof cr.planRevision !== "number" ||
+      !Number.isInteger(cr.planRevision) ||
+      cr.planRevision < 1
+    ) {
+      errors.push(err(`${P}.planRevision`, "type", "planRevision must be an integer >= 1"))
+    }
     validateOps(cr.ops, `${P}.ops`, errors)
     if (!CR_STATUSES.includes(cr.status as ChangeRequestStatus)) {
       errors.push(err(`${P}.status`, "enum", `status must be one of ${CR_STATUSES.join(", ")}`))
@@ -500,6 +615,27 @@ export function decodeChangeRequest(
           errors.push(err(`${ep}.driftDays`, "type", "impact.driftDays must be an integer"))
         }
       })
+      // Proyección de costo congelada: evidence, not cache — same rule as
+      // the entries themselves (shape-checked, never recomputed).
+      if (cr.impact.costImpact !== undefined && !isObject(cr.impact.costImpact)) {
+        errors.push(err(`${P}.impact.costImpact`, "type", "costImpact must be an object"))
+      } else if (isObject(cr.impact.costImpact)) {
+        const ci = cr.impact.costImpact
+        const CIP = `${P}.impact.costImpact`
+        if (typeof ci.currency !== "string" || ci.currency === "") {
+          errors.push(err(`${CIP}.currency`, "type", "costImpact.currency must be a non-empty string"))
+        }
+        if (typeof ci.projectedExtraCost !== "number" || !Number.isFinite(ci.projectedExtraCost)) {
+          errors.push(err(`${CIP}.projectedExtraCost`, "type", "projectedExtraCost must be a finite number"))
+        }
+        if (
+          typeof ci.extendedDays !== "number" ||
+          !Number.isInteger(ci.extendedDays) ||
+          ci.extendedDays < 0
+        ) {
+          errors.push(err(`${CIP}.extendedDays`, "type", "extendedDays must be an integer >= 0"))
+        }
+      }
     }
     // Append-only audit log: head is the proposal, every step is a legal
     // transition, and the tail mirrors the payload status. SENTINEL
@@ -554,6 +690,27 @@ export function decodeChangeRequest(
     }
     if (cr.decidedBy !== undefined && typeof cr.decidedBy !== "string") {
       errors.push(err(`${P}.decidedBy`, "type", "decidedBy must be a string"))
+    }
+
+    // Binding: relations, when present, point at the bound plan —
+    // exactly one, a GanttPlan, the same entity id the payload claims.
+    if (input.relations !== undefined) {
+      if (!Array.isArray(input.relations) || input.relations.length !== 1) {
+        errors.push(err("relations", "type", "a change request carries exactly one relation (to its plan)"))
+      } else {
+        const rel = input.relations[0]
+        if (!isObject(rel) || rel.targetEntity !== ENTITY_NAME) {
+          errors.push(err("relations[0].targetEntity", "enum", `relation targetEntity must be "${ENTITY_NAME}"`))
+        }
+        if (!isObject(rel) || typeof rel.targetId !== "string" || rel.targetId === "") {
+          errors.push(err("relations[0].targetId", "type", "relation targetId must be a non-empty string"))
+        } else if (
+          typeof cr.planEntityId === "string" &&
+          cr.planEntityId !== rel.targetId
+        ) {
+          errors.push(err("relations[0].targetId", "ref", `relation points at plan "${rel.targetId}" but the payload targets "${cr.planEntityId}"`))
+        }
+      }
     }
 
     // Capa 3: revision binding (only when the plan is supplied).
