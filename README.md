@@ -38,15 +38,17 @@ Orden de verificación tras un cambio: `pnpm lint && pnpm build && pnpm verify` 
 src/
 ├── components/
 │   ├── gantt-plan/
-│   │   ├── GanttPlanViewer.tsx   # vista principal (caja negra umeJSON): bitono dirty/crítico, bitácora, dependencias
-│   │   ├── ChangesetPanel.tsx    # panel inferior: muestra el contrato JSON (cambios)
+│   │   ├── GanttPlanViewer.tsx   # vista principal (caja negra umeJSON): bitono (reposo claro + avance fuerte), trazo de ruta crítica, bitácora, dependencias
+│   │   ├── ChangesetPanel.tsx    # panel inferior: muestra el contrato JSON (cambios) + proponer CR
+│   │   ├── ChangeRequestsPanel.tsx # cola de solicitudes de cambio (badges de estado, impacto congelado, Aprobar/Rechazar/Aplicar)
 │   │   └── EvmPanel.tsx          # tarjetas BAC/PV/EV/AC/SPI/CPI/EAC sobre el plan vivo
 │   ├── reui/gantt/               # motor gantt headless (gantt.tsx, gantt-view.tsx, ...)
 │   └── ui/                       # primitivos shadcn-style (button, slider, scroll-area, tooltip, ...)
 ├── data/
 │   ├── plan-departamento.ts      # plan sintético (schema v2): WBS de 4–5 niveles, 7 fases, ~31 eventos
 │   ├── demo-entity.ts            # envelope umeJSON demo (única definición: fallback App + seed backend)
-│   └── demo-contables.ts         # builders demo de GanttBudget / GanttActuals (tarifa×días, wiggle determinista)
+│   ├── demo-contables.ts         # builders demo de GanttBudget / GanttActuals (tarifa×días con desglose exacto, wiggle determinista)
+│   └── demo-workforce.ts         # builder demo de GanttWorkforce (cuadrillas derivadas de los RESPONSABLES)
 ├── lib/
 │   ├── plan-types.ts             # tipos PlanJSON v2 + EventData (compartidos data ↔ lib ↔ umejson)
 │   ├── plan-mapper.ts            # PlanJSON → GanttEvent[] + GanttResource[] (puro sobre el plan recibido)
@@ -235,6 +237,10 @@ Servicio Fastify + pg que escucha **solo en 127.0.0.1:4600** (nginx proxyea `/ap
 | `PUT /api/plans/:id` | Body `{ entity, expectedRevision }`; ver abajo |
 | `GET/PUT /api/plans/:planId/budget` | Entidad hermana `GanttBudget` del plan (la más reciente) |
 | `GET/PUT /api/plans/:planId/actuals` | Entidad hermana `GanttActuals` del plan |
+| `GET/PUT /api/plans/:planId/workforce` | Entidad hermana `GanttWorkforce` del plan (cuadrillas + asignaciones) |
+| `GET /api/plans/:planId/change-requests?status=` | Cola de CRs del plan (`created_at DESC`, filtro opcional por estado promovido) |
+| `POST /api/plans/:planId/change-requests` | Body `{ ops, reason? }` → propone una CR contra la revisión vigente; responde `{ id, revision, impact }` (201). Ops con targets inexistentes (vista vencida) → **422** |
+| `POST /api/change-requests/:id/decision` | Body `{ to: "approved"\|"rejected"\|"applied", reason? }`. Transición ilegal → **422**; apply con revisión del plan movida → **409** `{ currentRevision, crPlanRevision }` (la CR queda approved y hay que re-proponer) |
 
 ### Pipeline del PUT
 
@@ -250,21 +256,41 @@ Servicio Fastify + pg que escucha **solo en 127.0.0.1:4600** (nginx proxyea `/ap
 
 ### Configuración
 
-`server/.env` (gitignored, mode 640 root:gantt; template en `server/.env.example`): `DATABASE_URL` (rol `system`, owner de `db_umejson`) y `PORT=4600`. Carga manual sin dotenv, fail-fast al boot. Credenciales jamás en archivos trackeados.
+`server/.env` (gitignored, mode 640 root:gantt; template en `server/.env.example`): `DATABASE_URL` (rol `system`, owner de `db_umejson`), `PORT=4600` y `DEFAULT_ACTOR` (identidad que estampa `requestedBy`/`decidedBy` de las CRs — sin auth por ahora, el demo es público y rate-limited). Carga manual sin dotenv, fail-fast al boot. Credenciales jamás en archivos trackeados.
+
+### Seed y política de hermanas
+
+`pnpm --filter server seed` siembra el plan demo y sus hermanas (budget/actuals/workforce) con los mismos builders que el fallback offline de `App.tsx`. Política decidida: el **plan** nunca se sobreescribe (`ON CONFLICT DO NOTHING` — las ediciones sobreviven); las **hermanas demo son regenerables** y cada re-seed las refresca incondicionalmente (pisar una edición por PUT es aceptado y documentado). Cada documento se decodifica antes de persistir: el seed se niega a guardar algo que el contrato rechazaría.
 
 ## Entidades contables y EVM
 
 El schema del plan queda **congelado en v2**; los datos contables viven en entidades umeJSON hermanas vinculadas por `relations[]`:
 
-- **`GanttBudget`** (`budget.ts`): BAC por evento + moneda + time-phasing `uniform` (única política de la v1). `decodeBudget(input, plan?, planEntityId?)` valida BAC ≥ 0 finito y refs contra el plan suministrado.
+- **`GanttBudget`** (`budget.ts`): BAC por evento + moneda + time-phasing `uniform` (única política de la v1) + **`breakdownByEvent` opcional** (partición `labor/material/equipment` que debe sumar EXACTO al BAC del evento). `decodeBudget(input, plan?, planEntityId?)` valida montos ≥ 0 finitos, la suma exacta del desglose y refs contra el plan suministrado.
 - **`GanttActuals`** (`actuals.ts`): AC acumulado por evento + `dataDate` de corte + `baselineVersionByEvent` (qué versión vigente de la bitácora era la referencia al cortar — cross-checkeada contra la bitácora real).
+- **`GanttWorkforce`** (`workforce.ts`): RRHH de obra — `crews` (especialidad, headcount, tarifa/día/persona) + `assignmentByEvent` (evento → cuadrilla + headcount), con refs cruzadas (cuadrilla inexistente, evento desconocido vs plan) y relación exactamente 1 → `GanttPlan`. El viewer pinta la columna «Cuadrilla» (`{crew.title} · {headcount}`) cuando `App` le pasa la hermana.
 - **EVM** (`evm.ts`, runtime-pura — nada se persiste, es una lente): `computeEvm(plan, budget, actuals)` produce PV (BAC distribuido uniformemente sobre la ventana de referencia de drift = baseline anclada/vigente, clamped [0, BAC]), EV (BAC × progress), AC (corte) y SV/CV/SPI/CPI/EAC/ETC/TCPI/VAC por evento y proyecto. Los índices son `null` cuando el denominador no tiene sentido (PV 0, AC 0); CPI 0 con AC > 0 es una respuesta real. El `EvmPanel` pinta tarjetas con semáforo (rojo < 0.9, ámbar < 1, verde ≥ 1) sobre el **plan vivo** (`applyOps(basePlan, ops)`).
 
-Demo: `demo-contables.ts` genera montos sintéticos realistas (tarifa por fase × días para BAC; BAC × avance × wiggle determinista [0.85–1.15] para AC) — el fallback offline de `App.tsx` y el seed del backend usan los mismos builders.
+Demo: `demo-contables.ts` genera montos sintéticos realistas (tarifa por fase × días para BAC con desglose que suma exacto; BAC × avance × wiggle determinista [0.85–1.15] para AC) y `demo-workforce.ts` deriva las cuadrillas de los `RESPONSABLES` del propio plan (única fuente) — el fallback offline de `App.tsx` y el seed del backend usan los mismos builders.
+
+## Solicitudes de cambio (CRs end-to-end)
+
+El contrato vive en `change-request.ts`; el backend lo opera; el frontend propone y decide.
+
+- **Propuesta**: `POST /api/plans/:id/change-requests` con `{ ops, reason? }`. El servidor carga el plan almacenado, construye la CR con `createChangeRequest` (el snapshot de impacto nace del MISMO plan al que la CR se ancla — imposible adjuntar uno desincronizado), la envuelve con `buildChangeRequestEntity` (uuid nuevo) y la decodifica en el borde como check defensivo.
+- **Binding de revisión**: el payload lleva `planRevision` (int ≥ 1). `planAnchor` NO protege contra ediciones intermedias (`applyOps` lo preserva intacto) — la revisión sí: apply contra otra revisión → **409**, la CR queda `approved` y hay que re-proponer.
+- **Costo de un desliz (modelo labor-burn)**: `buildImpactSnapshot(basePlan, ops, budget?)` adjunta `costImpact` cuando hay budget: `dailyLaborBurn = breakdown.labor / duraciónDíasReferencia`; `projectedExtraCost = Σ driftDays × burn` (con signo — negativo = ahorro proyectado); `extendedDays = Σ driftDays > 0`. Sin budget no hay `costImpact`; sin desglose el burn es 0. Procurement/maquinaria-extendida/indirectos: out of scope (follow-up).
+- **Decisiones**: `proposed → approved | rejected`, `approved → applied` (terminal). El apply verifica la revisión y escribe **plan + CR en una transacción** (`applyOps` → documento del plan con `statusLog` append `«CR aplicada: <id>»`, revisión +1 → fila CR `applied`).
+- **Actores**: sin auth todavía — `DEFAULT_ACTOR` (`server/.env`) estampa `requestedBy`/`decidedBy` vía `stampChangeRequestSentinels`.
+- **UI**: `ChangesetPanel` propone los ops grabados (sin resetear el recorder — el reset llega con el remount post-apply); `ChangeRequestsPanel` (patrón `EvmPanel`) lista la cola con badge de estado, razón, impacto congelado (N eventos, Σ desliz, costo proyectado con moneda y signo) y botones Aprobar/Rechazar/Aplicar. En modo offline ambas cosas se esconden. Tras un apply, `App` refetchea el bundle y remonta el viewer por `key={planId:revision}` (su estado interno de eventos no se re-inicializa con solo cambiar props — limitación existente, documentada).
 
 ## CPM (ruta crítica)
 
-`cpmSchedule(plan)` (`cpm.ts`, runtime-pura) computa el forward pass (ES/EF, reusando `earliestStart` del cascade — misma semántica de restricciones), backward pass (LS/LF desde el fin del proyecto = max EF), **holgura total** (LS−ES, días corridos) y el conjunto crítico (float 0). Convención **as-planned**: ES = max(inicio planificado, restricciones) — la holgura que el planificador "guardó" arrancando tarde no es float. El viewer pinta las barras críticas con resting saturado (fase full-strength) vía los hooks de bitono; el tint dirty (drift vs referencia) tiene prioridad.
+`cpmSchedule(plan)` (`cpm.ts`, runtime-pura) computa el forward pass (ES/EF, reusando `earliestStart` del cascade — misma semántica de restricciones), backward pass (LS/LF desde el fin del proyecto = max EF), **holgura total** (LS−ES, días corridos) y el conjunto crítico (float 0). Convención **as-planned**: ES = max(inicio planificado, restricciones) — la holgura que el planificador "guardó" arrancando tarde no es float.
+
+### Invariante de pintado (bitono homologado)
+
+El reposo de una barra viva es **siempre un tono claro** (pastel de fase, o `DIRTY_TINT` red-200 si hay drift vs la referencia de la bitácora); el **full-strength queda reservado en exclusiva al overlay de avance**. Una barra crítica al 0% nunca puede pintarse fuerte — se leería como avance inexistente. La ruta crítica se señaliza con un **trazo `inset-ring` en el color de fase** vía `getEventBarClassName` (hook genérico del motor, canal de clases separado de los rellenos); el tint dirty tiene prioridad visual sobre el pastel, no sobre el overlay de avance. Las líneas base pintan en pastel por definición (`baselineTones`: stack 0 = pastel 25% de fase, históricas = rampa pastel fija); el preview por hover de una versión usa el pastel de la versión como reposo y su partner fuerte solo como avance.
 
 ## Despliegue
 
