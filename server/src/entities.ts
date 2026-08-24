@@ -46,6 +46,38 @@ export function stampSentinels<T>(doc: T, now: string): T {
   return cloned as T
 }
 
+/**
+ * CR-specific finalization on top of `stampSentinels`: the PAYLOAD also
+ * carries sentinels the generic pass doesn't know about —
+ * `changeRequest.statusLog[].timestamp` (legal SENTINEL pre-persist, see
+ * the contract header) and the `requestedBy`/`decidedBy` actor slots.
+ * Idempotent for the timestamps; actor slots stamp once and then hold
+ * (already-real actors pass through untouched).
+ */
+export function stampChangeRequestSentinels<T>(
+  doc: T,
+  now: string,
+  actor: string,
+): T {
+  const base: unknown = stampSentinels(doc, now)
+  if (!isObject(base)) return base as T
+  const dp = base.dynamicProperties
+  if (!isObject(dp) || !isObject(dp.changeRequest)) return base as T
+  const cr = dp.changeRequest
+  const next: Record<string, unknown> = { ...cr }
+  if (Array.isArray(cr.statusLog)) {
+    next.statusLog = cr.statusLog.map((entry) =>
+      isObject(entry) && entry.timestamp === SENTINEL
+        ? { ...entry, timestamp: now }
+        : entry,
+    )
+  }
+  if (cr.requestedBy === SENTINEL) next.requestedBy = actor
+  if (cr.decidedBy === SENTINEL) next.decidedBy = actor
+  base.dynamicProperties = { ...dp, changeRequest: next }
+  return base as T
+}
+
 export type PutOutcome = "ok" | "conflict"
 
 export interface PutEntityArgs {
@@ -54,8 +86,20 @@ export interface PutEntityArgs {
   entity: { id: string; lifecycle: { version: number }; state: { current: string } }
   document: unknown
   planEntityId: string | null
+  /**
+   * Promoted `status` override. Plans and siblings keep the default
+   * (`state.current`); CRs promote their PAYLOAD status
+   * ("proposed"/"approved"/...) so the queue index actually filters.
+   */
+  status?: string
   /** Seed mode: never overwrite an existing row (ON CONFLICT DO NOTHING). */
   ifNotExists?: boolean
+  /**
+   * Seed mode for regenerable demo siblings: ALWAYS overwrite (decided
+   * policy — demo data is regenerable, clobbering PUT edits is accepted).
+   * The PLAN keeps `ifNotExists`. `expectedRevision` is ignored here.
+   */
+  seedOverwrite?: boolean
 }
 
 /**
@@ -67,40 +111,56 @@ export async function putEntity(
   pool: Pool,
   args: PutEntityArgs & { expectedRevision: number },
 ): Promise<PutOutcome> {
-  const { entityName, entity, document, planEntityId, expectedRevision, ifNotExists } = args
-  const existing = await pool.query<{ revision: number }>(
-    "SELECT revision FROM ume_entities WHERE id = $1",
-    [entity.id],
-  )
-  if (existing.rowCount === 0 && expectedRevision !== 0) return "conflict"
-  if (existing.rowCount === 1 && existing.rows[0]!.revision !== expectedRevision) {
-    return "conflict"
+  const { entityName, entity, document, planEntityId, expectedRevision, ifNotExists, seedOverwrite } = args
+  const status = args.status ?? entity.state.current
+  if (!ifNotExists && !seedOverwrite) {
+    const existing = await pool.query<{ revision: number }>(
+      "SELECT revision FROM ume_entities WHERE id = $1",
+      [entity.id],
+    )
+    if (existing.rowCount === 0 && expectedRevision !== 0) return "conflict"
+    if (existing.rowCount === 1 && existing.rows[0]!.revision !== expectedRevision) {
+      return "conflict"
+    }
   }
+  const onConflict = ifNotExists
+    ? "DO NOTHING"
+    : seedOverwrite
+      ? `DO UPDATE
+        SET document = EXCLUDED.document,
+            entity_name = EXCLUDED.entity_name,
+            plan_entity_id = EXCLUDED.plan_entity_id,
+            status = EXCLUDED.status,
+            revision = EXCLUDED.revision,
+            updated_at = now()`
+      : `DO UPDATE
+        SET document = EXCLUDED.document,
+            entity_name = EXCLUDED.entity_name,
+            plan_entity_id = EXCLUDED.plan_entity_id,
+            status = EXCLUDED.status,
+            revision = EXCLUDED.revision,
+            updated_at = now()
+        WHERE ume_entities.revision = $7`
   const result = await pool.query(
     `INSERT INTO ume_entities (id, entity_name, document, plan_entity_id, status, revision)
      VALUES ($1, $2, $3, $4, $5, $6)
-     ON CONFLICT (id) ${ifNotExists ? "DO NOTHING" : `DO UPDATE
-       SET document = EXCLUDED.document,
-           entity_name = EXCLUDED.entity_name,
-           plan_entity_id = EXCLUDED.plan_entity_id,
-           status = EXCLUDED.status,
-           revision = EXCLUDED.revision,
-           updated_at = now()
-       WHERE ume_entities.revision = $7`}`,
-    ifNotExists
-      ? [entity.id, entityName, JSON.stringify(document), planEntityId, entity.state.current, entity.lifecycle.version]
-      : [
+     ON CONFLICT (id) ${onConflict}`,
+    onConflict.includes("$7")
+      ? [
           entity.id,
           entityName,
           JSON.stringify(document),
           planEntityId,
-          entity.state.current,
+          status,
           entity.lifecycle.version,
           expectedRevision,
-        ],
+        ]
+      : [entity.id, entityName, JSON.stringify(document), planEntityId, status, entity.lifecycle.version],
   )
-  // DO NOTHING on an existing id (seed over a seeded row) is a no-op, not a conflict.
-  if (result.rowCount === 0 && !ifNotExists) return "conflict"
+  // DO NOTHING on an existing id (seed over a seeded row) is a no-op, not
+  // a conflict; seedOverwrite clobbering an edited row is the documented
+  // policy, also not a conflict.
+  if (result.rowCount === 0 && !ifNotExists && !seedOverwrite) return "conflict"
   return "ok"
 }
 
@@ -129,6 +189,26 @@ export async function getLatestForPlan(
     [planEntityId, entityName],
   )
   return rows[0] ?? null
+}
+
+/** Cap on the CR queue listing: newest-first window, never unbounded. */
+const CR_QUEUE_LIMIT = 200
+
+/** CR queue of a plan, newest first (capped); optional promoted-status filter. */
+export async function listChangeRequests(
+  pool: Pool,
+  planEntityId: string,
+  status?: string,
+): Promise<EntityRow[]> {
+  const { rows } = await pool.query<EntityRow>(
+    `SELECT * FROM ume_entities
+     WHERE plan_entity_id = $1 AND entity_name = 'GanttChangeRequest' AND deleted_at IS NULL
+       ${status ? "AND status = $2" : ""}
+     ORDER BY created_at DESC
+     LIMIT ${CR_QUEUE_LIMIT}`,
+    status ? [planEntityId, status] : [planEntityId],
+  )
+  return rows
 }
 
 export async function currentRevision(pool: Pool, id: string): Promise<number | null> {

@@ -26,6 +26,11 @@ export interface ServerConfig {
   databaseUrl: string
   port: number
   host: "127.0.0.1"
+  /**
+   * Identity that stamps CR `requestedBy`/`decidedBy`. No auth exists yet
+   * (public rate-limited demo); a real identity arrives with the IA agent.
+   */
+  defaultActor: string
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
@@ -38,5 +43,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`PORT must be an integer 1..65535, got "${env.PORT}"`)
   }
-  return { databaseUrl, port, host: "127.0.0.1" }
+  return {
+    databaseUrl,
+    port,
+    host: "127.0.0.1",
+    defaultActor: env.DEFAULT_ACTOR?.trim() || "demo-actor",
+  }
 }
