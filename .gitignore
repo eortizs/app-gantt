@@ -27,3 +27,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Kilo local state (sessions, agent-manager recovery, scratch node_modules)
+.kilo/
