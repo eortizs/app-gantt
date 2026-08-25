@@ -842,6 +842,15 @@ function GanttPlanViewerInner({
             events.find((ev) => ev.id === id)?.title ?? id
           return (
             <>
+              <ContextMenuItem onClick={() => captureBaseline(occurrence.event.id)}>
+                <PinIcon aria-hidden /> {APP_STRINGS_ES.setBaseline}
+              </ContextMenuItem>
+              <ContextMenuItem
+                disabled={!occurrence.event.data?.baselines?.length}
+                onClick={() => openHistory(occurrence)}
+              >
+                <HistoryIcon aria-hidden /> {APP_STRINGS_ES.viewBaselines}
+              </ContextMenuItem>
               <ContextMenuItem
                 onClick={() => handleToggleMilestone(occurrence)}
               >
@@ -854,43 +863,8 @@ function GanttPlanViewerInner({
                   ? APP_STRINGS_ES.convertToTask
                   : APP_STRINGS_ES.convertToMilestone}
               </ContextMenuItem>
-              <ContextMenuItem onClick={() => captureBaseline(occurrence.event.id)}>
-                <PinIcon aria-hidden /> {APP_STRINGS_ES.setBaseline}
-              </ContextMenuItem>
-              <ContextMenuItem
-                disabled={!occurrence.event.data?.baselines?.length}
-                onClick={() => openHistory(occurrence)}
-              >
-                <HistoryIcon aria-hidden /> {APP_STRINGS_ES.viewBaselines}
-              </ContextMenuItem>
-              <ContextMenuSub>
-                <ContextMenuSubTrigger>
-                  <SplineIcon aria-hidden /> {APP_STRINGS_ES.addDependency}
-                </ContextMenuSubTrigger>
-                <ContextMenuSubContent className="max-h-64 overflow-auto">
-                  {events
-                    .filter((ev) => ev.id !== selfId)
-                    .map((ev) => {
-                      const blocked = wouldCreateCycle(deps, selfId, ev.id)
-                      return (
-                        <ContextMenuItem
-                          key={ev.id}
-                          disabled={blocked}
-                          onClick={() =>
-                            handleAddDependency(selfId, ev.id)
-                          }
-                        >
-                          {APP_STRINGS_ES.dependencyTargetLabel(ev.title)}
-                          {blocked && (
-                            <span className="text-muted-foreground ms-2 text-xs">
-                              {APP_STRINGS_ES.dependencyCycleBlocked}
-                            </span>
-                          )}
-                        </ContextMenuItem>
-                      )
-                    })}
-                </ContextMenuSubContent>
-              </ContextMenuSub>
+              {/* Las dependencias se crean SOLO arrastrando desde los
+                  connect handles de la barra; el menú queda para quitar. */}
               {(outgoing.length > 0 || incoming.length > 0) && (
                 <ContextMenuSub>
                   <ContextMenuSubTrigger>

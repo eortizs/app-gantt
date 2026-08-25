@@ -187,6 +187,7 @@ El menú contextual de cada barra ofrece **«Convertir en hito» / «Convertir e
 
 El panel `ChangesetPanel` inferior muestra dos secciones: el **`Op[]`** acumulado y, cuando hay cambios, el **documento umeJSON actualizado** (entidad lista para POST). Ambos con **Copiar JSON**.
 
+> **Nota sobre dependencias**: crear dependencias es **drag-and-drop** — se arranca desde los puntos de conexión en los bordes de la barra (con veto de ciclo en vivo `canConnectEvents`) y suelta sobre la tarea sucesora; no hay opción de alta en el menú contextual. El menú (y el clic sobre el conector, que abre `DependencyPanel`) queda para **quitar**.
 > **Nota sobre borrado**: el menú contextual de cada barra expone borrado (`DeleteOp` vía `recorder.onEventDelete` + `GanttApi.removeEvent`); `applyOps` poda las dependencias incidentes para que el documento nunca quede con refs colgantes.
 
 ## Pipeline umeJSON (caja negra)

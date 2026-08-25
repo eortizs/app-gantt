@@ -87,8 +87,8 @@ export const APP_STRINGS_ES = {
     `Refijada en cascada desde «${title}»`,
 
   // ----- dependencias -----
-  /** Context-menu submenu over a bar: link this event to a successor. */
-  addDependency: "Agregar dependencia",
+  // (Crear dependencias es drag-and-drop desde los connect handles de la
+  // barra; el menú contextual solo quita.)
   /** Context-menu submenu: unlink an edge touching this event. */
   removeDependency: "Quitar dependencia",
   dependencyTypes: {
@@ -97,8 +97,6 @@ export const APP_STRINGS_ES = {
     FF: "Fin → Fin",
     SF: "Inicio → Fin",
   } as const,
-  /** Menu entry naming the target event of a prospective edge. */
-  dependencyTargetLabel: (title: string) => `Hacia «${title}»`,
   /** Menu entry naming one existing edge (direction relative to this event). */
   dependencyEdgeLabel: (title: string, type: string, outgoing: boolean) =>
     `${outgoing ? "→" : "←"} ${title} (${type})`,
@@ -111,7 +109,6 @@ export const APP_STRINGS_ES = {
   /** Cause badge on auto-adjusted ops in the changeset JSON. */
   cascadeCauseLegend:
     "Los ops con «cause» son ajustes automáticos en cascada por dependencias; el resto son ediciones manuales.",
-  dependencyCycleBlocked: "(cerraría un ciclo)",
   /** Badge on a connector whose constraint the current dates violate. */
   dependencyViolated: "Fuera de secuencia",
 
