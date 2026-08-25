@@ -56,7 +56,7 @@ import {
   type UmeChangeRequestEntity,
 } from "../src/lib/umejson/change-request.ts"
 import { PLAN } from "../src/data/plan-departamento.ts"
-import { DEMO_PLAN_ID } from "../src/data/demo-entity.ts"
+import { DEMO_PLAN_ID, buildDemoEntity } from "../src/data/demo-entity.ts"
 import { buildDemoBudget } from "../src/data/demo-contables.ts"
 import { buildDemoWorkforce } from "../src/data/demo-workforce.ts"
 import type { PlanJSON } from "../src/lib/plan-types.ts"
@@ -1434,6 +1434,124 @@ for (const [label, input] of rejectionCases) {
     fail("demo: workforce builder purity", "PLAN mutated")
   } else {
     ok(`demo: workforce (${dWorkforce.workforce.crews.length} crews, all events assigned, PLAN untouched)`)
+  }
+}
+
+// ---- 22. Hitos: kind milestone + toggle canónico + cascada + CPM + demo --
+{
+  const t = (days: number) => new Date(Date.parse(ISO) + days * 86_400_000).toISOString()
+
+  // (a) Decoder: `kind: "milestone"` pasa, `kind: "x"` se rechaza.
+  const msPlan: PlanJSON = {
+    ...fixturePlan,
+    events: [
+      ...fixturePlan.events,
+      { id: "m1", resourceId: "child", start: ISO, end: ISO, progress: 0, kind: "milestone" },
+    ],
+  }
+  const withMs: unknown = { ...fixtureEntity, dynamicProperties: { plan: msPlan } }
+  if (!decodeUmePlan(withMs).ok) fail("milestone: decode accepts kind", "rejected")
+  else ok("milestone: decode accepts kind")
+  const badKind: unknown = {
+    ...fixtureEntity,
+    dynamicProperties: {
+      plan: {
+        ...msPlan,
+        events: [
+          ...msPlan.events.slice(0, -1),
+          { id: "m1", resourceId: "child", start: ISO, end: ISO, progress: 0, kind: "hito" },
+        ],
+      },
+    },
+  }
+  if (decodeUmePlan(badKind).ok) fail("milestone: decode rejects bad kind", "accepted")
+  else ok("milestone: decode rejects bad kind")
+
+  // (b) Toggle ida y vuelta: el campo `kind` DESAPARECE al volver a tarea
+  // (forma canónica) y un evento que nunca fue hito round-tripea igual.
+  const taskEvent: PlanJSON["events"][number] = {
+    id: "tk", resourceId: "child", start: t(0), end: t(5), progress: 0,
+  }
+  const taskPlan: PlanJSON = { ...fixturePlan, events: [taskEvent] }
+  const asMs = applyOps(taskPlan, [
+    { op: "update", id: "tk", patch: { start: t(5), end: t(5), kind: "milestone" } },
+  ])
+  const msEv = asMs.events[0]
+  if (msEv?.kind !== "milestone" || msEv.start !== t(5) || msEv.end !== t(5)) {
+    fail("milestone: conversion collapses onto the end", JSON.stringify(msEv))
+  } else ok("milestone: conversion collapses onto the end")
+  const back = applyOps(asMs, [
+    { op: "update", id: "tk", patch: { start: t(0), end: t(5), kind: "task" } },
+  ])
+  const backEv = back.events[0]
+  if (!backEv || "kind" in backEv || !deepEqual(backEv, taskEvent)) {
+    fail("milestone: toggle back is byte-identical", JSON.stringify(backEv))
+  } else ok("milestone: toggle back drops the kind field (byte-identical)")
+  const datesOnly = applyOps(taskPlan, [
+    { op: "update", id: "tk", patch: { start: t(1), end: t(6) } },
+  ])
+  if ("kind" in (datesOnly.events[0] ?? {})) {
+    fail("milestone: dates-only op synthesizes kind", "kind appeared")
+  } else ok("milestone: dates-only op never synthesizes kind")
+
+  // (c) Cascada FS desde un hito: el sucesor arranca en el instante.
+  const cascadePlan: PlanJSON = {
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: [
+      { id: "m", resourceId: "r", start: t(5), end: t(5), progress: 0, kind: "milestone" },
+      { id: "b", resourceId: "r", start: t(3), end: t(6), progress: 0 },
+    ],
+    dependencies: [{ id: "d", fromEventId: "m", toEventId: "b", type: "FS" }],
+  }
+  const msAdj = cascadeSchedule(cascadePlan, ["m"])[0]
+  if (!msAdj || msAdj.eventId !== "b" || msAdj.start !== t(5) || msAdj.end !== t(8)) {
+    fail("milestone: FS cascade pushes to the instant", JSON.stringify(msAdj))
+  } else ok("milestone: FS cascade pushes to the instant")
+
+  // (d) CPM con hito de duración 0: no truena y el hito une la ruta.
+  {
+    const r = cpmSchedule(cascadePlan)
+    const day = (v: number | undefined) =>
+      v === undefined ? undefined : Math.round((v - Date.parse(ISO)) / 86_400_000)
+    if (
+      r.projectEnd === null ||
+      day(r.es.get("b")) !== 5 ||
+      !r.critical.has("m") ||
+      !r.critical.has("b")
+    ) {
+      fail("milestone: cpm survives duration 0", JSON.stringify({ projectEnd: r.projectEnd, critical: [...r.critical] }))
+    } else ok("milestone: cpm treats the instant as float-0 chain link")
+  }
+
+  // (e) Plan demo con el hito sembrado: decode del envelope + budget con
+  // BAC 0 y partición 0/0/0 exacta sobre el evento hito.
+  {
+    const entity = buildDemoEntity()
+    const dPlan = decodeUmePlan(entity)
+    if (!dPlan.ok) {
+      fail("milestone: demo plan decodes", dPlan.errors[0]?.message ?? "rejected")
+    } else {
+      const acta = dPlan.plan.events.find((e) => e.id === "acta-entrega")
+      if (acta?.kind !== "milestone" || acta.start !== acta.end) {
+        fail("milestone: demo seeds acta-entrega", JSON.stringify({ kind: acta?.kind, start: acta?.start, end: acta?.end }))
+      } else ok("milestone: demo seeds acta-entrega as duration-0 milestone")
+      const budget = buildDemoBudget(dPlan.plan)
+      const dBudget = decodeBudget(budget, dPlan.plan, DEMO_PLAN_ID)
+      const b = dBudget.ok ? dBudget.budget : null
+      if (!b) {
+        fail("milestone: demo budget decodes", dBudget.ok ? "" : "rejected")
+      } else if ((b.bacByEvent["acta-entrega"] ?? -1) !== 0) {
+        fail("milestone: demo budget BAC 0", String(b.bacByEvent["acta-entrega"]))
+      } else {
+        const part = b.breakdownByEvent["acta-entrega"]
+        if (part && (part.labor !== 0 || part.material !== 0 || part.equipment !== 0)) {
+          fail("milestone: demo breakdown 0/0/0", JSON.stringify(part))
+        } else ok("milestone: demo budget BAC 0 with exact 0/0/0 partition")
+      }
+    }
   }
 }
 

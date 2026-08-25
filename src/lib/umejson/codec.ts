@@ -5,7 +5,16 @@ import type { DependencyCause } from "./schedule.ts"
 export type UpdateOp = {
   op: "update"
   id: string
-  patch: { start: string; end: string }
+  patch: {
+    start: string
+    end: string
+    /**
+     * Task ⇄ milestone conversion rides the same op as the dates: a
+     * milestone conversion collapses `start` onto `end`; converting back
+     * restores a duration. Absent = dates-only edit (kind untouched).
+     */
+    kind?: "task" | "milestone"
+  }
   /**
    * Why this date changed. Absent on manual edits; a dependency cascade
    * documents the binding predecessor, constraint type and shift so the
@@ -24,6 +33,8 @@ export type CreateOp = {
     progress: number
     title: string
     color?: string
+    /** Present when the event is born a milestone (duration 0). */
+    kind?: "task" | "milestone"
     data: { responsable: string; fase: string; status: string }
   }
   /**
@@ -63,9 +74,20 @@ export function applyOps(plan: PlanJSON, ops: ChangeOp[]): PlanJSON {
   const deps = () => dependencies ?? (dependencies = plan.dependencies ?? [])
   for (const op of ops) {
     if (op.op === "update") {
-      events = events.map((e) =>
-        e.id === op.id ? { ...e, start: op.patch.start, end: op.patch.end } : e,
-      )
+      events = events.map((e) => {
+        if (e.id !== op.id) return e
+        const next: PlanEvent = { ...e, start: op.patch.start, end: op.patch.end }
+        if (op.patch.kind === "milestone") return { ...next, kind: "milestone" }
+        if (op.patch.kind === "task") {
+          // Canonical form: a task carries NO kind field, so the document
+          // round-trips identical for events that never were milestones
+          // (same destructure-drop criterion as `dependencies`).
+          const { kind: _drop, ...rest } = next
+          void _drop
+          return rest
+        }
+        return next
+      })
     } else if (op.op === "create") {
       events = [
         ...events,
@@ -75,6 +97,7 @@ export function applyOps(plan: PlanJSON, ops: ChangeOp[]): PlanJSON {
           start: op.event.start,
           end: op.event.end,
           progress: op.event.progress,
+          ...(op.event.kind === "milestone" ? { kind: "milestone" } : {}),
         },
       ]
     } else if (op.op === "delete") {

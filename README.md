@@ -38,9 +38,10 @@ Orden de verificación tras un cambio: `pnpm lint && pnpm build && pnpm verify` 
 src/
 ├── components/
 │   ├── gantt-plan/
-│   │   ├── GanttPlanViewer.tsx   # vista principal (caja negra umeJSON): bitono (reposo claro + avance fuerte), trazo de ruta crítica, bitácora, dependencias
+│   │   ├── GanttPlanViewer.tsx   # vista principal (caja negra umeJSON): bitono (reposo claro + avance fuerte), trazo de ruta crítica, bitácora, dependencias, tarea ⇄ hito
 │   │   ├── ChangesetPanel.tsx    # panel inferior: muestra el contrato JSON (cambios) + proponer CR
 │   │   ├── ChangeRequestsPanel.tsx # cola de solicitudes de cambio (badges de estado, impacto congelado, Aprobar/Rechazar/Aplicar)
+│   │   ├── TreeColumnsMenu.tsx   # dropdown mostrar/ocultar columnas del panel árbol (persiste en localStorage)
 │   │   └── EvmPanel.tsx          # tarjetas BAC/PV/EV/AC/SPI/CPI/EAC sobre el plan vivo
 │   ├── reui/gantt/               # motor gantt headless (gantt.tsx, gantt-view.tsx, ...)
 │   └── ui/                       # primitivos shadcn-style (button, slider, scroll-area, tooltip, ...)
@@ -88,7 +89,7 @@ El módulo carga, en cada mount, un plan de obra generado a partir del inicio de
 
 - **7 fases** (groups L1): Preliminares · Cimentación · Estructura · Albañilería · Instalaciones · Acabados · Entrega.
 - **~45 recursos** estructurados como WBS plano de 4–5 niveles (L0 proyecto → L1 fases → L2 paquetes → L3/L4 tareas). Cada `PlanResource` apunta a su padre con `parentId` y hereda el color de fase vía `phaseId` (resuelto en `plan-mapper.ts`).
-- **~31 eventos** (schedules) con duraciones, offsets relativos al ancla, avance (`progress`) y responsable (`Cuadrilla A/B`, `Ing. Ríos`, `Mtro. Solís`, `Electricista`, etc.).
+- **~31 eventos** (schedules) con duraciones, offsets relativos al ancla, avance (`progress`) y responsable (`Cuadrilla A/B`, `Ing. Ríos`, `Mtro. Solís`, `Electricista`, etc.). El cierre `acta-entrega` es un **hito** (`kind: "milestone"`, duración 0 → diamante) con BAC 0 en el presupuesto demo.
 
 El timeline arranca en escala `month` (por defecto), centrado en `now`, con `infiniteScroll`, `nowIndicator`, `dragCreate`, `displayScheduleHint` y `summaryBars` activados — la UI replica un Gantt de obra real: navegación por mes con flechas, cambio de escala (Día / Semana / Mes / Trimestre / Año), botón **Hoy**, fechas en español y tooltips localizados.
 
@@ -154,7 +155,14 @@ El timeline (barras, filas del timeline, summary bars) conserva el color de fase
 
 ```ts
 // src/lib/umejson/codec.ts
-export type UpdateOp = { op: "update"; id: string; patch: { start: string; end: string } }
+export type UpdateOp = {
+  op: "update"; id: string
+  patch: {
+    start: string; end: string
+    kind?: "task" | "milestone" // toggle tarea ⇄ hito; ausente = no toca el kind
+  }
+  cause?: DependencyCause // ajuste en cascada documentado
+}
 export type CreateOp = {
   op: "create"
   event: {
@@ -165,12 +173,17 @@ export type CreateOp = {
     progress: number
     title: string
     color?: string
+    kind?: "task" | "milestone"
     data: { responsable: string; fase: string; status: string }
   }
 }
 export type DeleteOp = { op: "delete"; id: string }
-export type ChangeOp = UpdateOp | CreateOp | DeleteOp
+export type ChangeOp = UpdateOp | CreateOp | DeleteOp | AddDependencyOp | RemoveDependencyOp
 ```
+
+### Tarea ⇄ hito (`kind: "milestone"`)
+
+El menú contextual de cada barra ofrece **«Convertir en hito» / «Convertir en tarea»**. Un hito es de **finalización** con duración 0: al convertir, `start = end = fin actual` (los dependientes FS quedan intactos; el inicio salta al fin y la cascada repara posibles SS). Al volver a tarea, el instante queda como inicio y la duración se restaura del **plan base** si allí era tarea (si nació hito → 1 día). El campo `kind` es opcional y aditivo (`schemaVersion` sigue en 2): aplicar `kind: "task"` en `applyOps` **elimina** el campo (forma canónica), así un toggle ida y vuelta round-tripea byte-idéntico. En pantalla el hito es un **diamante** cuadrado centrado en el instante (bitono: pastel de fase → tinte fuerte al 100%), sin resize y con la etiqueta siempre fuera; el plan demo siembra `acta-entrega` como hito.
 
 El panel `ChangesetPanel` inferior muestra dos secciones: el **`Op[]`** acumulado y, cuando hay cambios, el **documento umeJSON actualizado** (entidad lista para POST). Ambos con **Copiar JSON**.
 

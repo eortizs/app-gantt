@@ -11,6 +11,7 @@ import {
 } from "react"
 import {
   DEFAULT_ROW_ALIGN,
+  GANTT_NAME_COLUMN_ID,
   resolveScheduleMode,
   resolveTimelineLines,
   useGantt,
@@ -211,6 +212,21 @@ const DEFAULT_TREE_PANEL = {
   nameColumnWidth: 208,
 }
 const DEFAULT_COLUMN_WIDTH = 96
+const DEFAULT_COLUMN_MIN_WIDTH = 72
+const DEFAULT_COLUMN_MAX_WIDTH = 480
+const NAME_COLUMN_MIN_WIDTH = 96
+const NAME_COLUMN_MAX_WIDTH = 640
+
+/**
+ * CSS custom property carrying one column's live width. Cells render
+ * `width: var(<name>, <resolved>px)`: the drag gesture writes the var straight
+ * onto the tree content root, so every header cell and every row cell moves in
+ * ONE style write per pointermove (no React), and a commit just re-renders the
+ * same value through state.
+ */
+function columnWidthVar(id: string): string {
+  return `--gantt-cw-${id.replace(/[^a-zA-Z0-9_-]/g, "-")}`
+}
 const DEFAULT_ZOOM_RANGE = { min: 0.5, max: 3 }
 /** Timeline pane never shrinks below this so it stays usable on narrow screens. */
 const MIN_TIMELINE_WIDTH = 200
@@ -1025,6 +1041,143 @@ if (row.isGroup && segments.length === 0 && viewConfig.summaryBars) {
   const [treeWidth, setTreeWidth] = useState(treeConfig.width)
   const configuredTreeWidth = clampTree(treeWidth)
   const columns = viewConfig.columns ?? []
+
+  // ----- tree columns: user widths (drag/keyboard/reset), live via CSS vars -----
+  // Uncontrolled unless columnWidths is passed; commits flow to
+  // onColumnWidthsChange either way. The record only ever holds USER-resized
+  // columns - an absent key means "use the configured width".
+  const [internalColumnWidths, setInternalColumnWidths] = useState<
+    Record<string, number>
+  >(() => viewConfig.defaultColumnWidths ?? {})
+  const columnWidths = viewConfig.columnWidths ?? internalColumnWidths
+  const columnWidthsRef = useRef(columnWidths)
+  columnWidthsRef.current = columnWidths
+  const resolvedColumnWidths = useMemo(() => {
+    const map: Record<string, number> = {
+      [GANTT_NAME_COLUMN_ID]:
+        columnWidths[GANTT_NAME_COLUMN_ID] ?? treeConfig.nameColumnWidth,
+    }
+    for (const column of columns) {
+      map[column.id] =
+        columnWidths[column.id] ?? column.width ?? DEFAULT_COLUMN_WIDTH
+    }
+    return map
+  }, [columns, columnWidths, treeConfig.nameColumnWidth])
+  const resolvedWidthsRef = useRef(resolvedColumnWidths)
+  resolvedWidthsRef.current = resolvedColumnWidths
+  const commitColumnWidths = useCallback((next: Record<string, number>) => {
+    if (viewConfigRef.current.columnWidths === undefined) {
+      setInternalColumnWidths(next)
+    }
+    viewConfigRef.current.onColumnWidthsChange?.(next)
+  }, [])
+  /** Column objects with the resolved width baked in: GanttTreeRow's memo. */
+  const sizedColumns = useMemo(
+    () =>
+      columns.map((column) => ({
+        ...column,
+        width: resolvedColumnWidths[column.id],
+      })),
+    [columns, resolvedColumnWidths]
+  )
+  // The vars ride on the tree content root so ONE DOM write moves every cell
+  // (header + rows) during a drag; the latest object also dresses the reorder
+  // carry overlay, whose body-appended clone leaves this scope behind.
+  const columnWidthVars = useMemo(() => {
+    const style: Record<string, string> = {}
+    for (const [id, width] of Object.entries(columnWidths)) {
+      style[columnWidthVar(id)] = `${width}px`
+    }
+    return style as CSSProperties
+  }, [columnWidths])
+  const columnWidthVarsRef = useRef(columnWidthVars)
+  columnWidthVarsRef.current = columnWidthVars
+  const treeContentRef = useRef<HTMLDivElement | null>(null)
+
+  const beginColumnResize = useCallback(
+    (
+      e: React.PointerEvent,
+      spec: { id: string; min: number; max: number },
+      handle: HTMLElement
+    ) => {
+      if (e.button !== 0) return
+      e.preventDefault()
+      e.stopPropagation()
+      const pointerId = e.pointerId
+      const startX = e.clientX
+      const startWidth = resolvedWidthsRef.current[spec.id] ?? spec.min
+      // in RTL the column's inline-end edge sits left: pointer deltas invert
+      const dir = getComputedStyle(handle).direction === "rtl" ? -1 : 1
+      handle.setAttribute("data-resizing", "")
+      document.body.style.cursor = "col-resize"
+      document.body.style.userSelect = "none"
+      const varName = columnWidthVar(spec.id)
+      let liveWidth = startWidth
+      const onMove = (ev: PointerEvent) => {
+        if (ev.pointerId !== pointerId) return
+        liveWidth = Math.round(
+          Math.min(
+            Math.max(startWidth + (ev.clientX - startX) * dir, spec.min),
+            spec.max
+          )
+        )
+        treeContentRef.current?.style.setProperty(varName, `${liveWidth}px`)
+      }
+      const finish = (ev?: PointerEvent) => {
+        if (ev && ev.pointerId !== pointerId) return
+        window.removeEventListener("pointermove", onMove)
+        window.removeEventListener("pointerup", finish)
+        window.removeEventListener("pointercancel", finish)
+        handle.removeAttribute("data-resizing")
+        document.body.style.cursor = ""
+        document.body.style.userSelect = ""
+        // Drop the imperative var so the committed style prop is the only
+        // source of truth: cells fall back to their baked width for the
+        // same-frame re-render, and a no-change release cannot leave a stale
+        // value behind to outrank a later config change.
+        treeContentRef.current?.style.removeProperty(varName)
+        if (liveWidth !== startWidth) {
+          commitColumnWidths({
+            ...columnWidthsRef.current,
+            [spec.id]: liveWidth,
+          })
+        }
+      }
+      window.addEventListener("pointermove", onMove)
+      window.addEventListener("pointerup", finish)
+      window.addEventListener("pointercancel", finish)
+    },
+    [commitColumnWidths]
+  )
+  const adjustColumnWidth = useCallback(
+    (id: string, deltaPx: number, min: number, max: number) => {
+      const current = resolvedWidthsRef.current[id] ?? min
+      const next = Math.round(Math.min(Math.max(current + deltaPx, min), max))
+      if (next === current) return
+      commitColumnWidths({ ...columnWidthsRef.current, [id]: next })
+    },
+    [commitColumnWidths]
+  )
+  /** Double-click: drop the entry so the column returns to its configured width. */
+  const resetColumnWidth = useCallback(
+    (id: string) => {
+      if (!(id in columnWidthsRef.current)) return
+      const next = { ...columnWidthsRef.current }
+      delete next[id]
+      commitColumnWidths(next)
+    },
+    [commitColumnWidths]
+  )
+  const columnResizeHandlers = useCallback(
+    (id: string, min: number, max: number) => ({
+      onBegin: (e: React.PointerEvent, handle: HTMLElement) =>
+        beginColumnResize(e, { id, min, max }, handle),
+      onAdjust: (deltaPx: number) => adjustColumnWidth(id, deltaPx, min, max),
+      onReset: () => resetColumnWidth(id),
+    }),
+    [beginColumnResize, adjustColumnWidth, resetColumnWidth]
+  )
+
 
   // "Add task" hint at the foot of the tree, gated by validation
   /**
@@ -1852,6 +2005,12 @@ if (row.isGroup && segments.length === 0 && viewConfig.summaryBars) {
       overlay.className =
         "bg-background pointer-events-none fixed overflow-hidden opacity-95"
       overlay.style.zIndex = "100"
+      // the clone's cells size themselves with the column-width CSS vars,
+      // which live on the tree content root this overlay escapes - copy the
+      // latest values over so carried rows don't snap back to configured widths
+      for (const [name, value] of Object.entries(columnWidthVarsRef.current)) {
+        overlay.style.setProperty(name, value)
+      }
       // body-appended, so it is outside the gantt root that owns the type
       // scale: without adopting the root's resolved metrics the carried row
       // renders at the document default and reads bigger than the row it left
@@ -2044,6 +2203,8 @@ if (row.isGroup && segments.length === 0 && viewConfig.summaryBars) {
   const namePaddingStart = reorderEnabled ? "3.125rem" : "2.25rem"
   const treeContent = (
     <div
+      ref={treeContentRef}
+      style={columnWidthVars}
       className={cn(
         "flex min-h-full w-max min-w-full flex-col",
         // clearance for the pinned horizontal scrollbar strip
@@ -2051,43 +2212,88 @@ if (row.isGroup && segments.length === 0 && viewConfig.summaryBars) {
       )}
     >
       {/* Same 65px height as the two-row timeline header so the panes align.
-          The head keeps its own bottom rule (under the Resources label), but
-          the header/body boundary line is transparent so the first tree node
-          has no rule directly above it - the 1px is kept only to preserve the
-          65px height, matching the timeline. */}
+          Consumer band first, column labels last: the labels sit directly
+          above the rows they name. The rule runs under the consumer band
+          (above the Resources label), and the header/body boundary line is
+          transparent so the first tree node has no rule directly above it -
+          the 1px is kept only to preserve the 65px height, matching the
+          timeline. */}
       <div
         data-slot="gantt-tree-header"
         className="bg-background sticky top-0 z-30 box-content h-16 shrink-0 border-b border-b-transparent"
       >
-        <div className="flex h-8 border-b">
+        {/* free h-8 band: consumer slot (level controls, filters, legend...) */}
+        {treeConfig.headerContent && (
+          <div
+            data-slot="gantt-tree-header-extra"
+            className="flex h-8 shrink-0 items-center gap-2 border-b px-3"
+          >
+            {treeConfig.headerContent}
+          </div>
+        )}
+        {/* mt-auto: when no headerContent fills the first band, the labels
+          drop to the bottom band instead of floating above dead space */}
+        <div className="mt-auto flex h-8">
           <div className="flex h-full min-w-0 flex-1">
             <div
-              className="flex h-full shrink-0 items-center"
+              className="relative flex h-full shrink-0 items-center"
               style={{
-                width: treeConfig.nameColumnWidth,
+                width: `var(${columnWidthVar(GANTT_NAME_COLUMN_ID)}, ${resolvedColumnWidths[GANTT_NAME_COLUMN_ID]}px)`,
                 paddingInlineStart: namePaddingStart,
               }}
             >
               <span className="text-muted-foreground truncate font-medium">
                 {settings.i18n.labels.resources}
               </span>
-            </div>
-            {columns.map((column) => (
-              <div
-                key={column.id}
-                data-slot="gantt-column-header"
-                data-column={column.id}
-                className={cn(
-                  "text-muted-foreground flex h-full shrink-0 items-center px-2 font-medium",
-                  column.align === "center" && "justify-center",
-                  column.align === "end" && "justify-end",
-                  column.className
+              <GanttColumnResizeHandle
+                label={settings.i18n.labels.resizeColumn(
+                  settings.i18n.labels.resources
                 )}
-                style={{ width: column.width ?? DEFAULT_COLUMN_WIDTH }}
-              >
-                <span className="truncate">{column.title ?? column.id}</span>
-              </div>
-            ))}
+                width={resolvedColumnWidths[GANTT_NAME_COLUMN_ID]}
+                min={NAME_COLUMN_MIN_WIDTH}
+                max={NAME_COLUMN_MAX_WIDTH}
+                {...columnResizeHandlers(
+                  GANTT_NAME_COLUMN_ID,
+                  NAME_COLUMN_MIN_WIDTH,
+                  NAME_COLUMN_MAX_WIDTH
+                )}
+              />
+            </div>
+            {sizedColumns.map((column) => {
+              const label =
+                typeof column.title === "string" ? column.title : column.id
+              return (
+                <div
+                  key={column.id}
+                  data-slot="gantt-column-header"
+                  data-column={column.id}
+                  className={cn(
+                    "text-muted-foreground relative flex h-full shrink-0 items-center px-2 font-medium",
+                    column.align === "center" && "justify-center",
+                    column.align === "end" && "justify-end",
+                    column.className
+                  )}
+                  style={{
+                    width: `var(${columnWidthVar(column.id)}, ${column.width}px)`,
+                  }}
+                >
+                  <span className="truncate">{column.title ?? column.id}</span>
+                  {column.resizable !== false && (
+                    <GanttColumnResizeHandle
+                      label={settings.i18n.labels.resizeColumn(label)}
+                      width={column.width ?? DEFAULT_COLUMN_WIDTH}
+                      min={column.minWidth ?? DEFAULT_COLUMN_MIN_WIDTH}
+                      max={column.maxWidth ?? DEFAULT_COLUMN_MAX_WIDTH}
+                      {...columnResizeHandlers(
+                        column.id,
+                        column.minWidth ?? DEFAULT_COLUMN_MIN_WIDTH,
+                        column.maxWidth ?? DEFAULT_COLUMN_MAX_WIDTH
+                      )}
+                    />
+                  )}
+                </div>
+              )
+            })}
             <div className="min-w-0 flex-1" />
           </div>
           {viewConfig.columnsMenu && (
@@ -2101,16 +2307,6 @@ if (row.isGroup && segments.length === 0 && viewConfig.summaryBars) {
             </div>
           )}
         </div>
-        {/* free h-8 band: consumer slot aligned with the timeline header's
-          second row (level controls, filters, legend...) */}
-        {treeConfig.headerContent && (
-          <div
-            data-slot="gantt-tree-header-extra"
-            className="flex h-8 items-center gap-2 px-3"
-          >
-            {treeConfig.headerContent}
-          </div>
-        )}
       </div>
       <div ref={treeRowsRef} className="flex flex-col">
         {rows.map((row) => (
@@ -2119,8 +2315,8 @@ if (row.isGroup && segments.length === 0 && viewConfig.summaryBars) {
             row={row}
             heightRem={rowBars.get(row.resource.id)?.heightRem ?? minRowRem}
             bandRem={rowBars.get(row.resource.id)?.bandRem ?? minRowRem}
-            columns={columns}
-            nameWidth={treeConfig.nameColumnWidth}
+            columns={sizedColumns}
+            nameWidth={resolvedColumnWidths[GANTT_NAME_COLUMN_ID]}
             indentPerLevelRem={treeConfig.indentPerLevelRem ?? 0.875}
             rowStyle={treeConfig.rowStyle}
             rowToggles={treeConfig.rowToggles ?? true}
@@ -2786,6 +2982,59 @@ function GanttCustomDragLayer() {
   )
 }
 
+/**
+ * Header-edge resize handle for one tree column: pointer drag, arrow keys
+ * (±16px, RTL-aware) and double-click reset, mirroring the panel splitter's
+ * contract (role=separator with value now/min/max).
+ */
+const GanttColumnResizeHandle = memo(function GanttColumnResizeHandle({
+  label,
+  width,
+  min,
+  max,
+  onBegin,
+  onAdjust,
+  onReset,
+}: {
+  label: string
+  /** Current resolved width, for aria-valuenow. */
+  width: number
+  min: number
+  max: number
+  onBegin: (e: React.PointerEvent, handle: HTMLElement) => void
+  onAdjust: (deltaPx: number) => void
+  onReset: () => void
+}) {
+  return (
+    <span
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={label}
+      aria-valuenow={Math.round(width)}
+      aria-valuemin={min}
+      aria-valuemax={max}
+      tabIndex={0}
+      data-slot="gantt-column-resize-handle"
+      className="group/col-resize absolute inset-y-0 -end-2 z-20 flex w-3.5 cursor-col-resize touch-none items-center justify-center outline-none focus-visible:ring-ring/50 focus-visible:ring-2"
+      onPointerDown={(e) => onBegin(e, e.currentTarget)}
+      onDoubleClick={onReset}
+      onKeyDown={(e) => {
+        if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+          e.preventDefault()
+          const dir =
+            getComputedStyle(e.currentTarget).direction === "rtl" ? -1 : 1
+          onAdjust((e.key === "ArrowLeft" ? -16 : 16) * dir)
+        }
+      }}
+    >
+      <span
+        aria-hidden
+        className="bg-border group-hover/col-resize:bg-primary/70 group-focus-visible/col-resize:bg-primary/70 group-data-resizing/col-resize:bg-primary h-4 w-px rounded-full transition-colors"
+      />
+    </span>
+  )
+})
+
 /** Memoized: only rows whose props actually changed re-render. */
 const GanttTreeRow = memo(function GanttTreeRow({
   row,
@@ -2885,14 +3134,16 @@ const GanttTreeRow = memo(function GanttTreeRow({
           row-level hover/selected tints show through the transparent cell */}
         <div
           data-slot="gantt-tree-cell"
-          className={cn(
-            // ps-3 keeps the row toggles off the left edge (kept in sync with
-            // namePaddingStart above so headers stay aligned with row titles)
-            "flex shrink-0 ps-3 pe-3",
-            alignStart ? "items-start" : "items-center",
-            row.isGroup && "font-medium"
-          )}
-          style={{ width: nameWidth }}
+            className={cn(
+              // ps-3 keeps the row toggles off the left edge (kept in sync with
+              // namePaddingStart above so headers stay aligned with row titles)
+              "flex shrink-0 ps-3 pe-3",
+              alignStart ? "items-start" : "items-center",
+              row.isGroup && "font-medium"
+            )}
+            style={{
+              width: `var(${columnWidthVar(GANTT_NAME_COLUMN_ID)}, ${nameWidth}px)`,
+            }}
         >
           {/* exactly the band the first schedule occupies: same height, both
             top-anchored, so the label and that schedule share a centerline */}
@@ -2980,7 +3231,9 @@ const GanttTreeRow = memo(function GanttTreeRow({
               alignStart ? "items-start" : "items-center",
               column.className
             )}
-            style={{ width: column.width ?? DEFAULT_COLUMN_WIDTH }}
+            style={{
+              width: `var(${columnWidthVar(column.id)}, ${column.width ?? DEFAULT_COLUMN_WIDTH}px)`,
+            }}
           >
             <div
               className={cn(
@@ -3140,6 +3393,7 @@ const GanttTimelineRow = memo(function GanttTimelineRow({
       title: string
       kind: string
       occurrenceKey: string
+      milestone: boolean
     } | null
   >(
     (state) => {
@@ -3153,6 +3407,7 @@ const GanttTimelineRow = memo(function GanttTimelineRow({
         title: drag.occurrence.event.title,
         kind: drag.kind,
         occurrenceKey: drag.occurrence.key,
+        milestone: drag.occurrence.event.milestone === true,
       }
     },
     {
@@ -3499,7 +3754,10 @@ const GanttTimelineRow = memo(function GanttTimelineRow({
             rangeStartMs + (segment.startMin ?? 0) * 60000
           )
           const to = fractionOf(rangeStartMs + (segment.endMin ?? 0) * 60000)
-          if (to <= from) return null
+          // A milestone is the one legal zero-width segment: start === end,
+          // rendered as a square box centered on the instant.
+          const isMilestone = segment.occurrence.event.milestone === true
+          if (to <= from && !isMilestone) return null
           const lane = segment.column ?? 0
           // Resolved once per segment so getEventBarTone is called exactly
           // twice (resting + progress) instead of twice per render of the
@@ -3531,10 +3789,12 @@ const GanttTimelineRow = memo(function GanttTimelineRow({
             : to
           // Title placement: outside beside the bar when configured (or too
           // short in "auto"), flipped before the bar near the range end, and
-          // back inside when the bar spans the whole view.
+          // back inside when the bar spans the whole view. A milestone's
+          // title NEVER fits "inside" a diamond - always outside.
           const barRemWidth = (to - from) * trackRemWidth
           const wantsOutside =
             viewConfig.barLabel === "outside" ||
+            isMilestone ||
             (viewConfig.barLabel === "auto" &&
               barRemWidth <
                 (viewConfig.metrics?.autoLabelMin ?? AUTO_LABEL_MIN_REM))
@@ -3579,9 +3839,17 @@ const GanttTimelineRow = memo(function GanttTimelineRow({
                 // version. When no overlay is set the bar stays at the live
                 // plan's own extent. Clamped the same way baseline marks
                 // are, so a hovered version whose dates are off-screen is
-                // truncated to the visible range.
-                insetInlineStart: `${overlayFrom * 100}%`,
-                width: `${Math.max((overlayTo - overlayFrom) * 100, 0.5)}%`,
+                // truncated to the visible range. A milestone keeps its
+                // square footprint, CENTERED on the (reprojected) instant.
+                ...(isMilestone
+                  ? {
+                      insetInlineStart: `calc(${overlayFrom * 100}% - ${laneHeightRem / 2}rem)`,
+                      width: `${laneHeightRem}rem`,
+                    }
+                  : {
+                      insetInlineStart: `${overlayFrom * 100}%`,
+                      width: `${Math.max((overlayTo - overlayFrom) * 100, 0.5)}%`,
+                    }),
                 top: `${laneOffsetRem + lane * (laneHeightRem + laneGapRem)}rem`,
                 height: `${laneHeightRem}rem`,
                 // one track means every lane is 0, so paint order (not the
@@ -3744,8 +4012,16 @@ const GanttTimelineRow = memo(function GanttTimelineRow({
             )}
             style={
               {
-                insetInlineStart: `${ghost.from * 100}%`,
-                width: `${Math.max((ghost.to - ghost.from) * 100, 0.5)}%`,
+                // a milestone drags as its square footprint, centered on the
+                // instant - a 0.5% sliver would read as nothing
+                insetInlineStart: ghost.milestone
+                  ? `calc(${ghost.from * 100}% - ${laneHeightRem / 2}rem)`
+                  : `${ghost.from * 100}%`,
+                width: ghost.milestone
+                  ? `${laneHeightRem}rem`
+                  : `${Math.max((ghost.to - ghost.from) * 100, 0.5)}%`,
+                // beat the wrapper's h-5: the square is the lane height
+                height: ghost.milestone ? `${laneHeightRem}rem` : undefined,
                 // sit on the dragged schedule's OWN lane. Centering the ghost
                 // in the row put it on no lane at all once a node stacked, so
                 // a 3-lane row showed the drop target floating in the middle.

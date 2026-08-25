@@ -35,9 +35,10 @@ import { ContextMenuItem, ContextMenuSub, ContextMenuSubContent, ContextMenuSubT
 import { Slider } from "@/components/ui/slider"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import {
-  GhostIcon,
+  DiamondIcon,
   HistoryIcon,
   PinIcon,
+  RectangleHorizontalIcon,
   SplineIcon,
   Trash2Icon,
   UnlinkIcon,
@@ -49,6 +50,7 @@ import type {
   EventData,
   PlanBaseline,
   PlanDependency,
+  PlanEvent,
   PlanJSON,
 } from "@/lib/plan-types"
 import {
@@ -62,8 +64,10 @@ import { isDrifted as isPlanDrifted, type DriftSubject } from "@/lib/umejson/bas
 import { applyOps, encodeUpdatedPlan, type ChangeOp } from "@/lib/umejson/codec"
 import { decodeUmePlan, type UmeJsonEntity, type ValidationError } from "@/lib/umejson/schema"
 import type { WorkforcePayload } from "@/lib/umejson/workforce"
+import type { BudgetPayload } from "@/lib/umejson/budget"
 import { wbsLevelStyle } from "@/lib/wbs-levels"
 import { ChangesetPanel } from "@/components/gantt-plan/ChangesetPanel"
+import { TreeColumnsMenu } from "@/components/gantt-plan/TreeColumnsMenu"
 import type { GanttDependencyMark } from "@/components/reui/gantt/gantt-types"
 import { cn } from "@/lib/utils"
 
@@ -83,8 +87,46 @@ export interface GanttPlanViewerProps {
   onDocumentChange?: (entity: UmeJsonEntity) => void
   /** RRHH sibling: adds the «Cuadrilla» column to the tree panel. */
   workforce?: WorkforcePayload
+  /** Budget sibling: adds the «Presupuesto» (BAC) column to the tree panel. */
+  budget?: BudgetPayload
   /** Present only online: proposes the recorded ops as a change request. */
   onProposeChangeRequest?: (ops: ChangeOp[], reason?: string) => Promise<void>
+}
+
+/** Tree-panel UX prefs (column visibility + widths), persisted locally. */
+interface ColumnPrefs {
+  hidden: string[]
+  widths: Record<string, number>
+}
+
+const COLUMN_PREFS_STORAGE_KEY = "gantt-plan.column-prefs.v1"
+
+function loadColumnPrefs(): ColumnPrefs {
+  try {
+    const raw = localStorage.getItem(COLUMN_PREFS_STORAGE_KEY)
+    if (!raw) return { hidden: [], widths: {} }
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== "object" || parsed === null) {
+      return { hidden: [], widths: {} }
+    }
+    const { hidden, widths } = parsed as Record<string, unknown>
+    return {
+      hidden:
+        Array.isArray(hidden) && hidden.every((id) => typeof id === "string")
+          ? hidden
+          : [],
+      widths:
+        typeof widths === "object" &&
+        widths !== null &&
+        Object.values(widths).every(
+          (w) => typeof w === "number" && Number.isFinite(w) && w > 0,
+        )
+          ? (widths as Record<string, number>)
+          : {},
+    }
+  } catch {
+    return { hidden: [], widths: {} }
+  }
 }
 
 export function GanttPlanViewer({
@@ -93,6 +135,7 @@ export function GanttPlanViewer({
   onOpsChange,
   onDocumentChange,
   workforce,
+  budget,
   onProposeChangeRequest,
 }: GanttPlanViewerProps) {
   const decoded = useMemo(() => decodeUmePlan(document), [document])
@@ -128,6 +171,7 @@ export function GanttPlanViewer({
       onOpsChange={onOpsChange}
       onDocumentChange={onDocumentChange}
       workforce={workforce}
+      budget={budget}
       onProposeChangeRequest={onProposeChangeRequest}
     />
   )
@@ -139,6 +183,7 @@ function GanttPlanViewerInner({
   onOpsChange,
   onDocumentChange,
   workforce,
+  budget,
   onProposeChangeRequest,
 }: {
   entity: UmeJsonEntity
@@ -146,6 +191,7 @@ function GanttPlanViewerInner({
   onOpsChange?: (ops: ChangeOp[]) => void
   onDocumentChange?: (entity: UmeJsonEntity) => void
   workforce?: WorkforcePayload
+  budget?: BudgetPayload
   onProposeChangeRequest?: (ops: ChangeOp[], reason?: string) => Promise<void>
 }) {
   const apiRef = useRef<GanttApi<EventData> | null>(null)
@@ -164,6 +210,36 @@ function GanttPlanViewerInner({
     () => toGanttResources(originalPlan),
     [originalPlan],
   )
+
+  // ----- preferencias de columnas (visibilidad + anchos) -----
+  const [columnPrefs, setColumnPrefs] = useState<ColumnPrefs>(loadColumnPrefs)
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        COLUMN_PREFS_STORAGE_KEY,
+        JSON.stringify(columnPrefs),
+      )
+    } catch {
+      // storage unavailable (private mode): prefs stay session-only
+    }
+  }, [columnPrefs])
+  const handleColumnWidthsChange = useCallback(
+    (widths: Record<string, number>) => {
+      setColumnPrefs((prev) => ({ ...prev, widths }))
+    },
+    [],
+  )
+  const toggleColumn = useCallback((id: string, visible: boolean) => {
+    setColumnPrefs((prev) => ({
+      ...prev,
+      hidden: visible
+        ? prev.hidden.filter((h) => h !== id)
+        : [...prev.hidden, id],
+    }))
+  }, [])
+  const resetColumnWidths = useCallback(() => {
+    setColumnPrefs((prev) => ({ ...prev, widths: {} }))
+  }, [])
 
   // ----- dependencias: cascada documentada -----
   // The engine emits the WHOLE events array after a committed drag, carrying
@@ -189,13 +265,43 @@ function GanttPlanViewerInner({
     setEvents((prev) => applyAdjustmentsTo(prev, adjustments))
   }, [])
 
+  // ----- tarea ⇄ hito -----
+  // The recorder owns the semantics (collapse onto the end / restore the
+  // base-plan duration) and records the op + cascade; the viewer only
+  // mirrors the result into the engine's controlled events, same merge the
+  // drag flow does (toggle date + queued adjustments in ONE setState).
+  const handleToggleMilestone = useCallback(
+    (occurrence: GanttOccurrence<EventData>) => {
+      const id = occurrence.event.id
+      const result = recorder.setEventKind(
+        id,
+        occurrence.event.milestone ? "task" : "milestone",
+      )
+      if (!result) return
+      const pending = recorder.consumePendingCascade()
+      setEvents((prev) =>
+        applyAdjustmentsTo(
+          prev.map((ev) =>
+            ev.id === id
+              ? {
+                  ...ev,
+                  milestone: result.kind === "milestone",
+                  start: new Date(result.start),
+                  end: new Date(result.end),
+                }
+              : ev,
+          ),
+          pending,
+        ),
+      )
+    },
+    [recorder],
+  )
+
   // ----- bitácora de baselines -----
   // Anchor lookups resolve against this subtree: the tooltip lives in a
   // portal, but bars stay right here.
   const rootRef = useRef<HTMLDivElement | null>(null)
-  // Default view shows only the immediately-previous baseline (the drift that
-  // matters most); the toggle fans out the whole history on the timeline.
-  const [showAllBaselines, setShowAllBaselines] = useState(false)
   const [historyTarget, setHistoryTarget] = useState<{
     eventId: string
     anchor: { x: number; y: number }
@@ -215,28 +321,13 @@ function GanttPlanViewerInner({
   // STABLE identity is load-bearing: the engine's per-row layout memo depends
   // on this callback, and a fresh closure per render would rebuild every row.
   //
-  // Marks are OPT-IN via the historical toggle: by default nothing paints.
-  // Painting the newest entry by default stamped a twin under the live bar at
-  // the exact moment Fijar línea base captured it, and the twin only revealed
-  // itself once the bar moved - reading as a stray bar nobody asked for.
-  // Drift against the vigente reference is already signaled by the dirty
-  // tint, so the ambient timeline stays clean; the toggle fans the whole
-  // bitácora out for whoever wants the history on canvas.
+  // Baseline ghosts stay off: the ambient timeline never paints them. Drift
+  // against the vigente reference is signaled by the dirty tint; the full
+  // history is read from the bitácora panel and the hover-time reprojection
+  // (`eventBarOverlays`), neither of which depends on this callback.
   const getEventBaselines = useCallback(
-    ({ event }: { event: GanttEvent<EventData> }): GanttBaselineMark[] => {
-      if (!showAllBaselines) return []
-      const history = event.data?.baselines ?? []
-      if (!history.length) return []
-      const ordered = [...history].sort((a, b) => a.version - b.version)
-      return ordered.map((b) => ({
-        key: `${event.id}::baseline-v${b.version}`,
-        label: APP_STRINGS_ES.versionShort(b.version),
-        color: event.color,
-        start: new Date(b.start),
-        end: new Date(b.end),
-      }))
-    },
-    [showAllBaselines],
+    (): GanttBaselineMark[] => [],
+    [],
   )
 
   // Same stability contract as above (array identity is compared upstream).
@@ -391,29 +482,45 @@ function GanttPlanViewerInner({
     return ids
   }, [resources, level])
 
+  // Demo plan is 1:1 resource↔event: the row's resource names the event
+  // whose assignment/budget we render. Shared by the cuadrilla and
+  // presupuesto columns.
+  const eventByResource = useMemo(
+    () => new Map(originalPlan.events.map((e) => [e.resourceId, e])),
+    [originalPlan],
+  )
+
+  // Money reference per row: a leaf shows its event's BAC, a group the
+  // SUM over its subtree — the rollup makes the column a reference for
+  // every WBS level, not just tasks.
+  const bacByResource = useMemo(
+    () =>
+      budget
+        ? bacRollupByResource(resources, eventByResource, budget.bacByEvent)
+        : null,
+    [resources, eventByResource, budget],
+  )
+
   const columns: GanttColumn[] = useMemo(() => {
     const cols: GanttColumn[] = [
       {
         id: "responsable",
-        title: "Responsable",
+        title: APP_STRINGS_ES.responsibleColumn,
         width: 130,
+        minWidth: 96,
         render: (ctx: { resource: { id: string } }) => {
           const r = originalPlan.resources.find((rr) => rr.id === ctx.resource.id)
           return r?.responsable ?? "—"
         },
       },
     ]
-    // Cuadrilla: the demo plan is 1:1 resource↔event, so the row's
-    // resource names the event whose assignment we render.
     if (workforce) {
-      const eventByResource = new Map(
-        originalPlan.events.map((e) => [e.resourceId, e]),
-      )
       const crewById = new Map(workforce.crews.map((c) => [c.id, c]))
       cols.push({
         id: "cuadrilla",
         title: APP_STRINGS_ES.crewColumn,
         width: 150,
+        minWidth: 104,
         render: (ctx: { resource: { id: string } }) => {
           const event = eventByResource.get(ctx.resource.id)
           const assignment =
@@ -423,8 +530,53 @@ function GanttPlanViewerInner({
         },
       })
     }
+    if (budget && bacByResource) {
+      const fmt = new Intl.NumberFormat("es-MX", {
+        style: "currency",
+        currency: budget.currency,
+        maximumFractionDigits: 0,
+      })
+      cols.push({
+        id: "presupuesto",
+        title: APP_STRINGS_ES.budgetColumn,
+        width: 120,
+        minWidth: 100,
+        align: "end",
+        className: "tabular-nums",
+        render: (ctx: { resource: { id: string } }) => {
+          const bac = bacByResource.get(ctx.resource.id) ?? 0
+          return bac > 0 ? fmt.format(bac) : "—"
+        },
+      })
+    }
     return cols
-  }, [originalPlan, workforce])
+  }, [originalPlan, workforce, budget, bacByResource, eventByResource])
+
+  // Hidden ids that no longer match a column (e.g. budget went offline) are
+  // inert: they just never filter anything.
+  const hiddenColumnIds = useMemo(
+    () => new Set(columnPrefs.hidden),
+    [columnPrefs.hidden],
+  )
+  const visibleColumns = useMemo(
+    () => columns.filter((c) => !hiddenColumnIds.has(c.id)),
+    [columns, hiddenColumnIds],
+  )
+  const columnsMenu = useMemo(
+    () => (
+      <TreeColumnsMenu
+        columns={columns.map((c) => ({
+          id: c.id,
+          title: typeof c.title === "string" ? c.title : c.id,
+        }))}
+        hiddenIds={columnPrefs.hidden}
+        hasCustomWidths={Object.keys(columnPrefs.widths).length > 0}
+        onToggle={toggleColumn}
+        onResetWidths={resetColumnWidths}
+      />
+    ),
+    [columns, columnPrefs, toggleColumn, resetColumnWidths],
+  )
 
   const ops = useRecorderOps(recorder)
   const livePlan = useMemo(
@@ -646,7 +798,10 @@ function GanttPlanViewerInner({
           ),
         }}
         collapsedGroups={collapsedGroups}
-        columns={columns}
+        columns={visibleColumns}
+        columnsMenu={columnsMenu}
+        columnWidths={columnPrefs.widths}
+        onColumnWidthsChange={handleColumnWidthsChange}
         summaryBars
         offDays
         nowIndicator
@@ -687,6 +842,18 @@ function GanttPlanViewerInner({
             events.find((ev) => ev.id === id)?.title ?? id
           return (
             <>
+              <ContextMenuItem
+                onClick={() => handleToggleMilestone(occurrence)}
+              >
+                {occurrence.event.milestone ? (
+                  <RectangleHorizontalIcon aria-hidden />
+                ) : (
+                  <DiamondIcon aria-hidden />
+                )}{" "}
+                {occurrence.event.milestone
+                  ? APP_STRINGS_ES.convertToTask
+                  : APP_STRINGS_ES.convertToMilestone}
+              </ContextMenuItem>
               <ContextMenuItem onClick={() => captureBaseline(occurrence.event.id)}>
                 <PinIcon aria-hidden /> {APP_STRINGS_ES.setBaseline}
               </ContextMenuItem>
@@ -773,17 +940,6 @@ function GanttPlanViewerInner({
                   <GanttNavNext />
                 </div>
                 <GanttTitle />
-                <Button
-                  size="sm"
-                  variant={showAllBaselines ? "secondary" : "outline"}
-                  aria-pressed={showAllBaselines}
-                  title={APP_STRINGS_ES.viewBaselines}
-                  onClick={() => setShowAllBaselines((v) => !v)}
-                  data-slot="gantt-baselines-toggle"
-                >
-                  <GhostIcon aria-hidden />
-                  {APP_STRINGS_ES.toggleHistoricalBaselines}
-                </Button>
               </div>
               <GanttScaleSlider />
             </div>
@@ -895,6 +1051,32 @@ function depthOf(nodes: GanttResource[], depth = 0): number {
   )
 }
 
+/**
+ * BAC rollup over the resource tree: each node sums its own event's BAC
+ * (demo plan is 1:1 resource↔event) plus its children's, so groups read
+ * the subtree total and leaves their own budget.
+ */
+function bacRollupByResource(
+  nodes: GanttResource[],
+  eventByResource: Map<string, PlanEvent>,
+  bacByEvent: Record<string, number>,
+): Map<string, number> {
+  const map = new Map<string, number>()
+  const walk = (node: GanttResource): number => {
+    const cached = map.get(node.id)
+    if (cached !== undefined) return cached
+    const event = eventByResource.get(node.id)
+    const own = event ? bacByEvent[event.id] ?? 0 : 0
+    const total = node.children?.length
+      ? own + node.children.reduce((sum, c) => sum + walk(c), 0)
+      : own
+    map.set(node.id, total)
+    return total
+  }
+  nodes.forEach(walk)
+  return map
+}
+
 function WbsLevelSlider({
   level,
   max,
@@ -916,7 +1098,7 @@ function WbsLevelSlider({
         value={level}
         onChange={onChange}
         aria-label="Profundidad WBS visible"
-        className="w-1/3 min-w-16"
+        className="w-20"
       />
       <span className="text-muted-foreground w-9 shrink-0 text-right text-xs tabular-nums">
         {level >= max ? "máx" : `${level}/${max}`}
@@ -961,8 +1143,10 @@ const HISTORY_CARD_HALF_W = 160
 /**
  * A baseline's own span: calendar days when it crosses days (matching how
  * all-day ranges read), hours when it starts and ends inside the same day.
+ * A milestone's baseline is an instant - labeled as the milestone itself.
  */
-function baselineDurationLabel(b: PlanBaseline): string {
+function baselineDurationLabel(b: PlanBaseline, milestone?: boolean): string {
+  if (milestone) return APP_STRINGS_ES.milestoneDurationLabel
   const start = new Date(b.start)
   const end = new Date(b.end)
   const days = differenceInCalendarDays(end, start)
@@ -1121,10 +1305,10 @@ function BaselineHistoryPanel({
                     }
                     style={{ backgroundColor: tone.full }}
                   />
-                  {APP_STRINGS_ES.versionShort(b.version)}{" "}
-                  <span className="text-muted-foreground font-normal">
-                    ({baselineDurationLabel(b)})
-                  </span>
+                   {APP_STRINGS_ES.versionShort(b.version)}{" "}
+                   <span className="text-muted-foreground font-normal">
+                     ({baselineDurationLabel(b, event.milestone === true)})
+                   </span>
                 </span>
                 <span
                   className={cn(

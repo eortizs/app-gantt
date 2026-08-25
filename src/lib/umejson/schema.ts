@@ -242,6 +242,10 @@ export function decodeUmePlan(input: unknown): DecodeResult {
         if (typeof e.phaseId === "string" && !phaseIds.has(e.phaseId)) {
           errors.push(err(`dynamicProperties.plan.events[${i}].phaseId`, "ref", `event references unknown phase "${e.phaseId}"`))
         }
+        // Milestone marker: optional; absent = task (canonical form).
+        if (e.kind !== undefined && e.kind !== "task" && e.kind !== "milestone") {
+          errors.push(err(`dynamicProperties.plan.events[${i}].kind`, "enum", 'event.kind must be "task" or "milestone"'))
+        }
         // Bitácora de baselines: opcional; entries are immutable snapshots.
         if (e.baselines !== undefined) {
           if (!Array.isArray(e.baselines)) {

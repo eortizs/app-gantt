@@ -22,6 +22,12 @@ export interface PlanEvent {
   progress: number
   /** Bitácora de baselines; optional so older documents stay valid. */
   baselines?: PlanBaseline[]
+  /**
+   * Finish milestone: `start === end` (duration 0). Absent = task (the
+   * canonical form — the codec drops the field when converting back, so
+   * events that never were milestones round-trip byte-identical).
+   */
+  kind?: "task" | "milestone"
 }
 
 /**

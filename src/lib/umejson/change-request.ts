@@ -421,6 +421,13 @@ const validateOps = (
           if (!isIsoDate(op.patch.end)) {
             errors.push(err(`${p}.patch.end`, "iso", "op.patch.end must be ISO date string"))
           }
+          if (
+            op.patch.kind !== undefined &&
+            op.patch.kind !== "task" &&
+            op.patch.kind !== "milestone"
+          ) {
+            errors.push(err(`${p}.patch.kind`, "enum", 'op.patch.kind must be "task" or "milestone"'))
+          }
         }
         validateCause(op.cause, `${p}.cause`, errors)
         break
@@ -451,6 +458,13 @@ const validateOps = (
         }
         if (ev.color !== undefined && typeof ev.color !== "string") {
           errors.push(err(`${p}.event.color`, "type", "event.color must be a string"))
+        }
+        if (
+          ev.kind !== undefined &&
+          ev.kind !== "task" &&
+          ev.kind !== "milestone"
+        ) {
+          errors.push(err(`${p}.event.kind`, "enum", 'event.kind must be "task" or "milestone"'))
         }
         if (!isObject(ev.data)) {
           errors.push(err(`${p}.event.data`, "type", "event.data must be an object"))

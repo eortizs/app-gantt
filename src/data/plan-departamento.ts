@@ -153,7 +153,12 @@ const events: PlanEvent[] = [
   event("limpieza-fina", "limpieza-fina", 15 * 7, 7, 0, "entrega"),
   event("obra-gris-correcciones", "obra-gris-correcciones", 13 * 7, 14, 0, "entrega"),
   event("kit-entrega", "kit-entrega", 16 * 7, 7, 0, "entrega"),
-  event("acta-entrega", "acta-entrega", 17 * 7, 7, 0, "entrega"),
+  // Hito de cierre: duración 0 (el helper con durationDays = 0 ya produce
+  // end === start) + kind milestone — el diamante del plan demo.
+  {
+    ...event("acta-entrega", "acta-entrega", 17 * 7, 0, 0, "entrega"),
+    kind: "milestone" as const,
+  },
 ]
 
 const r = (

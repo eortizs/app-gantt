@@ -22,6 +22,7 @@ export const I18N_ES: GanttI18nOverrides = {
     zoomIn: "Acercar",
     zoomOut: "Alejar",
     resizePanel: "Redimensionar panel",
+    resizeColumn: (title) => `Redimensionar columna «${title}»`,
     jumpToBar: (title) => `Ir a "${title}"`,
     progress: (p) => `${p}% completado`,
     durationDays: (d) => (d === 1 ? "1 día" : `${d} días`),
@@ -54,6 +55,10 @@ export const LOCALE_ES = es
 export const APP_STRINGS_ES = {
   deleteEvent: "Borrar",
   setBaseline: "Fijar línea base",
+  /** Context-menu toggle: convert the task into a finish milestone. */
+  convertToMilestone: "Convertir en hito",
+  /** Context-menu toggle: restore the milestone back to a task. */
+  convertToTask: "Convertir en tarea",
   viewBaselines: "Historial de líneas base",
   baselinesLink: (n: number) => `Líneas base (${n})`,
   baselinesTitle: "Historial de líneas base",
@@ -69,8 +74,9 @@ export const APP_STRINGS_ES = {
   baselineDurationDays: (d: number) => (d === 1 ? "1 día" : `${d} días`),
   /** Baseline span within a single calendar day. */
   baselineDurationHours: (h: number) => (h === 1 ? "1 hora" : `${h} horas`),
+  /** Span label for a milestone's baseline (an instant, not a duration). */
+  milestoneDurationLabel: "Hito",
   versionShort: (v: number) => `LB${v}`,
-  toggleHistoricalBaselines: "Líneas base",
   closePanel: "Cerrar",
   /** Reason persisted on the LB1 materialized at first capture (see captureBaseline). */
   baselineOriginalReason: "Carga inicial del plan",
@@ -184,4 +190,18 @@ export const APP_STRINGS_ES = {
   // ----- RRHH (workforce) -----
   /** Tree-panel column naming the crew assigned to each row. */
   crewColumn: "Cuadrilla",
+
+  // ----- Presupuesto (budget) -----
+  /** Tree-panel column naming each row's money reference (BAC). */
+  budgetColumn: "Presupuesto",
+
+  // ----- columnas del panel de árbol -----
+  /** Tree-panel column naming each row's responsible person. */
+  responsibleColumn: "Responsable",
+  /** Columns dropdown trigger (show/hide tree-panel columns). */
+  columnsMenuTrigger: "Mostrar u ocultar columnas",
+  /** Columns dropdown heading. */
+  columnsMenuTitle: "Columnas",
+  /** Menu item restoring the default column widths. */
+  columnsMenuResetWidths: "Restaurar anchos de columna",
 } as const

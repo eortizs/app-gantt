@@ -272,6 +272,10 @@ function GanttBar<TData = unknown>({
     typeof event.progress === "number"
       ? Math.min(Math.max(Math.round(event.progress), 0), 100)
       : null
+  // A milestone is an instant: the DIAMOND carries all the paint (resting
+  // tint / achieved tint), so the square button itself stays transparent -
+  // an opaque square behind a rotated square reads as a box, not a diamond.
+  const isMilestone = event.milestone === true
 
   const defaultContent = (
     <>
@@ -296,7 +300,7 @@ function GanttBar<TData = unknown>({
   const content =
     children ??
     viewConfig.renderEvent?.(renderProps) ??
-    (labelOutside ? null : defaultContent)
+    (labelOutside || isMilestone ? null : defaultContent)
   // Consumer-owned content owns the WHOLE inner visualization: the built-in
   // progress fill and done mark yield so custom bars start from a blank
   // canvas (progress stays readable via data-progress/data-completed).
@@ -438,13 +442,18 @@ function GanttBar<TData = unknown>({
       e.stopPropagation()
       settings.onEventDoubleClick?.(occurrence, e)
     },
-className: cn(
-      "group/gantt-bar-group text-foreground @container relative flex w-full min-w-0 cursor-pointer touch-none items-center gap-1.5 overflow-hidden rounded-sm px-1.5 py-0.5 text-start leading-normal select-none",
+    className: cn(
+      "group/gantt-bar-group text-foreground @container relative flex w-full min-w-0 cursor-pointer touch-none items-center gap-1.5 overflow-hidden rounded-sm text-start leading-normal select-none",
       "focus-visible:ring-ring/50 outline-none focus-visible:ring-2",
-      // resting fill: translucent normally, OPAQUE while a baseline tint is
-      // active so plan-vs-version comparison reads at full strength (the
-      // progress overlay still uses the event color underneath)
-      "bg-(--gantt-bar-tint)/20 data-bar-tinted:bg-(--gantt-bar-tint)",
+      // resting fill lives on the DIAMOND for milestones (see below); the
+      // square hit-area stays transparent, darkening only on hover/selected
+      // so the affordance reads without flattening the diamond into a box.
+      !isMilestone && "px-1.5 py-0.5",
+      !isMilestone &&
+        // resting fill: translucent normally, OPAQUE while a baseline tint is
+        // active so plan-vs-version comparison reads at full strength (the
+        // progress overlay still uses the event color underneath)
+        "bg-(--gantt-bar-tint)/20 data-bar-tinted:bg-(--gantt-bar-tint)",
       // move: hide the original (the smooth clone represents it)
       "data-[drag-kind=move]:opacity-0",
       // resize: keep the original event exactly, just fade it to a soft
@@ -458,8 +467,12 @@ className: cn(
       // paint. So: re-assert the opaque tint under hover/selected, and lay
       // the darkening wash as a background-IMAGE, which stacks OVER the
       // background-color instead of replacing it.
-      "hover:bg-(--gantt-bar-tint)/30 data-bar-tinted:hover:bg-(--gantt-bar-tint) data-bar-tinted:hover:bg-[linear-gradient(rgb(0_0_0/0.05),rgb(0_0_0/0.05))]",
-      "data-selected:bg-(--gantt-bar-tint)/30 data-bar-tinted:data-selected:bg-(--gantt-bar-tint) data-bar-tinted:data-selected:bg-[linear-gradient(rgb(0_0_0/0.05),rgb(0_0_0/0.05))]",
+      !isMilestone &&
+        "hover:bg-(--gantt-bar-tint)/30 data-bar-tinted:hover:bg-(--gantt-bar-tint) data-bar-tinted:hover:bg-[linear-gradient(rgb(0_0_0/0.05),rgb(0_0_0/0.05))]",
+      !isMilestone &&
+        "data-selected:bg-(--gantt-bar-tint)/30 data-bar-tinted:data-selected:bg-(--gantt-bar-tint) data-bar-tinted:data-selected:bg-[linear-gradient(rgb(0_0_0/0.05),rgb(0_0_0/0.05))]",
+      isMilestone &&
+        "hover:bg-[linear-gradient(rgb(0_0_0/0.05),rgb(0_0_0/0.05))] data-selected:bg-[linear-gradient(rgb(0_0_0/0.05),rgb(0_0_0/0.05))]",
       segment.continuesBefore && "rounded-s-none",
       segment.continuesAfter && "rounded-e-none",
       viewConfig.classNames?.event,
@@ -467,14 +480,29 @@ className: cn(
     ),
     children: (
       <>
-        {progress !== null && (
+        {isMilestone && (
+          // The milestone shape itself: a diamond centered in the square
+          // hit-area, painted with the SAME bitono channels as a bar - the
+          // resting tint (consumer bitono / dirty tint via colorOverride)
+          // while pending, the strong progress tint once achieved (100%).
+          // State chrome that must not borrow the fills (critical-path
+          // stroke via getEventBarClassName) rides the square wrapper.
+          <span
+            aria-hidden
+            data-slot="gantt-milestone-diamond"
+            data-completed={progress === 100 || undefined}
+            className="border-(--gantt-progress-tint)/65 bg-(--gantt-bar-tint) pointer-events-none absolute top-1/2 left-1/2 block size-[68%] -translate-x-1/2 -translate-y-1/2 rotate-45 rounded-[2px] border data-completed:border-(--gantt-progress-tint) data-completed:bg-(--gantt-progress-tint)"
+          />
+        )}
+        {progress !== null && !isMilestone && (
           // Chrome, not content: it is an absolutely-positioned layer BEHIND
           // whatever the bar renders, so a consumer bar (renderEvent) keeps
           // its completion fill instead of silently losing it. The inline
           // done-mark below stays gated, because that one really is content.
           // The tint comes from --gantt-progress-tint (defaults to the event
           // color) so the bitono can move progress independently of the
-          // resting fill underneath.
+          // resting fill underneath. Milestones are all-or-nothing: the
+          // diamond flips to the strong tint at 100%, no % strip.
           <span
             aria-hidden
             data-slot="gantt-bar-progress"
@@ -483,7 +511,7 @@ className: cn(
             style={{ width: `${progress}%` }}
           />
         )}
-        {progress === 100 && !consumerOwnsContent && (
+        {progress === 100 && !consumerOwnsContent && !isMilestone && (
           // done mark: completion chrome like the fill itself, so it shows
           // for outside-label bars too (where the inner content is empty)
           <CheckIcon className="relative size-2.5 shrink-0 opacity-80" aria-hidden="true" />
@@ -581,12 +609,16 @@ className: cn(
                 <div className="opacity-80">
                   {settings.i18n.labels.startDate} : {startDate}
                 </div>
-                <div className="opacity-80">
-                  {settings.i18n.labels.endDate} : {endDate}
-                </div>
-                <div className="opacity-80">
-                  Duration : {settings.i18n.labels.durationDays(durationDays)}
-                </div>
+                {!isMilestone && (
+                  <div className="opacity-80">
+                    {settings.i18n.labels.endDate} : {endDate}
+                  </div>
+                )}
+                {!isMilestone && (
+                  <div className="opacity-80">
+                    Duration : {settings.i18n.labels.durationDays(durationDays)}
+                  </div>
+                )}
                 {progress !== null && (
                   <div className="opacity-80">Progress : {progress}</div>
                 )}

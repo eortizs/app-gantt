@@ -30,6 +30,18 @@ export interface ChangesetRecorder {
   getOps(): ChangeOp[]
   reset(): void
   onEventUpdate(p: GanttProposedUpdate<EventData>): GanttUpdateResult
+  /**
+   * Task ⇄ milestone conversion, recorded like any other edit (auditable,
+   * reversible with «Reiniciar plan»). Returns the event's committed
+   * dates + kind, or false when the event doesn't exist in the live plan.
+   * Cascade adjustments the conversion triggers are QUEUED (same channel
+   * as the drag flow): the host merges them after consuming
+   * `consumePendingCascade()`.
+   */
+  setEventKind(
+    eventId: string,
+    kind: "task" | "milestone",
+  ): { start: string; end: string; kind: "task" | "milestone" } | false
   onEventDelete(eventId: string): void
   canSelectSlot(slot: GanttSlotDraft): boolean
   onSelectSlot(slot: GanttSlotDraft): void
@@ -111,7 +123,14 @@ export function createChangesetRecorder(
         opsMap.set(adj.eventId, {
           op: "update",
           id: adj.eventId,
-          patch: { start: adj.start, end: adj.end },
+          // keep a previously recorded conversion alive (merge, not replace)
+          patch: {
+            start: adj.start,
+            end: adj.end,
+            ...(recordedKind(adj.eventId)
+              ? { kind: recordedKind(adj.eventId) }
+              : {}),
+          },
           cause: adj.cause,
         })
       }
@@ -121,6 +140,26 @@ export function createChangesetRecorder(
   }
 
   const liveDeps = (): PlanDependency[] => currentPlan()?.dependencies ?? []
+
+  /**
+   * Kind already recorded for an event in this changeset: a later op on the
+   * same event (drag after conversion, cascade after conversion) must MERGE
+   * with it instead of replacing it - dropping the kind patch would undo
+   * the conversion in the committed ops while the live UI still shows the
+   * milestone.
+   */
+  const recordedKind = (
+    eventId: string,
+  ): "task" | "milestone" | undefined => {
+    const existing = opsMap.get(eventId)
+    if (existing?.op === "update") return existing.patch.kind
+    if (existing?.op === "create") {
+      return existing.event.kind === "milestone" ? "milestone" : undefined
+    }
+    return undefined
+  }
+
+  const DAY_MS = 86_400_000
 
   return {
     subscribe(listener) {
@@ -142,12 +181,17 @@ export function createChangesetRecorder(
     },
     onEventUpdate(p) {
       const { event, start, end } = p
-      if (end.getTime() <= start.getTime()) return false
+      // A milestone is an instant: end === start is its legal shape and the
+      // drag gesture preserves it. Everything else still needs a real span.
+      if (end.getTime() < start.getTime()) return false
+      if (end.getTime() === start.getTime() && !event.milestone) return false
       // A fresh gesture invalidates any cascade the previous one queued.
       pendingCascade = []
       const patch = {
         start: start.toISOString(),
         end: end.toISOString(),
+        // merge, not replace: a drag on a converted bar keeps the conversion
+        ...(recordedKind(event.id) ? { kind: recordedKind(event.id) } : {}),
       }
       const existing = opsMap.get(event.id)
       if (existing?.op === "create") {
@@ -166,6 +210,66 @@ export function createChangesetRecorder(
       runCascade([event.id], true)
       notify()
       return true
+    },
+    setEventKind(eventId, kind) {
+      // A fresh gesture invalidates any cascade the previous one queued.
+      pendingCascade = []
+      const plan = currentPlan()
+      const live = plan?.events.find((e) => e.id === eventId)
+      if (!plan || !live) return false
+      let startIso: string
+      let endIso: string
+      if (kind === "milestone") {
+        // Finish milestone: collapse onto the current end instant. The end
+        // never moves, so FS dependents stay bound; the START jumps forward,
+        // which the cascade below repairs for SS dependents.
+        startIso = live.end
+        endIso = live.end
+      } else {
+        // Back to a task: the milestone instant stays as the START and the
+        // duration returns from the BASE plan when it knew the event as a
+        // task; a milestone born as one (or an event born in this
+        // changeset) gets the 1-day fallback.
+        const base = opts
+          .getBasePlan?.()
+          .events.find((e) => e.id === eventId)
+        const durDays =
+          base && base.kind !== "milestone"
+            ? Math.max(
+                1,
+                Math.round(
+                  (Date.parse(base.end) - Date.parse(base.start)) / DAY_MS,
+                ),
+              )
+            : 1
+        startIso = live.start
+        endIso = new Date(Date.parse(live.start) + durDays * DAY_MS).toISOString()
+      }
+      const existing = opsMap.get(eventId)
+      if (existing?.op === "create") {
+        // The event was born in this changeset: fold into its create op.
+        const { kind: _drop, ...bornTask } = existing.event
+        void _drop
+        opsMap.set(eventId, {
+          ...existing,
+          event:
+            kind === "milestone"
+              ? { ...existing.event, start: startIso, end: endIso, kind }
+              : { ...bornTask, start: startIso, end: endIso },
+        })
+      } else {
+        opsMap.set(eventId, {
+          op: "update",
+          id: eventId,
+          patch: { start: startIso, end: endIso, kind },
+        })
+      }
+      // Both directions can bind dependents: → milestone jumps the START to
+      // the end (SS violations), → task moves the END (FS pushes). The
+      // adjustments are queued for the host, exactly like the drag flow.
+      runCascade([eventId], true)
+      notify()
+      return { start: startIso, end: endIso, kind }
     },
     onEventDelete(eventId) {
       const existing = opsMap.get(eventId)

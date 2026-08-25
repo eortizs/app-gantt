@@ -123,6 +123,12 @@ interface GanttEvent<TData = unknown> {
   readOnly?: boolean
   draggable?: boolean
   resizable?: boolean
+  /**
+   * Finish milestone: renders as a diamond centered on the event's END
+   * instant (start === end, duration 0). Never resizable; draggable as a
+   * whole. Absent = regular timed bar.
+   */
+  milestone?: boolean
   /** Feeds the default getEventPriority; higher orders and packs first. */
   priority?: number
   /** Completion 0-100, not 0-1. */

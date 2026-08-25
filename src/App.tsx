@@ -237,6 +237,7 @@ function App() {
         document={bundle.entity}
         onOpsChange={setOps}
         workforce={bundle.workforce.dynamicProperties.workforce}
+        budget={bundle.budget.dynamicProperties.budget}
         onProposeChangeRequest={online ? proposeChangeRequest : undefined}
       />
       <EvmPanel plan={livePlan} budget={bundle.budget} actuals={bundle.actuals} />

@@ -36,6 +36,8 @@ interface GanttI18nConfig {
     zoomOut: string
     /** Aria-label of the tree/timeline splitter. */
     resizePanel: string
+    /** Aria-label of a tree-column header resize handle. */
+    resizeColumn: (title: string) => string
     /** Aria-label of the off-screen bar chips. */
     jumpToBar: (title: string) => string
     /** Read to screen readers as part of the bar label. */
@@ -117,6 +119,7 @@ const DEFAULT_LABELS: GanttI18nConfig["labels"] = {
   zoomIn: "Zoom in",
   zoomOut: "Zoom out",
   resizePanel: "Resize panel",
+  resizeColumn: (title) => `Resize column "${title}"`,
   jumpToBar: (title) => `Scroll to "${title}"`,
   progress: (percent) => `${percent}% complete`,
   durationDays: (days) => (days === 1 ? "1 day" : `${days} days`),

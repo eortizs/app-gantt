@@ -37,6 +37,8 @@ export function toGanttEvents(plan: PlanJSON): GanttEvent<EventData>[] {
       progress: e.progress,
       resourceId: e.resourceId,
       color: phaseColorById.get(phaseId),
+      // Finish milestone (duration 0) renders as a diamond on the engine.
+      ...(e.kind === "milestone" ? { milestone: true } : {}),
       data: {
         responsable: resource?.responsable ?? "—",
         fase: phaseId,

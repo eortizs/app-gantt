@@ -1208,7 +1208,13 @@ function useGanttGestures<TData = unknown>() {
     (segment: GanttSegment<TData>) => {
       const { interactions } = instance.getState()
       const event = segment.occurrence.event
-      return interactions.resize && !event.readOnly && event.resizable !== false
+      // A milestone is an instant: there is no span to stretch.
+      return (
+        interactions.resize &&
+        !event.readOnly &&
+        event.resizable !== false &&
+        !event.milestone
+      )
     },
     [instance]
   )

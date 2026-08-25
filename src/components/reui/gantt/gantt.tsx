@@ -1114,13 +1114,19 @@ interface GanttColumnContext {
   collapsed: boolean
 }
 
+/**
+ * Widths-record key reserved for the pinned name column ("Resources"), so it
+ * resizes through the same columnWidths plumbing as the data columns.
+ */
+const GANTT_NAME_COLUMN_ID = "@name"
+
 /** One extra tree-panel column after the built-in name column. */
 interface GanttColumn {
   /** Stable id; doubles as the default header label. */
   id: string
   /** Header label. */
   title?: ReactNode
-  /** Fixed column width in px. Default 96. */
+  /** Column width in px before any user resize. Default 96. */
   width?: number
   /** Cell content alignment. Default "start". */
   align?: "start" | "center" | "end"
@@ -1128,6 +1134,12 @@ interface GanttColumn {
   render?: (ctx: GanttColumnContext) => ReactNode
   /** Extra classes on every cell of this column (header included). */
   className?: string
+  /** Header edge handle to resize this column. Default true. */
+  resizable?: boolean
+  /** Resize lower bound in px. Default 72. */
+  minWidth?: number
+  /** Resize upper bound in px. Default 480. */
+  maxWidth?: number
 }
 
 /** Pointer-activation thresholds; unset keys keep the dnd-kit parity defaults. */
@@ -1253,7 +1265,8 @@ interface GanttTreePanelConfig {
   rowToggles?: boolean
   /**
    * Custom content pinned inside the tree-panel header, on the free band
-   * below the column labels (level controls, filters, legend...).
+   * ABOVE the column labels (level controls, filters, legend...) so the
+   * labels sit directly above the rows they name.
    */
   headerContent?: ReactNode
 }
@@ -1347,6 +1360,16 @@ interface GanttViewConfig<TData = unknown> {
    * home for an add/remove-columns dropdown menu.
    */
   columnsMenu?: ReactNode
+  /**
+   * Live column widths keyed by column id (the pinned name column answers to
+   * GANTT_NAME_COLUMN_ID). Controlled: overrides each column's `width` while
+   * defined. Pairs with onColumnWidthsChange.
+   */
+  columnWidths?: Record<string, number>
+  /** Initial column widths (uncontrolled); untouched columns use `width`. */
+  defaultColumnWidths?: Record<string, number>
+  /** Fires after any user column resize (drag release, keyboard, reset). */
+  onColumnWidthsChange?: (widths: Record<string, number>) => void
   /** Tree-panel width, splitter bounds, and resizability. */
   treePanel?: GanttTreePanelConfig
   /**
@@ -1626,6 +1649,9 @@ const VIEW_CONFIG_KEYS: Array<keyof GanttViewConfig> = [
   "offDays",
   "columns",
   "columnsMenu",
+  "columnWidths",
+  "defaultColumnWidths",
+  "onColumnWidthsChange",
   "treePanel",
   "metrics",
   "timelineLines",
@@ -1847,6 +1873,7 @@ export {
   DEFAULT_ROW_ALIGN,
   DEFAULT_SCHEDULE_MODE,
   DEFAULT_VIEW_CONFIG,
+  GANTT_NAME_COLUMN_ID,
   Gantt,
   GanttContext,
   GanttViewConfigContext,

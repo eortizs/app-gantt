@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent } from "react"
+import { createPortal } from "react-dom"
 
 import { cn } from "@/lib/utils"
 
@@ -32,7 +33,17 @@ function Slider({
   tooltipText?: string
 }) {
   const trackRef = useRef<HTMLDivElement>(null)
-  const [dragging, setDragging] = useState(false)
+  // Viewport anchor captured ONCE per drag: hosts with sticky/overflow
+  // ancestors (the gantt tree header) clip or bury an absolutely-positioned
+  // tooltip, so the label portals to <body> as position:fixed. The track
+  // cannot move mid-gesture (touch-none, pointer captured) - the thumb's x
+  // derives from this anchor + pct, keeping the render ref-free.
+  const [dragAnchor, setDragAnchor] = useState<{
+    left: number
+    top: number
+    width: number
+  } | null>(null)
+  const dragging = dragAnchor !== null
   const pct = max > min ? ((value - min) / (max - min)) * 100 : 0
 
   const snap = useCallback(
@@ -53,7 +64,7 @@ function Slider({
   useEffect(() => {
     if (!dragging) return
     const onMove = (e: globalThis.PointerEvent) => onChange(snap(e.clientX))
-    const onUp = () => setDragging(false)
+    const onUp = () => setDragAnchor(null)
     window.addEventListener("pointermove", onMove)
     window.addEventListener("pointerup", onUp)
     window.addEventListener("pointercancel", onUp)
@@ -66,7 +77,8 @@ function Slider({
 
   const start = (e: PointerEvent<HTMLDivElement>) => {
     ;(e.target as Element).setPointerCapture?.(e.pointerId)
-    setDragging(true)
+    const rect = trackRef.current?.getBoundingClientRect()
+    if (rect) setDragAnchor({ left: rect.left, top: rect.top, width: rect.width })
     onChange(snap(e.clientX))
   }
 
@@ -119,15 +131,20 @@ function Slider({
         )}
         style={{ left: `${pct}%` }}
       />
-      {dragging && (
-        <div
-          data-slot="slider-tooltip"
-          className="pointer-events-none absolute -top-2 -translate-x-1/2 -translate-y-full rounded-md bg-foreground px-2 py-1 text-xs font-medium text-background shadow-md"
-          style={{ left: `${pct}%` }}
-        >
-          {tooltipText ?? value}
-        </div>
-      )}
+      {dragAnchor &&
+        createPortal(
+          <div
+            data-slot="slider-tooltip"
+            className="pointer-events-none fixed z-50 -translate-x-1/2 -translate-y-full rounded-md bg-foreground px-2 py-1 text-xs font-medium text-background shadow-md"
+            style={{
+              left: dragAnchor.left + (pct / 100) * dragAnchor.width,
+              top: dragAnchor.top - 8,
+            }}
+          >
+            {tooltipText ?? value}
+          </div>,
+          document.body,
+        )}
     </div>
   )
 }

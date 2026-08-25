@@ -92,8 +92,11 @@ export function buildDemoBudget(
   for (const event of plan.events) {
     const phaseId = resolvePhaseId(event.resourceId, resources)
     const rate = (phaseId && RATE_BY_PHASE[phaseId]) || DEFAULT_RATE
+    // A milestone books no work: BAC 0 with an exact 0/0/0 partition. Any
+    // other zero-rounding artifact keeps the 1-day floor it always had.
+    const floorDays = event.kind === "milestone" ? 0 : 1
     const days = Math.max(
-      1,
+      floorDays,
       Math.round((Date.parse(event.end) - Date.parse(event.start)) / DAY_MS),
     )
     const bac = round100(days * rate)
