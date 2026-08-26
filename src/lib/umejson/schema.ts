@@ -173,7 +173,25 @@ export function decodeUmePlan(input: unknown): DecodeResult {
       errors.push(err("dynamicProperties.plan.schemaVersion", "enum", "schemaVersion must be 2"))
     }
     if (!isIsoDate(plan.anchor)) {
-      errors.push(err("dynamicProperties.plan.anchor", "iso", "anchor must be ISO date string"))
+      errors.push(err("dynamicProperties.plan.anchor", "iso", "plan.anchor must be ISO date string"))
+    }
+    // Status date + scheduling conventions: additive-optional; validated
+    // only when present (schema stays v2).
+    if (plan.statusDate !== undefined && !isIsoDate(plan.statusDate)) {
+      errors.push(err("dynamicProperties.plan.statusDate", "iso", "plan.statusDate must be ISO date string"))
+    }
+    if (plan.schedulingOptions !== undefined) {
+      const so = plan.schedulingOptions
+      if (
+        !isObject(so) ||
+        (so.outOfSequence !== "retainedLogic" && so.outOfSequence !== "progressOverride")
+      ) {
+        errors.push(err(
+          "dynamicProperties.plan.schedulingOptions.outOfSequence",
+          "enum",
+          'plan.schedulingOptions.outOfSequence must be "retainedLogic" or "progressOverride"',
+        ))
+      }
     }
     if (!Array.isArray(plan.resources)) {
       errors.push(err("dynamicProperties.plan.resources", "type", "resources must be an array"))
@@ -245,6 +263,16 @@ export function decodeUmePlan(input: unknown): DecodeResult {
         // Milestone marker: optional; absent = task (canonical form).
         if (e.kind !== undefined && e.kind !== "task" && e.kind !== "milestone") {
           errors.push(err(`dynamicProperties.plan.events[${i}].kind`, "enum", 'event.kind must be "task" or "milestone"'))
+        }
+        // Leveling priority: additive-optional; validated only when present.
+        if (
+          e.priority !== undefined &&
+          (typeof e.priority !== "number" ||
+            !Number.isInteger(e.priority) ||
+            e.priority < 1 ||
+            e.priority > 1000)
+        ) {
+          errors.push(err(`dynamicProperties.plan.events[${i}].priority`, "range", "event.priority must be an integer 1..1000"))
         }
         // Bitácora de baselines: opcional; entries are immutable snapshots.
         if (e.baselines !== undefined) {

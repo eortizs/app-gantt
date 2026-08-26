@@ -13,6 +13,7 @@ import {
   buildDemoBudget,
 } from "../../src/data/demo-contables.ts"
 import { buildDemoWorkforce } from "../../src/data/demo-workforce.ts"
+import { buildDemoCalendar } from "../../src/data/demo-calendar.ts"
 import { decodeUmePlan } from "../../src/lib/umejson/schema.ts"
 import {
   ENTITY_NAME_BUDGET,
@@ -26,6 +27,10 @@ import {
   ENTITY_NAME_WORKFORCE,
   decodeWorkforce,
 } from "../../src/lib/umejson/workforce.ts"
+import {
+  ENTITY_NAME_CALENDAR,
+  decodeCalendar,
+} from "../../src/lib/umejson/calendar.ts"
 import { createPool } from "../src/db/pool.ts"
 import { runMigrations } from "../src/db/migrate.ts"
 import { currentRevision, putEntity } from "../src/entities.ts"
@@ -51,7 +56,10 @@ try {
   })
   console.log(planOutcome === "ok" ? `seeded plan ${DEMO_PLAN_ID}` : "plan already present, left untouched")
 
-  // Hermanas demo: builder → decoder (contract check) → seedOverwrite.
+  // Hermanas demo: cada iteración se aísla — un fallo en una hermana no
+  // salpica a las siguientes ni deja el bundle demo a medio sembrar.
+  // Política documentada: si decodifica, intenta upsert; si falla, se
+  // registra y el operador decide el siguiente paso.
   const siblings = [
     {
       label: "budget",
@@ -71,27 +79,44 @@ try {
       document: buildDemoWorkforce(plan),
       decode: (doc: unknown) => decodeWorkforce(doc, plan, DEMO_PLAN_ID),
     },
+    {
+      label: "calendar",
+      entityName: ENTITY_NAME_CALENDAR,
+      document: buildDemoCalendar(plan, DEMO_PLAN_ID),
+      decode: (doc: unknown) => decodeCalendar(doc, plan, DEMO_PLAN_ID),
+    },
   ] as const
   for (const sibling of siblings) {
-    const decoded = sibling.decode(sibling.document)
-    if (!decoded.ok) {
-      throw new Error(`seed ${sibling.label} failed decode: ${JSON.stringify(decoded.errors)}`)
-    }
-    const before = await currentRevision(pool, decoded.entity.id)
-    const outcome = await putEntity(pool, {
-      entityName: sibling.entityName,
-      entity: decoded.entity,
-      document: sibling.document,
-      planEntityId: DEMO_PLAN_ID,
-      expectedRevision: 0,
-      seedOverwrite: true,
-    })
-    if (outcome !== "ok") {
-      console.log(`${sibling.label}: conflict, left untouched`)
-    } else if (before === null) {
-      console.log(`seeded ${sibling.label}`)
-    } else {
-      console.log(`refreshed ${sibling.label} (regenerable demo data, revision reset to 1)`)
+    try {
+      const decoded = sibling.decode(sibling.document)
+      if (!decoded.ok) {
+        console.error(
+          `seed ${sibling.label} failed decode: ${JSON.stringify(decoded.errors)}`,
+        )
+        continue
+      }
+      const before = await currentRevision(pool, decoded.entity.id)
+      const outcome = await putEntity(pool, {
+        entityName: sibling.entityName,
+        entity: decoded.entity,
+        document: sibling.document,
+        planEntityId: DEMO_PLAN_ID,
+        expectedRevision: 0,
+        seedOverwrite: true,
+      })
+      if (outcome !== "ok") {
+        console.log(`${sibling.label}: conflict, left untouched`)
+      } else if (before === null) {
+        console.log(`seeded ${sibling.label}`)
+      } else {
+        console.log(
+          `refreshed ${sibling.label} (regenerable demo data, revision reset to 1)`,
+        )
+      }
+    } catch (err: unknown) {
+      console.error(
+        `seed ${sibling.label} threw: ${err instanceof Error ? err.message : String(err)}`,
+      )
     }
   }
 } finally {

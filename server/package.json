@@ -11,6 +11,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@fastify/cookie": "^11.1.2",
     "fastify": "^5.6.1",
     "pg": "^8.16.1"
   },

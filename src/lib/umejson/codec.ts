@@ -1,4 +1,9 @@
-import type { PlanDependency, PlanJSON, PlanEvent } from "../plan-types.ts"
+import type {
+  PlanDependency,
+  PlanJSON,
+  PlanEvent,
+  PlanResource,
+} from "../plan-types.ts"
 import { SENTINEL, type UmeJsonEntity } from "./schema.ts"
 import type { DependencyCause } from "./schedule.ts"
 
@@ -14,6 +19,13 @@ export type UpdateOp = {
      * restores a duration. Absent = dates-only edit (kind untouched).
      */
     kind?: "task" | "milestone"
+    /**
+     * Physical progress (% 0..100) captured from the field, additive and
+     * auditable like `kind`: absent = the edit never touched progress.
+     * Applying it overwrites `event.progress`; progress never moves
+     * dates, so cascades ignore it.
+     */
+    progress?: number
   }
   /**
    * Why this date changed. Absent on manual edits; a dependency cascade
@@ -64,6 +76,37 @@ export type RemoveDependencyOp = {
   id: string
 }
 
+/**
+ * Inline edit of a tree row's OWN metadata (the title lives on the
+ * PlanResource, not on the event). Additive patch: absent keys never touch
+ * the document, and applying an empty patch is a no-op that still counts as
+ * an edit (same fold-by-key story as events).
+ */
+export type UpdateResourceOp = {
+  op: "updateResource"
+  id: string
+  patch: {
+    title?: string
+    responsable?: string
+  }
+}
+
+/**
+ * Plan-level settings edit (status date, scheduling conventions). Same
+ * lazy discipline as resources: documents without this op keep their
+ * fields untouched; a `null` patch value DROPS the field (canonical
+ * absence), an object value replaces it wholesale.
+ */
+export type UpdatePlanSettingsOp = {
+  op: "updatePlanSettings"
+  patch: {
+    statusDate?: string | null
+    schedulingOptions?: {
+      outOfSequence: "retainedLogic" | "progressOverride"
+    } | null
+  }
+}
+
 export type ChangeOp =
   | UpdateOp
   | CreateOp
@@ -71,6 +114,8 @@ export type ChangeOp =
   | AddDependencyOp
   | UpdateDependencyOp
   | RemoveDependencyOp
+  | UpdateResourceOp
+  | UpdatePlanSettingsOp
 
 export function applyOps(plan: PlanJSON, ops: ChangeOp[]): PlanJSON {
   let events: PlanEvent[] = plan.events
@@ -78,11 +123,23 @@ export function applyOps(plan: PlanJSON, ops: ChangeOp[]): PlanJSON {
   // only ops that touch edges replace the array (and a delete prunes it).
   let dependencies: PlanDependency[] | null = null
   const deps = () => dependencies ?? (dependencies = plan.dependencies ?? [])
+  // Same lazy discipline for resources: documents without resource edits
+  // round-trip byte-identical because the array is never rebuilt.
+  let resources: PlanResource[] | null = null
+  const res = () => resources ?? (resources = plan.resources)
+  // Plan-level settings fold separately: null marks "field dropped".
+  let statusDate: string | null | undefined = undefined // untouched
+  let schedulingOptions:
+    | PlanJSON["schedulingOptions"]
+    | null
+    | undefined = undefined
   for (const op of ops) {
     if (op.op === "update") {
       events = events.map((e) => {
         if (e.id !== op.id) return e
         const next: PlanEvent = { ...e, start: op.patch.start, end: op.patch.end }
+        // Additive field, same criterion as `kind`: absent = untouched.
+        if (op.patch.progress !== undefined) next.progress = op.patch.progress
         if (op.patch.kind === "milestone") return { ...next, kind: "milestone" }
         if (op.patch.kind === "task") {
           // Canonical form: a task carries NO kind field, so the document
@@ -124,6 +181,30 @@ export function applyOps(plan: PlanJSON, ops: ChangeOp[]): PlanJSON {
       dependencies = deps().map((d) =>
         d.id === op.dependency.id ? op.dependency : d,
       )
+    } else if (op.op === "updateResource") {
+      // Replace by id only; an unknown id never touches the array at all
+      // (lazy discipline: no-op ops must not even rebuild the list). The
+      // patch applies key-by-key so absent keys never synthesize fields.
+      const current = res()
+      if (current.some((r) => r.id === op.id)) {
+        resources = current.map((r) => {
+          if (r.id !== op.id) return r
+          const next = { ...r }
+          if (op.patch.title !== undefined) next.title = op.patch.title
+          if (op.patch.responsable !== undefined)
+            next.responsable = op.patch.responsable
+          return next
+        })
+      }
+    } else if (op.op === "updatePlanSettings") {
+      // Field-level fold: last write wins per field; a null patch value
+      // drops the field (canonical absence), an object replaces wholesale.
+      if (op.patch.statusDate !== undefined) {
+        statusDate = op.patch.statusDate
+      }
+      if (op.patch.schedulingOptions !== undefined) {
+        schedulingOptions = op.patch.schedulingOptions
+      }
     } else {
       dependencies = deps().filter((d) => d.id !== op.id)
     }
@@ -138,6 +219,26 @@ export function applyOps(plan: PlanJSON, ops: ChangeOp[]): PlanJSON {
   // (including a `dependencies: undefined` property) and silently undo the
   // edit, so when the field was touched we rebuild the object without it.
   let result: PlanJSON = { ...plan, events }
+  if (resources !== null) {
+    // Resources is a REQUIRED field: a touch always writes the rebuilt
+    // list back (reassigning an existing key preserves its position, so
+    // byte-identical documents keep their key order).
+    result = { ...result, resources }
+  }
+  if (statusDate !== undefined) {
+    const { statusDate: _drop, ...rest } = result
+    void _drop
+    result = rest as PlanJSON
+    if (statusDate !== null) result = { ...result, statusDate }
+  }
+  if (schedulingOptions !== undefined) {
+    const { schedulingOptions: _drop, ...rest } = result
+    void _drop
+    result = rest as PlanJSON
+    if (schedulingOptions !== null) {
+      result = { ...result, schedulingOptions }
+    }
+  }
   if (dependencies !== null) {
     const { dependencies: _drop, ...rest } = result
     void _drop

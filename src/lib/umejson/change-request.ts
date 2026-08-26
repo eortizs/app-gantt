@@ -23,6 +23,7 @@ import { applyOps, type ChangeOp } from "./codec.ts"
 import type { PlanJSON } from "../plan-types.ts"
 import { dependentClosure } from "./schedule.ts"
 import { vigenteBaseline, driftDays } from "./baselines.ts"
+import { workingDaysBetween, type CalendarResolver } from "./working-time.ts"
 import type { BudgetPayload } from "./budget.ts"
 import {
   SENTINEL,
@@ -40,8 +41,6 @@ import {
 
 export const ENTITY_NAME_CHANGE_REQUEST = "GanttChangeRequest"
 export const CR_SCHEMA_VERSION = 1
-
-const DAY_MS = 86_400_000
 
 export type ChangeRequestStatus = "proposed" | "approved" | "rejected" | "applied"
 
@@ -168,6 +167,7 @@ export function buildImpactSnapshot(
   basePlan: PlanJSON,
   ops: readonly ChangeOp[],
   budget?: BudgetPayload,
+  resolve?: CalendarResolver,
 ): ImpactSnapshot {
   const next = applyOps(basePlan, [...ops])
   const baseById = new Map(basePlan.events.map((e) => [e.id, e]))
@@ -204,7 +204,9 @@ export function buildImpactSnapshot(
             start: nextEv.start,
             end: nextEv.end,
             reference,
-            driftDays: driftDays(nextEv.end, reference.end),
+            // Drift in the event's own WORKING days when a calendar
+            // resolver is supplied (corrido otherwise — identical bytes).
+            driftDays: driftDays(nextEv.end, reference.end, resolve?.(id) ?? null),
           }
         : { eventId: id, start: nextEv.start, end: nextEv.end },
     )
@@ -221,11 +223,14 @@ export function buildImpactSnapshot(
       if (entry.driftDays > 0) extended += entry.driftDays
       const breakdown = budget.breakdownByEvent?.[entry.eventId]
       if (!breakdown || !entry.reference) continue
+      // Labor burns over the reference window's WORKING days (corrido
+      // under a null calendar — the exact old arithmetic).
       const refDays = Math.max(
         1,
-        Math.round(
-          (Date.parse(entry.reference.end) - Date.parse(entry.reference.start)) /
-            DAY_MS,
+        workingDaysBetween(
+          resolve?.(entry.eventId) ?? null,
+          Date.parse(entry.reference.start),
+          Date.parse(entry.reference.end),
         ),
       )
       projected += (entry.driftDays * breakdown.labor) / refDays
@@ -252,6 +257,8 @@ export function createChangeRequest(input: {
   ops: readonly ChangeOp[]
   /** Budget feeding the frozen cost projection, when one exists. */
   budget?: BudgetPayload
+  /** Working-time resolver freezing the impact in WORKING days. */
+  resolve?: CalendarResolver
   /** Proposal reason, kept as the head statusLog entry's reason. */
   reason?: string
 }): ChangeRequestPayload {
@@ -263,7 +270,7 @@ export function createChangeRequest(input: {
     planRevision: input.planRevision,
     ops,
     status: "proposed",
-    impact: buildImpactSnapshot(input.basePlan, ops, input.budget),
+    impact: buildImpactSnapshot(input.basePlan, ops, input.budget, input.resolve),
     statusLog: [
       {
         status: "proposed",
@@ -429,6 +436,18 @@ const validateOps = (
             op.patch.kind !== "milestone"
           ) {
             errors.push(err(`${p}.patch.kind`, "enum", 'op.patch.kind must be "task" or "milestone"'))
+          }
+          // Avance físico auditable: 0..100 finito cuando viene.
+          if (
+            op.patch.progress !== undefined &&
+            (
+              typeof op.patch.progress !== "number" ||
+              !Number.isFinite(op.patch.progress) ||
+              op.patch.progress < 0 ||
+              op.patch.progress > 100
+            )
+          ) {
+            errors.push(err(`${p}.patch.progress`, "range", "op.patch.progress must be a finite number in 0..100"))
           }
         }
         validateCause(op.cause, `${p}.cause`, errors)

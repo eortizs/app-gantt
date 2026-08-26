@@ -10,11 +10,14 @@ export function ChangesetPanel({
   recorder,
   documentOut,
   onPropose,
+  canPropose = true,
 }: {
   recorder: ChangesetRecorder
   documentOut: UmeJsonEntity | null
   /** Present only online: proposes the recorded ops as a change request. */
   onPropose?: (ops: ChangeOp[], reason?: string) => Promise<void>
+  /** False when the session lacks an editor/aprobador role: hides the form. */
+  canPropose?: boolean
 }) {
   const ops = useSyncExternalStore(recorder.subscribe, recorder.getSnapshot)
   const [reason, setReason] = useState("")
@@ -81,7 +84,7 @@ export function ChangesetPanel({
               {APP_STRINGS_ES.cascadeCauseLegend}
             </p>
           )}
-          {onPropose && (
+          {onPropose && canPropose && (
             <div className="mt-3 flex flex-col gap-2" data-slot="gantt-cr-propose">
               <div className="flex items-center gap-2">
                 <input

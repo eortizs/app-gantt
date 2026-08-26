@@ -28,6 +28,12 @@ export interface PlanEvent {
    * events that never were milestones round-trip byte-identical).
    */
   kind?: "task" | "milestone"
+  /**
+   * Leveling priority (1..1000, higher = leveled first). Additive-optional
+   * (schema stays v2); absent = default middle priority. Consumed by the
+   * leveling kernel; never affects paint or scheduling by itself.
+   */
+  priority?: number
 }
 
 /**
@@ -70,6 +76,21 @@ export interface PlanJSON {
   events: PlanEvent[]
   /** Scheduling constraints; optional so older documents stay valid. */
   dependencies?: PlanDependency[]
+  /**
+   * Status-date cutoff for field progress; additive-optional (schema stays
+   * v2). When present, cascades treat started-before-cutoff work as frozen
+   * actuals and the convention below decides how successors re-seat.
+   */
+  statusDate?: string
+  /**
+   * Scheduling conventions; additive-optional. `retainedLogic` (default):
+   * successors of in-progress predecessors seat from their LIVE finish.
+   * `progressOverride`: seating floors at the status date and an
+   * in-progress successor keeps only its remaining fraction of duration.
+   */
+  schedulingOptions?: {
+    outOfSequence: "retainedLogic" | "progressOverride"
+  }
 }
 
 export type EventData = {

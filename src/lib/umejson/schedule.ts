@@ -7,7 +7,14 @@
 // earlier the successor stays put - pulling work back is a human decision,
 // never a side effect. Every produced adjustment documents its own cause so
 // the changeset can carry provenance for each rewritten date.
+//
+// Working time: every kernel takes an optional resolver
+// `(eventId) => WorkingCalendar | null`. A successor's constraint bound is
+// seated with `addWorkingDays` on ITS calendar (lag counts the successor's
+// working days, the MS Project convention); null-endowed events reproduce
+// the corrido math byte for byte.
 import type { DependencyType, PlanDependency, PlanJSON } from "../plan-types.ts"
+import { addWorkingDays, workingDaysBetween, type WorkingCalendar } from "./working-time.ts"
 
 export interface DependencyCause {
   kind: "dependency-cascade"
@@ -15,8 +22,9 @@ export interface DependencyCause {
   sourceEventId: string
   type: DependencyType
   /**
-   * Signed whole calendar days of this move (positive = pushed forward
-   * by a cascade, negative = seated back by an edge-shape edit snap).
+   * Signed whole WORKING days of this move on the moved event's calendar
+   * (positive = pushed forward by a cascade, negative = seated back by an
+   * edge-shape edit snap). Corrido under a null calendar.
    */
   shiftDays: number
 }
@@ -28,9 +36,11 @@ export interface ScheduleAdjustment {
   cause: DependencyCause
 }
 
-const DAY_MS = 86_400_000
-
-const lagMs = (dep: PlanDependency): number => (dep.lagDays ?? 0) * DAY_MS
+/**
+ * Optional per-event calendar source shared by every scheduling kernel.
+ * Absent or null-returning = corrido (the pre-calendar behavior).
+ */
+export type ScheduleResolver = (eventId: string) => WorkingCalendar | null
 
 /**
  * Earliest instant the successor's `start` may sit at, given the
@@ -38,24 +48,31 @@ const lagMs = (dep: PlanDependency): number => (dep.lagDays ?? 0) * DAY_MS
  * start directly; FF/SF bound the END, so the start backs off by the
  * successor's preserved duration. Exported for CPM's forward pass: both
  * computations must agree on what a constraint demands, byte for byte.
+ *
+ * `lagDays` counts WORKING days of `cal` — the successor's own calendar,
+ * per the MS Project convention that a link's lag runs on its successor.
+ * The bound is seated with `addWorkingDays`, so an FS off a Friday end
+ * lands on Monday, never Saturday. null cal = corrido: exactly the old
+ * `boundary + lag × 86_400_000` arithmetic.
  */
 export function earliestStart(
   predStartMs: number,
   predEndMs: number,
   succDurationMs: number,
   type: DependencyType,
-  lag: number,
+  lagDays: number,
+  cal?: WorkingCalendar | null,
 ): number {
   switch (type) {
     case "SS":
-      return predStartMs + lag
+      return addWorkingDays(cal ?? null, predStartMs, lagDays)
     case "FF":
-      return predEndMs + lag - succDurationMs
+      return addWorkingDays(cal ?? null, predEndMs, lagDays) - succDurationMs
     case "SF":
-      return predStartMs + lag - succDurationMs
+      return addWorkingDays(cal ?? null, predStartMs, lagDays) - succDurationMs
     case "FS":
     default:
-      return predEndMs + lag
+      return addWorkingDays(cal ?? null, predEndMs, lagDays)
   }
 }
 
@@ -66,16 +83,33 @@ export function earliestStart(
  * moved event, empty when nothing is violated. Events not reachable from
  * the seeds are never touched; cycles (which the decoder rejects anyway)
  * are skipped, not followed forever.
+ *
+ * Status-date conventions ride ON THE PLAN (`statusDate` +
+ * `schedulingOptions.outOfSequence`); a plan without them reproduces the
+ * classic behavior byte for byte:
+ * - FROZEN ACTUALS: an event with progress > 0 that started before the
+ *   cutoff IS history — the cascade never reschedules it (its successors
+ *   still re-evaluate when it seeds).
+ * - RETAINED LOGIC (default): successors of in-progress predecessors seat
+ *   from their live finish — the remaining logic stays respected as-is.
+ * - PROGRESS OVERRIDE: a triggered seat floors at the status date and the
+ *   successor keeps only its REMAINING fraction of duration
+ *   ((100 − progress)/100), so in-progress work resumes where it stands.
  */
 export function cascadeSchedule(
   plan: PlanJSON,
   seedIds: readonly string[],
+  resolve?: ScheduleResolver,
 ): ScheduleAdjustment[] {
   const events = new Map(plan.events.map((e) => [e.id, e]))
   const deps = (plan.dependencies ?? []).filter(
     (d) => events.has(d.fromEventId) && events.has(d.toEventId),
   )
   if (!deps.length || !seedIds.length) return []
+
+  const statusMs = plan.statusDate ? Date.parse(plan.statusDate) : null
+  const overrideMode =
+    plan.schedulingOptions?.outOfSequence === "progressOverride"
 
   // Predecessor lists + Kahn indegrees over ALL events touched by deps.
   const predsOf = new Map<string, PlanDependency[]>()
@@ -117,18 +151,33 @@ export function cascadeSchedule(
     const event = events.get(id)
     if (!event) continue
     const startMs = Date.parse(event.start)
+    // FROZEN ACTUALS: started before the cutoff with progress is history.
+    // The cascade never moves it; as a seed it still dirties its succs.
+    if (
+      statusMs !== null &&
+      (event.progress ?? 0) > 0 &&
+      startMs < statusMs
+    ) {
+      if (seedSet.has(id)) {
+        for (const dep of succsOf.get(id) ?? []) dirty.add(dep.toEventId)
+      }
+      continue
+    }
     const durationMs = Math.max(Date.parse(event.end) - startMs, 0)
     let bestMs = startMs
     let cause: { dep: PlanDependency; boundMs: number } | null = null
     for (const dep of predsOf.get(id) ?? []) {
       const pred = events.get(dep.fromEventId)
       if (!pred) continue
+      // The constraint's lag and seat run on the SUCCESSOR's calendar.
+      const succCal = resolve?.(id) ?? null
       const boundMs = earliestStart(
         Date.parse(pred.start),
         Date.parse(pred.end),
         durationMs,
         dep.type,
-        lagMs(dep),
+        dep.lagDays ?? 0,
+        succCal,
       )
       // The BINDING predecessor is the one demanding the latest start;
       // it owns the documented cause.
@@ -139,8 +188,19 @@ export function cascadeSchedule(
     }
     let moved = false
     if (cause && bestMs > startMs) {
-      const nextStart = new Date(bestMs)
-      const nextEnd = new Date(Math.max(bestMs + durationMs, bestMs))
+      const succCal = resolve?.(id) ?? null
+      // PROGRESS OVERRIDE: a triggered seat floors at the cutoff and only
+      // the REMAINING fraction of this event's duration survives it.
+      let seatMs = bestMs
+      let effDur = durationMs
+      if (overrideMode && statusMs !== null) {
+        seatMs = Math.max(seatMs, statusMs)
+        const remaining =
+          Math.min(Math.max(0, 100 - (event.progress ?? 0)), 100) / 100
+        effDur = durationMs * remaining
+      }
+      const nextStart = new Date(seatMs)
+      const nextEnd = new Date(Math.max(seatMs + effDur, seatMs))
       const shifted: PlanJSON["events"][number] = {
         ...event,
         start: nextStart.toISOString(),
@@ -156,7 +216,7 @@ export function cascadeSchedule(
           kind: "dependency-cascade",
           sourceEventId: cause.dep.fromEventId,
           type: cause.dep.type,
-          shiftDays: Math.round((bestMs - startMs) / DAY_MS),
+          shiftDays: workingDaysBetween(succCal, startMs, seatMs),
         },
       })
     }
@@ -185,6 +245,7 @@ export function cascadeSchedule(
 export function snapToDependency(
   plan: PlanJSON,
   dep: PlanDependency,
+  resolve?: ScheduleResolver,
 ): ScheduleAdjustment | null {
   const events = new Map(plan.events.map((e) => [e.id, e]))
   const pred = events.get(dep.fromEventId)
@@ -192,12 +253,14 @@ export function snapToDependency(
   if (!pred || !succ) return null
   const startMs = Date.parse(succ.start)
   const durationMs = Math.max(Date.parse(succ.end) - startMs, 0)
+  const succCal = resolve?.(succ.id) ?? null
   const boundMs = earliestStart(
     Date.parse(pred.start),
     Date.parse(pred.end),
     durationMs,
     dep.type,
-    lagMs(dep),
+    dep.lagDays ?? 0,
+    succCal,
   )
   const start = new Date(boundMs).toISOString()
   const end = new Date(Math.max(boundMs + durationMs, boundMs)).toISOString()
@@ -210,7 +273,7 @@ export function snapToDependency(
       kind: "dependency-cascade",
       sourceEventId: pred.id,
       type: dep.type,
-      shiftDays: Math.round((boundMs - startMs) / DAY_MS),
+      shiftDays: workingDaysBetween(succCal, startMs, boundMs),
     },
   }
 }
@@ -227,6 +290,7 @@ export function impliedLagDays(
   dep: Pick<PlanDependency, "type">,
   pred: { start: string | Date; end: string | Date },
   succ: { start: string | Date; end: string | Date },
+  cal?: WorkingCalendar | null,
 ): number {
   const ms = (v: string | Date): number =>
     typeof v === "number"
@@ -242,7 +306,7 @@ export function impliedLagDays(
         : dep.type === "SF"
           ? [ms(pred.start), ms(succ.end)]
           : [ms(pred.end), ms(succ.start)] // FS
-  return Math.round((to - from) / DAY_MS)
+  return workingDaysBetween(cal ?? null, from, to)
 }
 
 /**

@@ -1,11 +1,4 @@
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react"
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react"
 import { differenceInCalendarDays, format } from "date-fns"
 import {
   Gantt,
@@ -40,8 +33,13 @@ import {
   HistoryIcon,
   PinIcon,
   RectangleHorizontalIcon,
+  Redo2Icon,
+  ScaleIcon,
   SplineIcon,
+  TimerIcon,
   Trash2Icon,
+  TrendingUpIcon,
+  Undo2Icon,
   UnlinkIcon,
   XIcon,
 } from "lucide-react"
@@ -55,6 +53,7 @@ import type {
   PlanJSON,
 } from "@/lib/plan-types"
 import {
+  progressStatus,
   resolveDependencyMarks,
   toGanttEvents,
   toGanttResources,
@@ -71,9 +70,23 @@ import { applyOps, encodeUpdatedPlan, type ChangeOp } from "@/lib/umejson/codec"
 import { decodeUmePlan, type UmeJsonEntity, type ValidationError } from "@/lib/umejson/schema"
 import type { WorkforcePayload } from "@/lib/umejson/workforce"
 import type { BudgetPayload } from "@/lib/umejson/budget"
+import type { ActualsPayload } from "@/lib/umejson/actuals"
+import type { CalendarResolver } from "@/lib/umejson/working-time"
+import { workingDaysBetween } from "@/lib/umejson/working-time"
+import {
+  eventOverloadDays,
+  levelPlan,
+  type LevelingResult,
+} from "@/lib/umejson/leveling"
 import { wbsLevelStyle } from "@/lib/wbs-levels"
 import { ChangesetPanel } from "@/components/gantt-plan/ChangesetPanel"
 import { TreeColumnsMenu } from "@/components/gantt-plan/TreeColumnsMenu"
+import {
+  EMPTY_PLAN_FILTERS,
+  PlanFiltersMenu,
+  isPlanFilterActive,
+  type PlanFilters,
+} from "@/components/gantt-plan/PlanFiltersMenu"
 import type { GanttDependencyMark } from "@/components/reui/gantt/gantt-types"
 import { cn } from "@/lib/utils"
 
@@ -95,6 +108,23 @@ export interface GanttPlanViewerProps {
   workforce?: WorkforcePayload
   /** Budget sibling: adds the «Presupuesto» (BAC) column to the tree panel. */
   budget?: BudgetPayload
+  /**
+   * Working-time resolver (from the GanttCalendar sibling): cascades, edge
+   * snaps, CPM and violation marks run on WORKING days when present;
+   * absent = corrido arithmetic.
+   */
+  resolve?: CalendarResolver
+  /** Actuals sibling: dataDate + current AC for the progress dialog. */
+  actuals?: ActualsPayload
+  /**
+   * Present when the host persists captured ACs (online it PUTs the
+   * GanttActuals sibling; offline App keeps them in memory). Receives the
+   * entries and the NEW data date (the capture instant).
+   */
+  onCaptureActuals?: (
+    entries: { eventId: string; ac: number }[],
+    dataDate: string,
+  ) => Promise<void>
   /** Present only online: proposes the recorded ops as a change request. */
   onProposeChangeRequest?: (ops: ChangeOp[], reason?: string) => Promise<void>
 }
@@ -142,6 +172,9 @@ export function GanttPlanViewer({
   onDocumentChange,
   workforce,
   budget,
+  resolve,
+  actuals,
+  onCaptureActuals,
   onProposeChangeRequest,
 }: GanttPlanViewerProps) {
   const decoded = useMemo(() => decodeUmePlan(document), [document])
@@ -178,6 +211,9 @@ export function GanttPlanViewer({
       onDocumentChange={onDocumentChange}
       workforce={workforce}
       budget={budget}
+      resolve={resolve}
+      actuals={actuals}
+      onCaptureActuals={onCaptureActuals}
       onProposeChangeRequest={onProposeChangeRequest}
     />
   )
@@ -190,6 +226,9 @@ function GanttPlanViewerInner({
   onDocumentChange,
   workforce,
   budget,
+  resolve,
+  actuals,
+  onCaptureActuals,
   onProposeChangeRequest,
 }: {
   entity: UmeJsonEntity
@@ -198,6 +237,12 @@ function GanttPlanViewerInner({
   onDocumentChange?: (entity: UmeJsonEntity) => void
   workforce?: WorkforcePayload
   budget?: BudgetPayload
+  resolve?: CalendarResolver
+  actuals?: ActualsPayload
+  onCaptureActuals?: (
+    entries: { eventId: string; ac: number }[],
+    dataDate: string,
+  ) => Promise<void>
   onProposeChangeRequest?: (ops: ChangeOp[], reason?: string) => Promise<void>
 }) {
   const apiRef = useRef<GanttApi<EventData> | null>(null)
@@ -205,6 +250,9 @@ function GanttPlanViewerInner({
   if (recorderRef.current === null) {
     recorderRef.current = createChangesetRecorder(apiRef, {
       getBasePlan: () => originalPlan,
+      // Captured once per mount: the viewer remounts per plan revision, so
+      // the resolver can never go stale inside the recorder.
+      ...(resolve ? { resolve } : {}),
     })
   }
   const recorder = recorderRef.current!
@@ -212,9 +260,23 @@ function GanttPlanViewerInner({
   const [events, setEvents] = useState<GanttEvent<EventData>[]>(() =>
     toGanttEvents(originalPlan),
   )
+  // ----- título inline (UpdateResourceOp) -----
+  // Resources derive from the LIVE plan (ops applied), so an inline rename
+  // - and its undo - re-derives the tree immediately.
+  const ops = useRecorderOps(recorder)
+  const livePlan = useMemo(
+    () => (ops.length ? applyOps(originalPlan, ops) : originalPlan),
+    [ops, originalPlan],
+  )
   const resources: GanttResource[] = useMemo(
-    () => toGanttResources(originalPlan),
-    [originalPlan],
+    () => toGanttResources(livePlan),
+    [livePlan],
+  )
+  const handleResourceTitleCommit = useCallback(
+    (resourceId: string, title: string) => {
+      recorder.updateResourceTitle(resourceId, title)
+    },
+    [recorder],
   )
 
   // ----- preferencias de columnas (visibilidad + anchos) -----
@@ -323,6 +385,44 @@ function GanttPlanViewerInner({
     x: number
     y: number
   } | null>(null)
+
+  // «Registrar avance»: parked anchored to the bar (same pattern as the
+  // bitácora), fed by the context menu. Derived-closed when the event
+  // disappears from `events`.
+  const [progressTarget, setProgressTarget] = useState<{
+    eventId: string
+    anchor: { x: number; y: number }
+  } | null>(null)
+
+  // «Duración…»: same anchoring pattern; the commit re-seats the END on the
+  // event's own working days and queues the cascade like the drag flow.
+  const [durationTarget, setDurationTarget] = useState<{
+    eventId: string
+    anchor: { x: number; y: number }
+  } | null>(null)
+
+  // «Nivelar recursos»: el kernel corre contra el plan vivo al ABRIR el
+  // panel (preview congelado); Aplicar empuja los ops por el recorder
+  // (auditable, undoable) y espeja las fechas en el engine.
+  const [levelingOpen, setLevelingOpen] = useState(false)
+  const levelingPreview: LevelingResult | null = useMemo(
+    () =>
+      workforce && levelingOpen
+        ? levelPlan(livePlan, workforce, resolve ? { resolve } : {})
+        : null,
+    [levelingOpen, livePlan, workforce, resolve],
+  )
+  const handleApplyLeveling = useCallback(() => {
+    if (!levelingPreview?.ops.length) return
+    recorder.recordOps(levelingPreview.ops)
+    const moves = levelingPreview.ops.flatMap((o) =>
+      o.op === "update"
+        ? [{ eventId: o.id, start: o.patch.start, end: o.patch.end }]
+        : [],
+    )
+    setEvents((prev) => applyAdjustmentsTo(prev, moves))
+    setLevelingOpen(false)
+  }, [levelingPreview, recorder])
 
   // STABLE identity is load-bearing: the engine's per-row layout memo depends
   // on this callback, and a fresh closure per render would rebuild every row.
@@ -434,25 +534,128 @@ function GanttPlanViewerInner({
   // audit trail reads as one batch.
   // (Declaration lives after `livePlan` is computed - see below.)
 
+  /**
+   * Anchor point of a bar at the row's center bottom — shared by every
+   * floating panel that anchors to a bar (bitácora, progreso, etc.).
+   * Falls back to viewport center when the bar isn't measurable yet
+   * (the engine mounts the panel before the next paint flush).
+   */
+  const occurrenceAnchor = (
+    occurrence: GanttOccurrence<EventData>,
+  ): { x: number; y: number } => {
+    const bar = rootRef.current?.querySelector<HTMLElement>(
+      `[data-occurrence-key="${CSS.escape(occurrence.key)}"]`,
+    )
+    const rect = bar?.getBoundingClientRect()
+    return {
+      x: rect ? rect.left + rect.width / 2 : window.innerWidth / 2,
+      y: rect ? rect.bottom + 6 : window.innerHeight / 3,
+    }
+  }
+
   // Opens the history panel anchored to the bar itself (not the cursor): the
   // tooltip freezes its anchor at open time, but a panel listing history
   // needs an anchor that stays put.
   const openHistory = useCallback(
     (occurrence: GanttOccurrence<EventData>) => {
-      const bar = rootRef.current?.querySelector<HTMLElement>(
-        `[data-occurrence-key="${CSS.escape(occurrence.key)}"]`,
-      )
-      const rect = bar?.getBoundingClientRect()
       setHistoryTarget({
         eventId: occurrence.event.id,
-        anchor: {
-          x: rect ? rect.left + rect.width / 2 : window.innerWidth / 2,
-          y: rect ? rect.bottom + 6 : window.innerHeight / 3,
-        },
+        anchor: occurrenceAnchor(occurrence),
       })
       setHighlightedBaseline(null)
     },
     [],
+  )
+
+  const openProgress = useCallback(
+    (occurrence: GanttOccurrence<EventData>) => {
+      setProgressTarget({
+        eventId: occurrence.event.id,
+        anchor: occurrenceAnchor(occurrence),
+      })
+    },
+    [],
+  )
+
+  const openDuration = useCallback(
+    (occurrence: GanttOccurrence<EventData>) => {
+      setDurationTarget({
+        eventId: occurrence.event.id,
+        anchor: occurrenceAnchor(occurrence),
+      })
+    },
+    [],
+  )
+
+  // Derived, not effect-synced: the dialog closes during render when its
+  // event disappears (deleted, reset) — no extra pass, never stale.
+  const progressEvent = progressTarget
+    ? events.find((ev) => ev.id === progressTarget.eventId) ?? null
+    : null
+  const activeProgress =
+    progressTarget && progressEvent ? progressTarget : null
+
+  // Same derived-close pattern for the duration dialog.
+  const durationEvent = durationTarget
+    ? events.find((ev) => ev.id === durationTarget.eventId) ?? null
+    : null
+  const activeDuration =
+    durationTarget && durationEvent && !durationEvent.milestone
+      ? durationTarget
+      : null
+
+  /**
+   * Duración por teclado: the recorder re-seats the END on the event's own
+   * working days and queues the cascade; the engine mirror is updated HERE
+   * in one setState (target dates + queued adjustments), exactly like the
+   * milestone-toggle flow.
+   */
+  const handleSetDuration = useCallback(
+    (eventId: string, days: number) => {
+      const result = recorder.setEventDuration(eventId, days)
+      if (!result) return false
+      const pending = recorder.consumePendingCascade()
+      setEvents((prev) =>
+        applyAdjustmentsTo(
+          prev.map((ev) =>
+            ev.id === eventId
+              ? { ...ev, start: new Date(result.start), end: new Date(result.end) }
+              : ev,
+          ),
+          pending,
+        ),
+      )
+      return true
+    },
+    [recorder],
+  )
+
+  // % → recorder (auditable, CR-able); AC (+ dataDate bump) → host. The
+  // engine's mirror is updated HERE because progress lives on the event
+  // object (paint + tooltip), not in the ops the recorder replays.
+  // The dialog closes REGARDLESS of capture success — a failed AC doesn't
+  // punish the user with a stuck modal; recorder + engine mirror already
+  // applied the % and survive on their own.
+  const handleRegisterProgress = useCallback(
+    async (eventId: string, progress: number, ac: number | null) => {
+      if (!recorder.setEventProgress(eventId, progress)) return
+      const status = progressStatus(progress)
+      setEvents((prev) =>
+        prev.map((ev) =>
+          ev.id === eventId
+            ? { ...ev, progress, data: ev.data ? { ...ev.data, status } : ev.data }
+            : ev,
+        ),
+      )
+      try {
+        if (ac !== null && onCaptureActuals) {
+          await onCaptureActuals([{ eventId, ac }], new Date().toISOString())
+        }
+      } finally {
+        setProgressTarget(null)
+      }
+    },
+    [recorder, onCaptureActuals],
   )
 
   // Derived, not effect-synced: if the event disappears (deleted, plan reset)
@@ -475,6 +678,7 @@ function GanttPlanViewerInner({
 
   const maxDepth = useMemo(() => depthOf(resources), [resources])
   const [level, setLevel] = useState(maxDepth)
+
   const collapsedGroups = useMemo(() => {
     const ids: string[] = []
     const walk = (nodes: GanttResource[], depth: number) => {
@@ -496,6 +700,13 @@ function GanttPlanViewerInner({
     [originalPlan],
   )
 
+  // ----- sobrecarga de cuadrillas (insumo de lectura de la hermana RRHH) --
+  const overloadDaysByEvent = useMemo(
+    () =>
+      workforce ? eventOverloadDays(livePlan, workforce, resolve) : null,
+    [workforce, livePlan, resolve],
+  )
+
   // Money reference per row: a leaf shows its event's BAC, a group the
   // SUM over its subtree — the rollup makes the column a reference for
   // every WBS level, not just tasks.
@@ -515,7 +726,7 @@ function GanttPlanViewerInner({
         width: 130,
         minWidth: 96,
         render: (ctx: { resource: { id: string } }) => {
-          const r = originalPlan.resources.find((rr) => rr.id === ctx.resource.id)
+          const r = livePlan.resources.find((rr) => rr.id === ctx.resource.id)
           return r?.responsable ?? "—"
         },
       },
@@ -535,6 +746,40 @@ function GanttPlanViewerInner({
           return crew ? `${crew.title} · ${assignment!.headcount}` : "—"
         },
       })
+      // Heatmap de sobrecarga: días en que la cuadrilla del evento excede
+      // su headcount con este evento trabajando. Intensidad por buckets.
+      if (overloadDaysByEvent) {
+        cols.push({
+          id: "sobrecarga",
+          title: APP_STRINGS_ES.overloadColumn,
+          width: 96,
+          minWidth: 72,
+          align: "center",
+          render: (ctx: { resource: { id: string } }) => {
+            const event = eventByResource.get(ctx.resource.id)
+            const days = event
+              ? overloadDaysByEvent.get(event.id) ?? 0
+              : 0
+            if (!days) {
+              return <span className="text-muted-foreground">—</span>
+            }
+            return (
+              <span
+                data-slot="gantt-overload-pill"
+                className={cn(
+                  "rounded-full px-1.5 py-px font-medium tabular-nums",
+                  days >= 3
+                    ? "bg-destructive/15 text-destructive"
+                    : "bg-amber-500/20 text-amber-600 dark:text-amber-400",
+                )}
+                title={APP_STRINGS_ES.overloadDaysTitle(days)}
+              >
+                {APP_STRINGS_ES.overloadDaysLabel(days)}
+              </span>
+            )
+          },
+        })
+      }
     }
     if (budget && bacByResource) {
       const fmt = new Intl.NumberFormat("es-MX", {
@@ -556,7 +801,7 @@ function GanttPlanViewerInner({
       })
     }
     return cols
-  }, [originalPlan, workforce, budget, bacByResource, eventByResource])
+  }, [livePlan, workforce, budget, bacByResource, eventByResource])
 
   // Hidden ids that no longer match a column (e.g. budget went offline) are
   // inert: they just never filter anything.
@@ -584,16 +829,101 @@ function GanttPlanViewerInner({
     [columns, columnPrefs, toggleColumn, resetColumnWidths],
   )
 
-  const ops = useRecorderOps(recorder)
-  const livePlan = useMemo(
-    () => (ops.length ? applyOps(originalPlan, ops) : originalPlan),
-    [ops, originalPlan],
+  // Ruta crítica sobre el plan VIVO: reacciona a cada op (drag, cascada,
+  // borde nuevo) sin tocar el motor vendorizado. Con calendario, la
+  // holgura cuenta días laborables del propio evento.
+  const criticalIds = useMemo(
+    () => cpmSchedule(livePlan, resolve).critical,
+    [livePlan, resolve],
   )
 
-  // Ruta crítica sobre el plan VIVO: reacciona a cada op (drag, cascada,
-  // borde nuevo) sin tocar el motor vendorizado.
-  const criticalIds = useMemo(
-    () => cpmSchedule(livePlan).critical,
+  // ----- filtros del árbol (Ola 1C) -----
+  // El motor recibe el árbol YA FILTRADO (matches ∪ ancestros, para no
+  // romper la estructura); los ops siguen aplicando a las filas ocultas —
+  // drift/cascada las mueven igual. El conteo de ocultas se muestra junto
+  // al disparador.
+  const [filters, setFilters] = useState<PlanFilters>(EMPTY_PLAN_FILTERS)
+  const engineEventById = useMemo(
+    () => new Map(events.map((ev) => [ev.id, ev])),
+    [events],
+  )
+  const filteredResources = useMemo(() => {
+    if (!isPlanFilterActive(filters)) return resources
+    const text = filters.text.trim().toLowerCase()
+    // phaseId heredable: misma resolución que plan-mapper (ancestro más
+    // cercano con fase).
+    const byId = new Map(livePlan.resources.map((r) => [r.id, r]))
+    const phaseOf = (id: string): string | undefined => {
+      const visiting = new Set<string>()
+      let cur: string | undefined = id
+      while (cur && !visiting.has(cur)) {
+        visiting.add(cur)
+        const r = byId.get(cur)
+        if (!r) return undefined
+        if (r.phaseId) return r.phaseId
+        cur = r.parentId
+      }
+      return undefined
+    }
+    // Predicado AND sobre cada nodo (con su evento 1:1 cuando existe).
+    const matches = (node: GanttResource): boolean => {
+      const ev = engineEventById.get(node.id)
+      const resp = livePlan.resources.find((r) => r.id === node.id)?.responsable
+      if (
+        text &&
+        !node.title.toLowerCase().includes(text) &&
+        !(resp ?? "").toLowerCase().includes(text)
+      ) {
+        return false
+      }
+      if (filters.responsable !== "" && resp !== filters.responsable) {
+        return false
+      }
+      if (filters.fase !== "" && phaseOf(node.id) !== filters.fase) {
+        return false
+      }
+      if (filters.critical || filters.drifted || filters.milestones) {
+        if (!ev) return false
+        if (filters.critical && !criticalIds.has(ev.id)) return false
+        if (filters.drifted && !isDriftedEvent(ev)) return false
+        if (filters.milestones && ev.milestone !== true) return false
+      }
+      return true
+    }
+    // matches ∪ ancestros: un grupo sobrevive si él matchea o si algún
+    // descendiente matchea; los hijos que quedan son SOLO los que pasan.
+    const keep = (nodes: GanttResource[]): GanttResource[] => {
+      const out: GanttResource[] = []
+      for (const node of nodes) {
+        const keptKids = node.children ? keep(node.children) : undefined
+        if (!matches(node) && !(keptKids && keptKids.length > 0)) continue
+        out.push({
+          ...node,
+          ...(keptKids && keptKids.length > 0 ? { children: keptKids } : {}),
+        })
+      }
+      return out
+    }
+    return keep(resources)
+  }, [resources, livePlan, events, engineEventById, criticalIds, filters])
+  const rowCount = useCallback(
+    (nodes: GanttResource[]): number =>
+      nodes.reduce((sum, n) => sum + 1 + (n.children ? rowCount(n.children) : 0), 0),
+    [],
+  )
+  const hiddenRowCount = useMemo(
+    () => rowCount(resources) - rowCount(filteredResources),
+    [resources, filteredResources, rowCount],
+  )
+  const filterResponsables = useMemo(() => {
+    const set = new Set<string>()
+    for (const r of livePlan.resources) {
+      if (r.responsable) set.add(r.responsable)
+    }
+    return [...set].sort((a, b) => a.localeCompare(b, "es"))
+  }, [livePlan])
+  const filterPhases = useMemo(
+    () => livePlan.phases.map((p) => ({ id: p.id, title: p.title })),
     [livePlan],
   )
 
@@ -707,8 +1037,8 @@ function GanttPlanViewerInner({
   // Connectors read the LIVE engine events: a violation lights up during the
   // drag that causes it, before any op is committed to the document.
   const dependencyMarks = useMemo(
-    () => resolveDependencyMarks(livePlan.dependencies ?? [], events),
-    [livePlan, events],
+    () => resolveDependencyMarks(livePlan.dependencies ?? [], events, resolve),
+    [livePlan, events, resolve],
   )
 
   // Derived, not effect-synced: an edge that disappears (removed, reset)
@@ -784,13 +1114,82 @@ function GanttPlanViewerInner({
     recorder.reset()
   }
 
+  // ----- convención de fuera de secuencia (UpdatePlanSettingsOp) -----
+  const handleConventionChange = useCallback(
+    (v: "retainedLogic" | "progressOverride") => {
+      const baseConvention =
+        originalPlan.schedulingOptions?.outOfSequence ?? "retainedLogic"
+      recorder.recordOps([
+        v === baseConvention
+          ? // Back to the base plan's convention: drop the field so the
+            // document keeps its canonical form.
+            { op: "updatePlanSettings", patch: { schedulingOptions: null } }
+          : {
+              op: "updatePlanSettings",
+              patch: { schedulingOptions: { outOfSequence: v } },
+            },
+      ])
+    },
+    [recorder, originalPlan],
+  )
+
+  // ----- deshacer / rehacer -----
+  // Same reconstruction mechanism as «Reiniciar plan», but against the
+  // LIVE plan the post-undo ops describe — NOT the original document.
+  // KNOWN LIMITATION (accepted): session bitácora captures live only in
+  // the engine's events state, so a rebuild drops them (same wipe
+  // semantics as «Reiniciar plan»); ops-recorded state (dates, kind,
+  // progress, edges) survives untouched.
+  const undoRedoFlags = useRecorderFlags(recorder)
+  const applyRecorderOps = useCallback(
+    (next: ChangeOp[]) => {
+      const plan = next.length ? applyOps(originalPlan, next) : originalPlan
+      setEvents(toGanttEvents(plan))
+      setDependencyTarget(null)
+      setHistoryTarget(null)
+      setHighlightedBaseline(null)
+    },
+    [originalPlan],
+  )
+  const handleUndo = useCallback(() => {
+    if (!recorder.canUndo()) return
+    applyRecorderOps(recorder.undo())
+  }, [recorder, applyRecorderOps])
+  const handleRedo = useCallback(() => {
+    if (!recorder.canRedo()) return
+    applyRecorderOps(recorder.redo())
+  }, [recorder, applyRecorderOps])
+
+  // Ctrl+Z / Ctrl+Shift+Z (⌘Z / ⇧⌘Z): window-level, but inert while the
+  // focus is inside a text field so native text undo keeps working.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "z") return
+      const target = e.target as HTMLElement | null
+      const tag = target?.tagName
+      if (
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        target?.isContentEditable
+      ) {
+        return
+      }
+      e.preventDefault()
+      if (e.shiftKey) handleRedo()
+      else handleUndo()
+    }
+    window.addEventListener("keydown", onKeyDown)
+    return () => window.removeEventListener("keydown", onKeyDown)
+  }, [handleUndo, handleRedo])
+
   return (
     <div ref={rootRef} className="relative flex flex-col gap-4">
       <Gantt<EventData>
         apiRef={apiRef}
         events={events}
         onEventsChange={handleEventsChange}
-        resources={resources}
+        resources={filteredResources}
         dependencies={dependencyMarks}
         onDependencyClick={(mark, e) =>
           setDependencyTarget({ mark, x: e.clientX, y: e.clientY })
@@ -806,15 +1205,26 @@ function GanttPlanViewerInner({
           indentPerLevelRem: 0,
           rowStyle: (ctx) => wbsLevelStyle(ctx.depth),
           rowToggles: false,
+          titleEditable: true,
           headerContent: (
-            <WbsLevelSlider
-              level={level}
-              max={maxDepth}
-              onChange={setLevel}
-            />
+            <div className="flex w-full min-w-0 items-center gap-1">
+              <WbsLevelSlider
+                level={level}
+                max={maxDepth}
+                onChange={setLevel}
+              />
+              <PlanFiltersMenu
+                filters={filters}
+                onChange={setFilters}
+                responsables={filterResponsables}
+                phases={filterPhases}
+                hiddenCount={hiddenRowCount}
+              />
+            </div>
           ),
         }}
         collapsedGroups={collapsedGroups}
+        onResourceTitleCommit={handleResourceTitleCommit}
         columns={visibleColumns}
         columnsMenu={columnsMenu}
         columnWidths={columnPrefs.widths}
@@ -822,6 +1232,7 @@ function GanttPlanViewerInner({
         summaryBars
         offDays
         nowIndicator
+        statusMarker={livePlan.statusDate}
         offscreenIndicators
         infiniteScroll
         onEventUpdate={recorder.onEventUpdate}
@@ -880,6 +1291,16 @@ function GanttPlanViewerInner({
                   ? APP_STRINGS_ES.convertToTask
                   : APP_STRINGS_ES.convertToMilestone}
               </ContextMenuItem>
+              <ContextMenuItem onClick={() => openProgress(occurrence)}>
+                <TrendingUpIcon aria-hidden />{" "}
+                {APP_STRINGS_ES.registerProgress}
+              </ContextMenuItem>
+              {/* Duración por teclado: hitos vetados (duración 0). */}
+              {!occurrence.event.milestone && (
+                <ContextMenuItem onClick={() => openDuration(occurrence)}>
+                  <TimerIcon aria-hidden /> {APP_STRINGS_ES.durationMenuItem}
+                </ContextMenuItem>
+              )}
               {/* Las dependencias se crean SOLO arrastrando desde los
                   connect handles de la barra; el menú queda para quitar. */}
               {(outgoing.length > 0 || incoming.length > 0) && (
@@ -947,11 +1368,44 @@ function GanttPlanViewerInner({
           onClose={() => setHistoryTarget(null)}
         />
       )}
+      {activeProgress && progressEvent && (
+        <ProgressPanel
+          event={progressEvent}
+          actuals={actuals}
+          canCaptureActuals={Boolean(onCaptureActuals)}
+          anchor={activeProgress.anchor}
+          onCommit={(progress, ac) =>
+            void handleRegisterProgress(progressEvent.id, progress, ac)
+          }
+          onClose={() => setProgressTarget(null)}
+        />
+      )}
+      {activeDuration && durationEvent && (
+        <DurationPanel
+          event={durationEvent}
+          resolve={resolve}
+          anchor={activeDuration.anchor}
+          onCommit={(days) => {
+            if (handleSetDuration(durationEvent.id, days)) {
+              setDurationTarget(null)
+            }
+          }}
+          onClose={() => setDurationTarget(null)}
+        />
+      )}
+      {levelingOpen && levelingPreview && (
+        <LevelingPanel
+          result={levelingPreview}
+          onApply={handleApplyLeveling}
+          onClose={() => setLevelingOpen(false)}
+        />
+      )}
       {activeDependency && (
         <DependencyPanel
           mark={activeDependency.mark}
           deps={livePlan.dependencies ?? []}
           events={events}
+          resolve={resolve}
           point={{ x: activeDependency.x, y: activeDependency.y }}
           onUpdate={handleUpdateDependency}
           onRemove={() => {
@@ -969,16 +1423,86 @@ function GanttPlanViewerInner({
           <Button
             size="sm"
             variant="outline"
+            onClick={handleUndo}
+            disabled={!undoRedoFlags.canUndo}
+            aria-label={APP_STRINGS_ES.undoLabel}
+            data-slot="gantt-undo"
+          >
+            <Undo2Icon aria-hidden />
+            {APP_STRINGS_ES.undoLabel}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleRedo}
+            disabled={!undoRedoFlags.canRedo}
+            aria-label={APP_STRINGS_ES.redoLabel}
+            data-slot="gantt-redo"
+          >
+            <Redo2Icon aria-hidden />
+            {APP_STRINGS_ES.redoLabel}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
             onClick={handleReset}
             data-slot="gantt-reset"
           >
             Reiniciar plan
           </Button>
+          {workforce && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setLevelingOpen(true)}
+              data-slot="gantt-level-button"
+            >
+              <ScaleIcon aria-hidden />
+              {APP_STRINGS_ES.levelingButton}
+            </Button>
+          )}
           <span
             className="text-muted-foreground text-xs"
             data-slot="gantt-critical-legend"
           >
             {APP_STRINGS_ES.criticalPathLegend(criticalIds.size)}
+          </span>
+        </div>
+        {/* Convención de fuera de secuencia + corte: viajan como
+            UpdatePlanSettingsOp (un solo slot en el changeset); volver a la
+            convención del plan base DROPEA el campo (forma canónica). */}
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+          <label className="flex items-center gap-2 text-xs">
+            <span className="text-muted-foreground">
+              {APP_STRINGS_ES.schedulingLabel}
+            </span>
+            <select
+              data-slot="gantt-scheduling-mode"
+              value={
+                livePlan.schedulingOptions?.outOfSequence ?? "retainedLogic"
+              }
+              onChange={(e) =>
+                handleConventionChange(
+                  e.target.value as "retainedLogic" | "progressOverride",
+                )
+              }
+              aria-label={APP_STRINGS_ES.schedulingLabel}
+              className="bg-background ring-ring/30 rounded-md px-1 py-0.5 ring-1 outline-none"
+            >
+              <option value="retainedLogic">{APP_STRINGS_ES.schedulingRetained}</option>
+              <option value="progressOverride">{APP_STRINGS_ES.schedulingOverride}</option>
+            </select>
+          </label>
+          {livePlan.statusDate && (
+            <span className="text-muted-foreground text-xs" data-slot="gantt-status-date">
+              {APP_STRINGS_ES.statusDateLabel}:{" "}
+              {format(new Date(livePlan.statusDate), "d MMM yyyy", {
+                locale: LOCALE_ES,
+              })}
+            </span>
+          )}
+          <span className="text-muted-foreground text-[10px]">
+            {APP_STRINGS_ES.schedulingHint}
           </span>
         </div>
         <ChangesetPanel
@@ -998,6 +1522,14 @@ function useRecorderOps(recorder: ChangesetRecorder): ChangeOp[] {
     return recorder.subscribe(() => setOps(recorder.getOps()))
   }, [recorder])
   return ops
+}
+
+/** Undo/redo availability off the same store the ops panel subscribes to. */
+function useRecorderFlags(recorder: ChangesetRecorder): {
+  canUndo: boolean
+  canRedo: boolean
+} {
+  return useSyncExternalStore(recorder.subscribe, recorder.getUndoRedoFlags)
 }
 
 /**
@@ -1020,7 +1552,11 @@ function isDriftedEvent(ev: GanttEvent<EventData>): boolean {
 /** Pure merge of cascade adjustments into an events array (by event id). */
 function applyAdjustmentsTo(
   events: GanttEvent<EventData>[],
-  adjustments: readonly ScheduleAdjustment[],
+  adjustments: ReadonlyArray<{
+    eventId: string
+    start: string
+    end: string
+  }>,
 ): GanttEvent<EventData>[] {
   if (!adjustments.length) return events
   const byId = new Map(adjustments.map((a) => [a.eventId, a]))
@@ -1133,6 +1669,44 @@ function GanttScaleSlider() {
 const HISTORY_CARD_HALF_W = 160
 
 /**
+ * Close-on-outside-interaction wiring every floating panel shares:
+ * click outside, Escape, nested scroll past the card, window resize.
+ * Captures scroll so the gantt body's nested viewport still fires it.
+ * Behavior kept identical across the three panels — divergent copy was
+ * the drift surface this extracted.
+ */
+function usePanelClose(
+  cardRef: React.RefObject<HTMLElement | null>,
+  onClose: () => void,
+) {
+  useEffect(() => {
+    cardRef.current?.focus()
+    const contains = (target: EventTarget | null) =>
+      target instanceof Node && cardRef.current?.contains(target) === true
+    const onPointerDown = (e: PointerEvent) => {
+      if (!contains(e.target)) onClose()
+    }
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose()
+    }
+    const onScroll = (e: Event) => {
+      if (!contains(e.target)) onClose()
+    }
+    const onResize = () => onClose()
+    window.addEventListener("pointerdown", onPointerDown)
+    window.addEventListener("keydown", onKeyDown)
+    window.addEventListener("scroll", onScroll, true)
+    window.addEventListener("resize", onResize)
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown)
+      window.removeEventListener("keydown", onKeyDown)
+      window.removeEventListener("scroll", onScroll, true)
+      window.removeEventListener("resize", onResize)
+    }
+  }, [cardRef, onClose])
+}
+
+/**
  * A baseline's own span: calendar days when it crosses days (matching how
  * all-day ranges read), hours when it starts and ends inside the same day.
  * A milestone's baseline is an instant - labeled as the milestone itself.
@@ -1174,33 +1748,7 @@ function BaselineHistoryPanel({
   onClose: () => void
 }) {
   const cardRef = useRef<HTMLDivElement | null>(null)
-
-  useEffect(() => {
-    cardRef.current?.focus()
-    const contains = (target: EventTarget | null) =>
-      target instanceof Node && cardRef.current?.contains(target) === true
-    const onPointerDown = (e: PointerEvent) => {
-      if (!contains(e.target)) onClose()
-    }
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose()
-    }
-    // capture: the gantt body scrolls in a nested ScrollArea viewport
-    const onScroll = (e: Event) => {
-      if (!contains(e.target)) onClose()
-    }
-    const onResize = () => onClose()
-    window.addEventListener("pointerdown", onPointerDown)
-    window.addEventListener("keydown", onKeyDown)
-    window.addEventListener("scroll", onScroll, true)
-    window.addEventListener("resize", onResize)
-    return () => {
-      window.removeEventListener("pointerdown", onPointerDown)
-      window.removeEventListener("keydown", onKeyDown)
-      window.removeEventListener("scroll", onScroll, true)
-      window.removeEventListener("resize", onResize)
-    }
-  }, [onClose])
+  usePanelClose(cardRef, onClose)
 
   const history = [...(event.data?.baselines ?? [])].sort(
     (a, b) => b.version - a.version,
@@ -1334,6 +1882,386 @@ function BaselineHistoryPanel({
 }
 
 /**
+ * «Registrar avance» dialog, anchored to the bar like the bitácora: the %
+ * travels to the recorder as an auditable UpdateOp (patch.progress); the
+ * optional AC goes to the host (`onCaptureActuals`) together with a bumped
+ * dataDate — AC is an ACCUMULATED value, so the entry REPLACES any prior
+ * one for the event. Shows the actuals cutoff in force and degrades
+ * honestly offline (% still records; AC stays in memory via App).
+ */
+function ProgressPanel({
+  event,
+  actuals,
+  canCaptureActuals,
+  anchor,
+  onCommit,
+  onClose,
+}: {
+  event: GanttEvent<EventData>
+  actuals?: ActualsPayload
+  canCaptureActuals: boolean
+  anchor: { x: number; y: number }
+  onCommit: (progress: number, ac: number | null) => void
+  onClose: () => void
+}) {
+  const cardRef = useRef<HTMLDivElement | null>(null)
+  usePanelClose(cardRef, onClose)
+  const currentAc = actuals?.acByEvent[event.id]
+  const [percentDraft, setPercentDraft] = useState(String(event.progress))
+  const [acDraft, setAcDraft] = useState(
+    currentAc !== undefined ? String(currentAc) : "",
+  )
+  const [error, setError] = useState<string | null>(null)
+
+  const parseNumber = (raw: string): number | null => {
+    const parsed = Number(raw.trim().replace(",", "."))
+    return raw.trim() !== "" && Number.isFinite(parsed) ? parsed : null
+  }
+
+  const commit = () => {
+    const percent = parseNumber(percentDraft)
+    if (percent === null || percent < 0 || percent > 100) {
+      setError(APP_STRINGS_ES.progressInvalidPercent)
+      return
+    }
+    let ac: number | null = null
+    if (acDraft.trim() !== "") {
+      const parsedAc = parseNumber(acDraft)
+      if (parsedAc === null || parsedAc < 0) {
+        setError(APP_STRINGS_ES.progressInvalidAc)
+        return
+      }
+      ac = parsedAc
+    }
+    if (ac !== null && !canCaptureActuals) ac = null
+    onCommit(percent, ac)
+  }
+
+  const left = Math.min(
+    Math.max(anchor.x, HISTORY_CARD_HALF_W + 8),
+    window.innerWidth - HISTORY_CARD_HALF_W - 8,
+  )
+
+  return (
+    <div
+      ref={cardRef}
+      role="dialog"
+      aria-label={APP_STRINGS_ES.progressDialogTitle}
+      tabIndex={-1}
+      data-slot="gantt-progress-panel"
+      className="bg-popover text-popover-foreground ring-ring/20 fixed z-50 w-max max-w-72 rounded-md py-2 text-xs shadow-md outline-none ring-1"
+      style={{ left, top: anchor.y, transform: "translateX(-50%)" }}
+      onPointerDown={(e) => e.stopPropagation()}
+    >
+      <div className="flex items-start justify-between gap-4 px-3 pb-1">
+        <span className="font-medium">{APP_STRINGS_ES.progressDialogTitle}</span>
+        <button
+          type="button"
+          aria-label={APP_STRINGS_ES.closePanel}
+          onClick={onClose}
+          className="text-muted-foreground hover:text-foreground -mr-1 rounded-sm p-1 outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+        >
+          <XIcon className="size-3.5" aria-hidden />
+        </button>
+      </div>
+      <div className="text-muted-foreground truncate px-3 pb-1 font-medium">
+        {event.title}
+      </div>
+      {actuals && (
+        <div className="text-muted-foreground whitespace-nowrap px-3 pb-1">
+          {APP_STRINGS_ES.progressDataDateLabel}:{" "}
+          {format(new Date(actuals.dataDate), "d MMM yyyy HH:mm", {
+            locale: LOCALE_ES,
+          })}
+        </div>
+      )}
+      <div className="flex flex-col gap-2 border-t px-3 pt-2">
+        <label className="flex items-center justify-between gap-3">
+          <span className="text-muted-foreground">
+            {APP_STRINGS_ES.progressPercentLabel}
+          </span>
+          <input
+            type="text"
+            inputMode="decimal"
+            data-slot="gantt-progress-percent"
+            value={percentDraft}
+            onChange={(e) => setPercentDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commit()
+            }}
+            aria-label={APP_STRINGS_ES.progressPercentLabel}
+            className="ring-ring/30 bg-background w-16 rounded-md py-0.5 text-center tabular-nums ring-1 outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          />
+        </label>
+        <label className="flex items-center justify-between gap-3">
+          <span className="text-muted-foreground">
+            {APP_STRINGS_ES.progressAcLabel}
+          </span>
+          <input
+            type="text"
+            inputMode="decimal"
+            data-slot="gantt-progress-ac"
+            value={acDraft}
+            onChange={(e) => setAcDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commit()
+            }}
+            placeholder={currentAc !== undefined ? String(currentAc) : "0"}
+            aria-label={APP_STRINGS_ES.progressAcLabel}
+            className="ring-ring/30 bg-background w-24 rounded-md py-0.5 text-right tabular-nums ring-1 outline-none placeholder:text-muted-foreground/60 focus-visible:ring-2 focus-visible:ring-ring/50"
+          />
+        </label>
+        {!canCaptureActuals && (
+          <p className="text-muted-foreground text-[10px]">
+            {APP_STRINGS_ES.progressOfflineHint}
+          </p>
+        )}
+        {error && <p className="text-destructive">{error}</p>}
+        <div className="flex items-center justify-end gap-1.5 pb-0.5">
+          <button
+            type="button"
+            onClick={onClose}
+            className="hover:bg-accent rounded-md px-2 py-1 outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          >
+            {APP_STRINGS_ES.progressCancel}
+          </button>
+          <button
+            type="button"
+            data-slot="gantt-progress-commit"
+            onClick={commit}
+            className="bg-primary text-primary-foreground rounded-md px-2 py-1 font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          >
+            {APP_STRINGS_ES.progressCommit}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * «Nivelar recursos» preview: the kernel's ops + report, frozen at open
+ * time. Aplicar pushes the ops through the recorder (auditable, whole-
+ * snapshot undoable) and mirrors the date moves into the engine; closing
+ * discards nothing but the proposal. Centered like a modal card - it is
+ * not anchored to any bar.
+ */
+function LevelingPanel({
+  result,
+  onApply,
+  onClose,
+}: {
+  result: LevelingResult
+  onApply: () => void
+  onClose: () => void
+}) {
+  const cardRef = useRef<HTMLDivElement | null>(null)
+  const anchor = useMemo(
+    () => ({ x: window.innerWidth / 2, y: Math.max(96, window.innerHeight * 0.18) }),
+    [],
+  )
+  usePanelClose(cardRef, onClose)
+  const { report } = result
+  const endDeltaDays =
+    report.projectEndBefore && report.projectEndAfter
+      ? Math.round(
+          (Date.parse(report.projectEndAfter) -
+            Date.parse(report.projectEndBefore)) /
+            86_400_000,
+        )
+      : 0
+
+  return (
+    <div
+      ref={cardRef}
+      role="dialog"
+      aria-label={APP_STRINGS_ES.levelingTitle}
+      tabIndex={-1}
+      data-slot="gantt-leveling-panel"
+      className="bg-popover text-popover-foreground ring-ring/20 fixed z-50 w-max max-w-md rounded-md py-2 text-xs shadow-md outline-none ring-1"
+      style={{ left: anchor.x, top: anchor.y, transform: "translateX(-50%)" }}
+      onPointerDown={(e) => e.stopPropagation()}
+    >
+      <div className="flex items-start justify-between gap-4 px-3 pb-1">
+        <span className="font-medium">{APP_STRINGS_ES.levelingTitle}</span>
+        <button
+          type="button"
+          aria-label={APP_STRINGS_ES.closePanel}
+          onClick={onClose}
+          className="text-muted-foreground hover:text-foreground -mr-1 rounded-sm p-1 outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+        >
+          <XIcon className="size-3.5" aria-hidden />
+        </button>
+      </div>
+      {result.ops.length === 0 ? (
+        <p className="text-muted-foreground px-3 pb-1">
+          {APP_STRINGS_ES.levelingNoop}
+        </p>
+      ) : (
+        <>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 pb-1.5">
+            <span className="font-medium tabular-nums">
+              {APP_STRINGS_ES.levelingMoved(report.movedEvents)}
+            </span>
+            <span className="text-muted-foreground tabular-nums">
+              {APP_STRINGS_ES.levelingRuns(
+                report.resolvedRuns,
+                report.unresolvedRuns,
+              )}
+            </span>
+            <span
+              className={cn(
+                "font-medium tabular-nums",
+                endDeltaDays > 0 && "text-destructive",
+                endDeltaDays <= 0 && "text-emerald-600 dark:text-emerald-400",
+              )}
+            >
+              {APP_STRINGS_ES.levelingEndDelta(endDeltaDays)}
+            </span>
+          </div>
+          <pre
+            data-slot="gantt-leveling-ops"
+            className="bg-muted mx-3 max-h-48 overflow-auto rounded-md p-2 text-[10px] leading-snug"
+          >
+            {JSON.stringify(result.ops, null, 2)}
+          </pre>
+          <div className="mt-1 flex items-center justify-end gap-1.5 border-t px-3 pt-1.5">
+            <button
+              type="button"
+              onClick={onClose}
+              className="hover:bg-accent rounded-md px-2 py-1 outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            >
+              {APP_STRINGS_ES.progressCancel}
+            </button>
+            <button
+              type="button"
+              data-slot="gantt-leveling-apply"
+              onClick={onApply}
+              className="bg-primary text-primary-foreground rounded-md px-2 py-1 font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            >
+              {APP_STRINGS_ES.levelingApply}
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+/**
+ * «Duración…» dialog, anchored to the bar like the other floating panels:
+ * an integer of WORKING days re-seats the END from the live start over the
+ * event's own calendar (corrido without one). The draft opens at the
+ * event's current duration in working days (same rounding as the bitácora),
+ * so what you see is what a commit replaces.
+ */
+function DurationPanel({
+  event,
+  resolve,
+  anchor,
+  onCommit,
+  onClose,
+}: {
+  event: GanttEvent<EventData>
+  resolve?: CalendarResolver
+  anchor: { x: number; y: number }
+  onCommit: (days: number) => void
+  onClose: () => void
+}) {
+  const cardRef = useRef<HTMLDivElement | null>(null)
+  usePanelClose(cardRef, onClose)
+  const cal = resolve?.(event.id) ?? null
+  const currentDays = Math.max(
+    1,
+    workingDaysBetween(cal, event.start.getTime(), event.end.getTime()),
+  )
+  const [draft, setDraft] = useState(String(currentDays))
+  const [error, setError] = useState<string | null>(null)
+
+  const commit = () => {
+    const parsed = Number.parseInt(draft.trim(), 10)
+    if (!Number.isFinite(parsed) || parsed < 1) {
+      setError(APP_STRINGS_ES.durationInvalid)
+      return
+    }
+    onCommit(parsed)
+  }
+
+  const left = Math.min(
+    Math.max(anchor.x, HISTORY_CARD_HALF_W + 8),
+    window.innerWidth - HISTORY_CARD_HALF_W - 8,
+  )
+
+  return (
+    <div
+      ref={cardRef}
+      role="dialog"
+      aria-label={APP_STRINGS_ES.durationDialogTitle}
+      tabIndex={-1}
+      data-slot="gantt-duration-panel"
+      className="bg-popover text-popover-foreground ring-ring/20 fixed z-50 w-max max-w-72 rounded-md py-2 text-xs shadow-md outline-none ring-1"
+      style={{ left, top: anchor.y, transform: "translateX(-50%)" }}
+      onPointerDown={(e) => e.stopPropagation()}
+    >
+      <div className="flex items-start justify-between gap-4 px-3 pb-1">
+        <span className="font-medium">{APP_STRINGS_ES.durationDialogTitle}</span>
+        <button
+          type="button"
+          aria-label={APP_STRINGS_ES.closePanel}
+          onClick={onClose}
+          className="text-muted-foreground hover:text-foreground -mr-1 rounded-sm p-1 outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+        >
+          <XIcon className="size-3.5" aria-hidden />
+        </button>
+      </div>
+      <div className="text-muted-foreground truncate px-3 pb-1 font-medium">
+        {event.title}
+      </div>
+      <div className="flex flex-col gap-2 border-t px-3 pt-2">
+        <label className="flex items-center justify-between gap-3">
+          <span className="text-muted-foreground">
+            {APP_STRINGS_ES.durationDaysLabel}
+          </span>
+          <input
+            type="text"
+            inputMode="numeric"
+            data-slot="gantt-duration-days"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commit()
+            }}
+            aria-label={APP_STRINGS_ES.durationDaysLabel}
+            className="ring-ring/30 bg-background w-16 rounded-md py-0.5 text-center tabular-nums ring-1 outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          />
+        </label>
+        <p className="text-muted-foreground text-[10px]">
+          {APP_STRINGS_ES.durationHint}
+        </p>
+        {error && <p className="text-destructive">{error}</p>}
+        <div className="flex items-center justify-end gap-1.5 pb-0.5">
+          <button
+            type="button"
+            onClick={onClose}
+            className="hover:bg-accent rounded-md px-2 py-1 outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          >
+            {APP_STRINGS_ES.progressCancel}
+          </button>
+          <button
+            type="button"
+            data-slot="gantt-duration-commit"
+            onClick={commit}
+            className="bg-primary text-primary-foreground rounded-md px-2 py-1 font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          >
+            {APP_STRINGS_ES.durationCommit}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/**
  * Floating card for a clicked connector: names both ends, the constraint
  * type (and lag), and edits the edge's SHAPE - a segmented FS/SS/FF/SF
  * control plus a signed lag stepper (negative = overlap/lead). Every
@@ -1351,6 +2279,7 @@ function DependencyPanel({
   mark,
   deps,
   events,
+  resolve,
   point,
   onUpdate,
   onRemove,
@@ -1359,6 +2288,7 @@ function DependencyPanel({
   mark: GanttDependencyMark
   deps: readonly PlanDependency[]
   events: GanttEvent<EventData>[]
+  resolve?: CalendarResolver
   point: { x: number; y: number }
   onUpdate: (dep: PlanDependency) => void
   onRemove: () => void
@@ -1376,10 +2306,11 @@ function DependencyPanel({
   const predEv = events.find((ev) => ev.id === dep?.fromEventId)
   const succEv = events.find((ev) => ev.id === dep?.toEventId)
   // Lag EFECTIVO: leído de las fechas vivas de ambos extremos (misma
-  // matemática que snapToDependency, convención inversa). Es lo que el
-  // panel muestra y la base de los steppers, así un drag manual de
-  // cualquiera de las barras se refleja acá al soltar — el documento solo
-  // cambia cuando el usuario confirma una edición.
+  // matemática que snapToDependency, convención inversa; en laborables del
+  // SUCESOR cuando hay calendario). Es lo que el panel muestra y la base
+  // de los steppers, así un drag manual de cualquiera de las barras se
+  // refleja acá al soltar — el documento solo cambia cuando el usuario
+  // confirma una edición.
   const effectiveLag = useMemo(
     () =>
       dep && predEv && succEv
@@ -1387,9 +2318,10 @@ function DependencyPanel({
             dep,
             { start: predEv.start, end: predEv.end },
             { start: succEv.start, end: succEv.end },
+            resolve?.(succEv.id) ?? null,
           )
         : (dep?.lagDays ?? 0),
-    [dep, predEv, succEv],
+    [dep, predEv, succEv, resolve],
   )
   // Draft of the lag input: committed on blur/Enter/steppers, never
   // mid-typing. Re-synced from the EFFECTIVE lag whenever it moves (a
@@ -1402,30 +2334,7 @@ function DependencyPanel({
     setLagDraft(String(effectiveLag))
   }
 
-  useEffect(() => {
-    const contains = (target: EventTarget | null) =>
-      target instanceof Node && cardRef.current?.contains(target) === true
-    const onPointerDown = (e: PointerEvent) => {
-      if (!contains(e.target)) onClose()
-    }
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose()
-    }
-    const onScroll = (e: Event) => {
-      if (!contains(e.target)) onClose()
-    }
-    const onResize = () => onClose()
-    window.addEventListener("pointerdown", onPointerDown)
-    window.addEventListener("keydown", onKeyDown)
-    window.addEventListener("scroll", onScroll, true)
-    window.addEventListener("resize", onResize)
-    return () => {
-      window.removeEventListener("pointerdown", onPointerDown)
-      window.removeEventListener("keydown", onKeyDown)
-      window.removeEventListener("scroll", onScroll, true)
-      window.removeEventListener("resize", onResize)
-    }
-  }, [onClose])
+  usePanelClose(cardRef, onClose)
 
   if (!dep) return null
   const titleOf = (id: string) =>

@@ -27,10 +27,14 @@ export interface ServerConfig {
   port: number
   host: "127.0.0.1"
   /**
-   * Identity that stamps CR `requestedBy`/`decidedBy`. No auth exists yet
-   * (public rate-limited demo); a real identity arrives with the IA agent.
+   * Identity that stamps CR `requestedBy`/`decidedBy` when no session is
+   * present (defensive fallback only — sessions are the real identity).
    */
   defaultActor: string
+  /** HMAC key for the `gantt_session` cookie. Rotating it kills sessions. */
+  sessionSecret: string
+  /** Shared login passcode (one per deployment, not per user). */
+  actorPasscode: string
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
@@ -43,10 +47,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`PORT must be an integer 1..65535, got "${env.PORT}"`)
   }
+  const sessionSecret = env.SESSION_SECRET?.trim() ?? ""
+  if (!sessionSecret) {
+    throw new Error("SESSION_SECRET is required (see server/.env.example)")
+  }
+  const actorPasscode = env.ACTOR_PASSCODE?.trim() ?? ""
+  if (!actorPasscode) {
+    throw new Error("ACTOR_PASSCODE is required (see server/.env.example)")
+  }
   return {
     databaseUrl,
     port,
     host: "127.0.0.1",
     defaultActor: env.DEFAULT_ACTOR?.trim() || "demo-actor",
+    sessionSecret,
+    actorPasscode,
   }
 }

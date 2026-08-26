@@ -47,6 +47,18 @@ import {
   type UmeWorkforceEntity,
 } from "../src/lib/umejson/workforce.ts"
 import {
+  buildCalendarEntity,
+  decodeCalendar,
+  type UmeCalendarEntity,
+} from "../src/lib/umejson/calendar.ts"
+import {
+  addWorkingDays,
+  buildResolver,
+  isWorkingDay,
+  workingDaysBetween,
+} from "../src/lib/umejson/working-time.ts"
+import { buildDemoCalendar } from "../src/data/demo-calendar.ts"
+import {
   buildChangeRequestEntity,
   buildImpactSnapshot,
   createChangeRequest,
@@ -61,6 +73,16 @@ import { PLAN } from "../src/data/plan-departamento.ts"
 import { DEMO_PLAN_ID, buildDemoEntity } from "../src/data/demo-entity.ts"
 import { buildDemoBudget } from "../src/data/demo-contables.ts"
 import { buildDemoWorkforce } from "../src/data/demo-workforce.ts"
+import {
+  eventOverloadDays,
+  levelPlan,
+  overallocations,
+} from "../src/lib/umejson/leveling.ts"
+import {
+  buildTimesheetEntity,
+  decodeTimesheet,
+  transitionEntry,
+} from "../src/lib/umejson/timesheet.ts"
 import type { PlanJSON } from "../src/lib/plan-types.ts"
 
 const fails: string[] = []
@@ -1921,6 +1943,792 @@ for (const [label, input] of rejectionCases) {
     if (implied !== -2) fail(`implied-lag: round-trip ${type}`, String(implied))
     else ok(`implied-lag: implied(snap(lag)) === lag (${type})`)
   }
+}
+
+// ---- 26. Working-time: helpers de día laborable ----------------------------
+{
+  const t = (days: number) => Date.parse(ISO) + days * 86_400_000
+  // ISO (2026-01-12) cae LUNES: t(0)=lun, t(4)=vie, t(5)=sáb, t(7)=lun.
+  const monFri = { id: "c1", title: "Lun–Vie", workWeek: [false, true, true, true, true, true, false] as const, exceptions: {} }
+  const cal = { ...monFri, workWeek: [...monFri.workWeek], exceptions: { ...monFri.exceptions } }
+
+  // null = corrido EXACTO: byte-igual a la aritmética que reemplaza.
+  if (addWorkingDays(null, t(0), 3) !== t(3)) fail("wt: addWorkingDays null corrido", "differs")
+  else ok("wt: addWorkingDays(null) is exact corrido arithmetic")
+  if (workingDaysBetween(null, t(0), t(2.4)) !== Math.round((t(2.4) - t(0)) / 86_400_000)) {
+    fail("wt: between null rounding", String(workingDaysBetween(null, t(0), t(2.4))))
+  } else ok("wt: workingDaysBetween(null) matches driftDays rounding")
+
+  // Firmado sobre fines de semana: +1 desde viernes aterriza lunes.
+  if (addWorkingDays(cal, t(4), 1) !== t(7)) fail("wt: fri+1 → lun", String(addWorkingDays(cal, t(4), 1)))
+  else ok("wt: addWorkingDays skips the weekend (fri +1 → mon)")
+  if (addWorkingDays(cal, t(0), -1) !== t(-3)) fail("wt: mon-1 → vie", String(addWorkingDays(cal, t(0), -1)))
+  else ok("wt: addWorkingDays backward lands on the prior friday")
+  // n=0 convención de asiento: sábado se sienta en lunes; lunes queda igual.
+  if (addWorkingDays(cal, t(5), 0) !== t(7)) fail("wt: seat sat→mon", String(addWorkingDays(cal, t(5), 0)))
+  else ok("wt: addWorkingDays n=0 seats an off day onto the next working day")
+  if (addWorkingDays(cal, t(0), 0) !== t(0)) fail("wt: seat working day unchanged", "moved")
+  else ok("wt: addWorkingDays n=0 keeps a working instant")
+  // Excepciones: feriado miércoles empuja +1 al jueves; sábado trabajado cuenta.
+  const hol = { ...cal, exceptions: { [new Date(t(1)).toISOString().slice(0, 10)]: false, [new Date(t(5)).toISOString().slice(0, 10)]: true } }
+  if (addWorkingDays(hol, t(0), 1) !== t(2)) fail("wt: feriado skipped", String(addWorkingDays(hol, t(0), 1)))
+  else ok("wt: exception feriado is skipped by the step")
+  if (addWorkingDays(hol, t(4), 1) !== t(5)) fail("wt: worked saturday counts", String(addWorkingDays(hol, t(4), 1)))
+  else ok("wt: worked-saturday exception counts as a working day")
+  if (!isWorkingDay(cal, t(1)) || isWorkingDay(cal, t(5))) fail("wt: isWorkingDay weekly pattern", "wrong")
+  else ok("wt: isWorkingDay follows the weekly pattern")
+
+  // Conteo firmado: jue→vie+lun = 2 laborables (corrido serían 4).
+  if (workingDaysBetween(cal, t(3), t(7)) !== 2 || workingDaysBetween(cal, t(7), t(3)) !== -2) {
+    fail("wt: between signed weekend bridge", `${workingDaysBetween(cal, t(3), t(7))}/${workingDaysBetween(cal, t(7), t(3))}`)
+  } else ok("wt: workingDaysBetween counts the thu→mon bridge as 2, signed")
+}
+
+// ---- 27. Kernels con calendario: cascada, snap/implied, CPM, drift ---------
+{
+  const t = (days: number) => Date.parse(ISO) + days * 86_400_000
+  const dayIso = (days: number) => new Date(t(days)).toISOString()
+  // Lun–Vie puro (el ancla cae lunes).
+  const cal = {
+    id: "c1",
+    title: "Lun–Vie",
+    workWeek: [false, true, true, true, true, true, false] as boolean[],
+    exceptions: {} as Record<string, boolean>,
+  }
+  // El mismo con UN feriado: el miércoles de la semana del ancla (puente).
+  const calBridge = {
+    ...cal,
+    exceptions: { [dayIso(2).slice(0, 10)]: false } as Record<string, boolean>,
+  }
+  const resolve = (_eventId: string) => cal
+  const resolveBridge = (_eventId: string) => calBridge
+  const planOf = (events: Array<{ id: string; s: number; e: number }>, lag?: number): PlanJSON => ({
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: events.map((x) => ({ id: x.id, resourceId: "r", start: dayIso(x.s), end: dayIso(x.e), progress: 0 })),
+    dependencies: [
+      { id: "d1", fromEventId: "a", toEventId: "b", type: "FS", ...(lag !== undefined ? { lagDays: lag } : {}) },
+    ],
+  })
+
+  // Cascada sobre un puente festivo: A termina martes; B sentado temprano
+  // es empujado AL JUEVES (el feriado no cuenta como asiento ni como día).
+  {
+    const adj = cascadeSchedule(planOf([{ id: "a", s: 0, e: 2 }, { id: "b", s: 0, e: 2 }]), ["a"], resolveBridge)[0]
+    if (!adj || adj.eventId !== "b" || adj.start !== dayIso(3) || adj.end !== dayIso(5)) {
+      fail("wt-cascade: seats past the holiday", JSON.stringify(adj))
+    } else if (adj.cause.shiftDays !== 2) {
+      fail("wt-cascade: shift in WORKING days", String(adj.cause.shiftDays))
+    } else ok("wt-cascade: FS over a holiday seats on the next working day (+2 laborables)")
+    // Mismo plan SIN resolver: corrido byte-idéntico (mar t2, fin t4, +2 d).
+    const plain = cascadeSchedule(planOf([{ id: "a", s: 0, e: 2 }, { id: "b", s: 0, e: 2 }]), ["a"])[0]
+    if (!plain || plain.start !== dayIso(2) || plain.end !== dayIso(4) || plain.cause.shiftDays !== 2) {
+      fail("wt-cascade: null mode unchanged", JSON.stringify(plain))
+    } else ok("wt-cascade: null resolver reproduces the corrido cascade exactly")
+  }
+
+  // snap/implied round-trip en laborables: FS lag +2 desde un fin de
+  // semana cruza al lunes siguiente y la lectura devuelve 2.
+  for (const type of ["FS", "SS", "FF", "SF"] as const) {
+    const plan: PlanJSON = {
+      schemaVersion: 2,
+      anchor: ISO,
+      phases: [],
+      resources: [{ id: "r", title: "R" }],
+      events: [
+        { id: "a", resourceId: "r", start: dayIso(0), end: dayIso(2), progress: 0 },
+        { id: "b", resourceId: "r", start: dayIso(10), end: dayIso(14), progress: 0 },
+      ],
+      dependencies: [{ id: "d", fromEventId: "a", toEventId: "b", type, lagDays: -2 }],
+    }
+    const dep = plan.dependencies![0]!
+    const snap = snapToDependency(plan, dep, resolve)
+    if (!snap) {
+      fail(`wt-snap: round-trip ${type}`, "snap produced nothing")
+      continue
+    }
+    const seated: PlanJSON = {
+      ...plan,
+      events: plan.events.map((e) =>
+        e.id === "b" ? { ...e, start: snap.start, end: snap.end } : e,
+      ),
+    }
+    const implied = impliedLagDays(
+      dep,
+      { start: seated.events[0]!.start, end: seated.events[0]!.end },
+      { start: seated.events[1]!.start, end: seated.events[1]!.end },
+      resolve(seated.events[1]!.id),
+    )
+    if (implied !== -2) fail(`wt-snap: implied(snap(lag)) === lag (${type})`, String(implied))
+    else ok(`wt-snap: working-time round-trip (${type})`)
+  }
+  // Y sin calendario el snap es corrido histórico: FS lag −2 desde un fin
+  // en martes aterriza domingo por la noche (t0), feriados invisibles.
+  {
+    const plan: PlanJSON = {
+      schemaVersion: 2,
+      anchor: ISO,
+      phases: [],
+      resources: [{ id: "r", title: "R" }],
+      events: [
+        { id: "a", resourceId: "r", start: dayIso(0), end: dayIso(2), progress: 0 },
+        { id: "b", resourceId: "r", start: dayIso(10), end: dayIso(14), progress: 0 },
+      ],
+      dependencies: [{ id: "d", fromEventId: "a", toEventId: "b", type: "FS", lagDays: -2 }],
+    }
+    const plain = snapToDependency(plan, plan.dependencies![0]!)
+    if (!plain || plain.start !== dayIso(0)) fail("wt-snap: null mode corrido", JSON.stringify(plain))
+    else ok("wt-snap: null resolver keeps the corrido seat exactly")
+  }
+
+  // CPM con calendario: el lag del vínculo corre en laborables del
+  // sucesor, así A solo banca UN laborable (martes) antes de correr a B;
+  // corrido la misma cadena lee 3.
+  {
+    const r = cpmSchedule(planOf([{ id: "a", s: 0, e: 2 }, { id: "b", s: 7, e: 10 }], 2), resolve)
+    if (r.floatDays.get("a") !== 1 || r.floatDays.get("b") !== 0 || !r.critical.has("b")) {
+      fail("wt-cpm: float in working days", JSON.stringify([...r.floatDays]))
+    } else ok("wt-cpm: float reads in WORKING days of the event's own calendar")
+    const plainR = cpmSchedule(planOf([{ id: "a", s: 0, e: 2 }, { id: "b", s: 7, e: 10 }], 2))
+    if (plainR.floatDays.get("a") !== 3) {
+      fail("wt-cpm: null mode corrido float", JSON.stringify([...plainR.floatDays]))
+    } else ok("wt-cpm: without calendar the same chain reads corrido (3)")
+  }
+
+  // driftDays laborable: jue→lun son 2 laborables (4 corridos).
+  if (driftDays(dayIso(7), dayIso(3), cal) !== 2 || driftDays(dayIso(7), dayIso(3)) !== 4) {
+    fail("wt-drift: working driftDays", `${driftDays(dayIso(7), dayIso(3), cal)}/${driftDays(dayIso(7), dayIso(3))}`)
+  } else ok("wt-drift: driftDays counts 2 laborables over a weekend, 4 corridos without calendar")
+
+  // Impact snapshot congelado en laborables: b referencia viernes-instante
+  // (t4) y propone lunes (t7): el fin de semana no cuenta → 1 laborable;
+  // corrido serían 3.
+  {
+    const plan = planOf([{ id: "a", s: 0, e: 3 }, { id: "b", s: 3, e: 4 }])
+    const ops: ChangeOp[] = [{ op: "update", id: "b", patch: { start: dayIso(6), end: dayIso(7) } }]
+    const snapWt = buildImpactSnapshot(plan, ops, undefined, resolve)
+    const bWt = snapWt.entries.find((e) => e.eventId === "b")
+    if (bWt?.driftDays !== 1) fail("wt-impact: frozen drift in working days", JSON.stringify(bWt))
+    else ok("wt-impact: impact snapshot freezes drift in WORKING days")
+    const snapPlain = buildImpactSnapshot(plan, ops)
+    if (snapPlain.entries.find((e) => e.eventId === "b")?.driftDays !== 3) {
+      fail("wt-impact: null mode corrido drift", JSON.stringify(snapPlain.entries))
+    } else ok("wt-impact: without resolver the snapshot stays corrido")
+  }
+}
+
+// ---- 28. GanttCalendar: hermana decodifica + demo carga limpia -------------
+{
+  const entity: UmeCalendarEntity = buildCalendarEntity({
+    id: "00000000-0000-4000-8000-000000000005",
+    planEntityId: "plan-1",
+    planAnchor: ISO,
+    calendar: {
+      schemaVersion: 1,
+      calendars: [
+        {
+          id: "c1",
+          title: "Obra",
+          workWeek: [false, true, true, true, true, true, false],
+          exceptions: { "2026-01-16": false },
+        },
+      ],
+      defaultCalendarId: "c1",
+      assignmentByEvent: { e1: { calendarId: "c1" } },
+    },
+  })
+  const d = decodeCalendar(entity, fixturePlan, "plan-1")
+  if (!d.ok) fail("calendar: happy path", d.errors[0]?.message ?? "rejected")
+  else if (d.calendar.defaultCalendarId !== "c1") fail("calendar: round-trip", "payload differs")
+  else ok("calendar: decodes with plan binding (round-trip)")
+
+  const patched = (patch: Record<string, unknown>): unknown => ({
+    ...entity,
+    dynamicProperties: { calendar: { ...entity.dynamicProperties.calendar, ...patch } },
+  })
+  const rejects: Array<[string, unknown]> = [
+    ["workWeek of 6", patched({ calendars: [{ id: "c1", title: "X", workWeek: [true, true, true, true, true, true], exceptions: {} }] })],
+    ["all-false workWeek", patched({ calendars: [{ id: "c1", title: "X", workWeek: [false, false, false, false, false, false, false], exceptions: {} }] })],
+    ["unknown default", patched({ defaultCalendarId: "ghost" })],
+    ["ghost assignment", patched({ assignmentByEvent: { e1: { calendarId: "ghost" } } })],
+    ["non-ISO exception key", patched({ calendars: [{ id: "c1", title: "X", workWeek: [false, true, true, true, true, true, false], exceptions: { "2026-13-45": false } }] })],
+    ["duplicate calendar id", patched({ calendars: [
+      { id: "c1", title: "A", workWeek: [false, true, true, true, true, true, false], exceptions: {} },
+      { id: "c1", title: "B", workWeek: [false, true, true, true, true, true, false], exceptions: {} },
+    ] })],
+    ["assignment to unknown event", patched({ assignmentByEvent: { ghost: { calendarId: "c1" } } })],
+  ]
+  for (const [label, input] of rejects) {
+    const dd = decodeCalendar(input, label.includes("unknown event") ? fixturePlan : undefined)
+    if (dd.ok) fail(`reject calendar: ${label}`, "decoder accepted it")
+    else ok(`reject calendar: ${label}`)
+  }
+  const wrongRel: unknown = {
+    ...entity,
+    relations: [{ targetEntity: "GanttPlan", targetId: "other-plan", type: "one-to-one" }],
+  }
+  if (decodeCalendar(wrongRel, fixturePlan, "plan-1").ok) fail("reject calendar: bound to other plan", "accepted")
+  else ok("reject calendar: bound to other plan")
+
+  // Demo: la hermana decodifica contra PLAN y el grafo sembrado carga
+  // LIMPIO bajo su propio calendario — cada dependencia ya descansa en su
+  // borde (snap null ⇔ sin violación), ninguna barra arranca en día
+  // inhábil y al menos una cruza un fin de semana (el salto visible).
+  const demoEntity = buildDemoCalendar(PLAN, DEMO_PLAN_ID)
+  const dDemo = decodeCalendar(demoEntity, PLAN, DEMO_PLAN_ID)
+  if (!dDemo.ok) {
+    fail("demo: calendar decodes against PLAN", dDemo.errors[0]?.message ?? "rejected")
+  } else {
+    const resolver = buildResolver(dDemo.calendar)
+    const atBound = PLAN.dependencies!.every(
+      (dep) => snapToDependency(PLAN, dep, resolver) === null,
+    )
+    if (!atBound) fail("demo: deps load clean under the demo calendar", "some edge sits off its bound")
+    else ok(`demo: all ${PLAN.dependencies!.length} seeded deps sit exactly at their bounds (working time)`)
+    const badStart = PLAN.events.filter((e) => !isWorkingDay(resolver(e.id), Date.parse(e.start)))
+    if (badStart.length) fail("demo: every event starts on a working day", badStart.map((e) => e.id).join(","))
+    else ok("demo: every seeded event starts on a working day")
+    const spansWeekend = PLAN.events.some((e) =>
+      workingDaysBetween(resolver(e.id), Date.parse(e.start), Date.parse(e.end)) <
+      Math.round((Date.parse(e.end) - Date.parse(e.start)) / 86_400_000)
+    )
+    if (!spansWeekend) fail("demo: some event visibly spans a weekend", "none found")
+    else ok("demo: the plan shows the weekend jump live (span > working days)")
+    const before = JSON.parse(JSON.stringify(PLAN))
+    buildDemoCalendar(PLAN, DEMO_PLAN_ID)
+    if (!deepEqual(PLAN, before)) fail("demo: calendar builder purity", "PLAN mutated")
+    else ok("demo: calendar builder leaves PLAN untouched")
+  }
+}
+
+// ---- 29. Avance real: patch.progress auditable ------------------------------
+{
+  const t = (days: number) => Date.parse(ISO) + days * 86_400_000
+  const dayIso = (days: number) => new Date(t(days)).toISOString()
+  const plan: PlanJSON = {
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: [
+      { id: "a", resourceId: "r", start: dayIso(0), end: dayIso(4), progress: 20 },
+      { id: "b", resourceId: "r", start: dayIso(0), end: dayIso(4), progress: 0 },
+    ],
+  }
+
+  // applyOps aplica el % y deja el resto intacto.
+  {
+    const next = applyOps(plan, [
+      { op: "update", id: "a", patch: { start: dayIso(0), end: dayIso(4), progress: 55 } },
+    ])
+    if (next.events[0]?.progress !== 55 || next.events[0].start !== dayIso(0)) {
+      fail("progress: applyOps applies percent", JSON.stringify(next.events[0]))
+    } else ok("progress: applyOps applies the captured percent")
+  }
+  // Op de fechas solamente NUNCA sintetiza progress (aditivo como kind).
+  {
+    const next = applyOps(plan, [
+      { op: "update", id: "a", patch: { start: dayIso(1), end: dayIso(5) } },
+    ])
+    if (next.events[0]?.progress !== 20) fail("progress: dates-only keeps prior", JSON.stringify(next.events[0]))
+    else ok("progress: dates-only op leaves the stored percent untouched")
+  }
+  // Merge con drag/kind a nivel codec: drag (kind milestone) + avance
+  // posterior en la MISMA secuencia conservan ambos campos.
+  {
+    const dragged = applyOps(plan, [
+      { op: "update", id: "b", patch: { start: dayIso(3), end: dayIso(3), kind: "milestone" } },
+    ])
+    const merged = applyOps(dragged, [
+      { op: "update", id: "b", patch: { start: dayIso(3), end: dayIso(3), kind: "milestone", progress: 70 } },
+    ])
+    const b = merged.events.find((e) => e.id === "b")
+    if (
+      b?.kind !== "milestone" || b.progress !== 70 ||
+      b.start !== dayIso(3) || b.end !== dayIso(3)
+    ) {
+      fail("progress: merge with kind conversion", JSON.stringify(b))
+    } else ok("progress: drag+conversion+percent all ride one document state")
+    // Toggle back to task drops kind but KEEPS the recorded percent.
+    const back = applyOps(merged, [
+      { op: "update", id: "b", patch: { start: dayIso(3), end: dayIso(7), kind: "task", progress: 70 } },
+    ])
+    const b2 = back.events.find((e) => e.id === "b")
+    if (!b2 || "kind" in b2 || b2.progress !== 70) {
+      fail("progress: toggle back keeps percent, drops kind", JSON.stringify(b2))
+    } else ok("progress: conversion back drops kind, keeps the percent")
+  }
+
+  // CR decoder rejections: 101, −1 y "mucho".
+  {
+    const base = buildChangeRequestEntity({
+      payload: createChangeRequest({
+        planEntityId: "plan-1",
+        planAnchor: plan.anchor,
+        planRevision: 1,
+        basePlan: plan,
+        ops: [{ op: "update", id: "a", patch: { start: dayIso(0), end: dayIso(4), progress: 50 } }],
+      }),
+    })
+    const happy = decodeChangeRequest(base, plan, "plan-1")
+    if (!happy.ok) fail("progress: cr decodes valid percent", happy.errors[0]?.message ?? "rejected")
+    else ok("progress: CR carries a valid percent through the border")
+    const withProgress = (v: unknown): unknown => ({
+      ...base,
+      dynamicProperties: {
+        changeRequest: {
+          ...base.dynamicProperties.changeRequest,
+          ops: [{ op: "update", id: "a", patch: { start: dayIso(0), end: dayIso(4), progress: v } }],
+        },
+      },
+    })
+    for (const [label, v] of [["101", 101], ["−1", -1], ["mucho", "mucho"], ["NaN-ish", Number.POSITIVE_INFINITY]] as const) {
+      if (decodeChangeRequest(withProgress(v)).ok) fail(`reject progress: ${label}`, "accepted")
+      else ok(`reject progress: ${label}`)
+    }
+  }
+
+  // El snapshot NO cambia de drift por un avance: mismas entradas/fechas
+  // que sin el patch de progress (el % no mueve nada).
+  {
+    const opsDates: ChangeOp[] = [{ op: "update", id: "a", patch: { start: dayIso(5), end: dayIso(9) } }]
+    const withPct: ChangeOp[] = [
+      ...opsDates,
+      { op: "update", id: "b", patch: { start: dayIso(0), end: dayIso(4), progress: 99 } },
+    ]
+    const snapA = buildImpactSnapshot(plan, opsDates)
+    const snapB = buildImpactSnapshot(plan, withPct)
+    const aEntry = snapB.entries.find((e) => e.eventId === "a")
+    const bEntry = snapB.entries.find((e) => e.eventId === "b")
+    if (!deepEqual(snapA.entries, snapB.entries.filter((e) => e.eventId !== "b"))) {
+      fail("progress-impact: dates drift unchanged", JSON.stringify(snapB.entries))
+    } else if (snapB.entries.length !== 2 || bEntry?.driftDays !== 0) {
+      fail("progress-impact: progress seed drifts nothing", JSON.stringify(bEntry))
+    } else ok("progress-impact: percent never perturbs the frozen drift")
+  }
+}
+
+// ---- 25. updateResource + priority aditivo (Ola 1B/2A) -------------------
+{
+  const t = (days: number) => new Date(Date.parse(ISO) + days * 86_400_000).toISOString()
+
+  // (a) applyOps: título y responsable se aplican por id; un patch parcial
+  // NUNCA sintetiza el campo ausente; id desconocido = no-op puro.
+  const resPlan: PlanJSON = {
+    ...fixturePlan,
+    resources: [
+      { id: "root", title: "Root" },
+      { id: "child", title: "Child", parentId: "root", responsable: "Alguien" },
+    ],
+    events: [{ id: "e1", resourceId: "child", start: t(0), end: t(3), progress: 0 }],
+  }
+  const renamed = applyOps(resPlan, [
+    { op: "updateResource", id: "child", patch: { title: "Hijo" } },
+  ])
+  const child = renamed.resources.find((r) => r.id === "child")
+  if (!child || child.title !== "Hijo" || child.responsable !== "Alguien") {
+    fail("updateResource: partial patch keeps untouched keys", JSON.stringify(child))
+  } else ok("updateResource: partial patch keeps untouched keys")
+  if (!deepEqual(renamed.events, resPlan.events)) {
+    fail("updateResource: events untouched", JSON.stringify(renamed.events))
+  } else ok("updateResource: events untouched")
+  const ghost = applyOps(resPlan, [
+    { op: "updateResource", id: "nope", patch: { title: "X" } },
+  ])
+  if (!deepEqual(ghost, resPlan)) {
+    fail("updateResource: unknown id is a pure no-op", JSON.stringify(ghost.resources))
+  } else ok("updateResource: unknown id is a pure no-op")
+  const both = applyOps(resPlan, [
+    { op: "updateResource", id: "child", patch: { title: "Hijo", responsable: "Nadie" } },
+  ])
+  const child2 = both.resources.find((r) => r.id === "child")
+  if (!child2 || child2.title !== "Hijo" || child2.responsable !== "Nadie") {
+    fail("updateResource: full patch applies every key", JSON.stringify(child2))
+  } else ok("updateResource: full patch applies every key")
+
+  // (b) Round-trip BYTE-IDÉNTICO: sin ops de recurso, `resources` nunca se
+  // reconstruye; con uno, aplicar → encodear → re-aplicar → re-encodear es
+  // estable (el punto fijo del codec).
+  const noResOps = applyOps(resPlan, [
+    { op: "update", id: "e1", patch: { start: t(1), end: t(4), progress: 50 } },
+  ])
+  if (JSON.stringify(noResOps.resources) !== JSON.stringify(resPlan.resources)) {
+    fail("updateResource: resource-free ops keep resources byte-identical", "resources rebuilt")
+  } else ok("updateResource: resource-free ops keep resources byte-identical")
+  const entityOut1 = { ...fixtureEntity, dynamicProperties: { plan: renamed } }
+  const dec1 = decodeUmePlan(entityOut1)
+  if (!dec1.ok) fail("updateResource: renamed document decodes", dec1.errors[0]?.message ?? "rejected")
+  else {
+    const again = applyOps(dec1.plan, [
+      { op: "updateResource", id: "child", patch: { title: "Hijo" } },
+    ])
+    if (JSON.stringify(again) !== JSON.stringify(dec1.plan)) {
+      fail("updateResource: re-apply is a fixed point", "documents differ")
+    } else ok("updateResource: apply→decode→re-apply is byte-identical")
+  }
+
+  // (c) Fold-by-key del recorder: dos renombres seguidos son UN op con el
+  // último título (la semántica que ChangesetRecorder garantiza).
+  const folded = applyOps(resPlan, [
+    { op: "updateResource", id: "child", patch: { title: "Uno" } },
+    { op: "updateResource", id: "child", patch: { title: "Dos" } },
+  ])
+  const child3 = folded.resources.find((r) => r.id === "child")
+  if (!child3 || child3.title !== "Dos") {
+    fail("updateResource: later op wins the fold", JSON.stringify(child3))
+  } else ok("updateResource: later op wins the fold")
+
+  // (d) priority aditivo: válido cuando es entero 1..1000; rechazado fuera
+  // de rango o no entero; ausente sigue siendo la forma canónica.
+  const prio = (v: unknown): unknown => ({
+    ...fixtureEntity,
+    dynamicProperties: {
+      plan: {
+        ...fixturePlan,
+        events: [{ id: "e1", resourceId: "child", start: t(0), end: t(3), progress: 0, ...(v === undefined ? {} : { priority: v }) }],
+      },
+    },
+  })
+  if (!decodeUmePlan(prio(500)).ok) fail("priority: decode accepts integer", "rejected")
+  else ok("priority: decode accepts integer in range")
+  for (const [label, v] of [["0", 0], ["1001", 1001], ["medio", 2.5], ["texto", "alta"]] as const) {
+    if (decodeUmePlan(prio(v)).ok) fail(`reject priority: ${label}`, "accepted")
+    else ok(`reject priority: ${label}`)
+  }
+  if (!decodeUmePlan(prio(undefined)).ok) fail("priority: absent stays valid", "rejected")
+  else ok("priority: absent stays valid")
+}
+
+// ---- 26. Nivelación: demanda, sobrecarga y levelPlan (Ola 2A) ------------
+{
+  const t = (days: number) => new Date(Date.parse(ISO) + days * 86_400_000).toISOString()
+
+  // (a) Detección: dos eventos paralelos de la misma cuadrilla de 1 → una
+  // corrida de sobrecarga [d0..d2], pico 2, exceso 3 persona-días.
+  const wf = (headcount: number): WorkforcePayload => ({
+    schemaVersion: 1,
+    crews: [{ id: "C", title: "Cuadrilla C", specialty: "obra", headcount, dayRate: 900 }],
+    assignmentByEvent: {
+      a: { crewId: "C", headcount: 1 },
+      b: { crewId: "C", headcount: 1 },
+    },
+  })
+  const parallel: PlanJSON = {
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: [
+      { id: "a", resourceId: "r", start: t(0), end: t(3), progress: 0, priority: 1000 },
+      { id: "b", resourceId: "r", start: t(0), end: t(3), progress: 0, priority: 1 },
+    ],
+  }
+  const runs0 = overallocations(parallel, wf(1))
+  if (
+    runs0.length !== 1 ||
+    runs0[0].from !== t(0).slice(0, 10) + "T00:00:00.000Z" ||
+    runs0[0].peak !== 2 ||
+    runs0[0].excessPersonDays !== 3
+  ) {
+    fail("leveling: detects the known run", JSON.stringify(runs0))
+  } else ok("leveling: detects the known overallocation run")
+  const overloadMap = eventOverloadDays(parallel, wf(1))
+  if (overloadMap.get("a") !== 3 || overloadMap.get("b") !== 3) {
+    fail("leveling: per-event overload days", JSON.stringify([...overloadMap]))
+  } else ok("leveling: per-event heatmap days count every overloaded day")
+
+  // (b) levelPlan: prioridad ALTA se empuja primero (orden del plan);
+  // duración preservada; el resultado limpia TODAS las sobrecargas.
+  const lv = levelPlan(parallel, wf(1))
+  if (lv.ops.length !== 1 || lv.ops[0].id !== "a") {
+    fail("leveling: highest priority is the victim", JSON.stringify(lv.ops))
+  } else if (lv.ops[0].op !== "update" || lv.ops[0].patch.start !== t(3) || lv.ops[0].patch.end !== t(6)) {
+    fail("leveling: seat past the run keeps duration", JSON.stringify(lv.ops[0]))
+  } else ok("leveling: victim seats past the run with duration preserved")
+  if (overallocations(lv.ops.length ? applyOps(parallel, lv.ops) : parallel, wf(1)).length !== 0) {
+    fail("leveling: applying ops clears overallocations", "still overloaded")
+  } else ok("leveling: applying the ops clears every overallocation")
+  if (lv.report.movedEvents !== 1 || lv.report.resolvedRuns !== 1 || lv.report.unresolvedRuns !== 0) {
+    fail("leveling: report counts", JSON.stringify(lv.report))
+  } else ok("leveling: report counts one move and one resolved run")
+
+  // (c) Cascada documentada: el dependiente FS del empujado viaja con cause.
+  const chained: PlanJSON = {
+    ...parallel,
+    events: [
+      ...parallel.events,
+      { id: "c", resourceId: "r", start: t(4), end: t(7), progress: 0 },
+    ],
+    dependencies: [{ id: "d1", fromEventId: "a", toEventId: "c", type: "FS" }],
+  }
+  const lvChain = levelPlan(chained, wf(1))
+  const cOp = lvChain.ops.find((o) => o.id === "c")
+  if (
+    !cOp || cOp.op !== "update" ||
+    cOp.cause?.kind !== "dependency-cascade" ||
+    cOp.cause.sourceEventId !== "a"
+  ) {
+    fail("leveling: cascade op carries documented cause", JSON.stringify(cOp))
+  } else ok("leveling: dependent cascade rides its documented cause")
+
+  // (d) Hitos nunca son víctimas aunque tengan cuadrilla asignada.
+  const withMs: PlanJSON = {
+    ...parallel,
+    events: [
+      { id: "m", resourceId: "r", start: t(3), end: t(3), progress: 0, kind: "milestone" as const },
+      ...parallel.events,
+    ],
+    dependencies: [],
+  }
+  const wfM: WorkforcePayload = {
+    ...wf(1),
+    assignmentByEvent: {
+      ...wf(1).assignmentByEvent,
+      m: { crewId: "C", headcount: 2 },
+    },
+  }
+  const lvMs = levelPlan(withMs, wfM)
+  if (lvMs.ops.some((o) => o.id === "m")) {
+    fail("leveling: milestones are never victims", JSON.stringify(lvMs.ops))
+  } else ok("leveling: a milestone never becomes the victim")
+
+  // (e) Capacidad suficiente = cero ops, reporte limpio.
+  const lvNone = levelPlan(parallel, wf(4))
+  if (lvNone.ops.length !== 0 || lvNone.report.iterations !== 0) {
+    fail("leveling: roomy capacity levels nothing", JSON.stringify(lvNone))
+  } else ok("leveling: roomy capacity produces no ops")
+}
+
+// ---- 27. StatusDate + convenciones + free float (Ola 2B) -----------------
+{
+  const t = (days: number) => new Date(Date.parse(ISO) + days * 86_400_000).toISOString()
+
+  // Plan con avance FUERA de secuencia: A empezó antes del corte y va al
+  // 50%; su sucesor B arrancó antes del fin de A (violación viva).
+  const base: PlanJSON = {
+    schemaVersion: 2,
+    anchor: ISO,
+    statusDate: t(10),
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: [
+      { id: "a", resourceId: "r", start: t(0), end: t(5), progress: 50 },
+      { id: "b", resourceId: "r", start: t(3), end: t(8), progress: 0 },
+    ],
+    dependencies: [{ id: "d", fromEventId: "a", toEventId: "b", type: "FS" }],
+    schedulingOptions: { outOfSequence: "retainedLogic" },
+  }
+
+  // (a) Retained logic: B se sienta desde el fin VIVO de A conservando SU
+  // duración (5 d) → t(5)..t(10).
+  const retained = cascadeSchedule(base, ["a"])
+  if (
+    retained.length !== 1 ||
+    retained[0].eventId !== "b" ||
+    retained[0].start !== t(5) ||
+    retained[0].end !== t(10)
+  ) {
+    fail("statusDate: retained logic seats from the live finish", JSON.stringify(retained))
+  } else ok("statusDate: retained logic keeps B's duration from the live finish")
+
+  // (b) Progress override: el asiento PISA el corte y B conserva solo la
+  // fracción restante (0% aquí → duración completa desplazada a t(10)).
+  const overridePlan: PlanJSON = {
+    ...base,
+    schedulingOptions: { outOfSequence: "progressOverride" },
+  }
+  const override = cascadeSchedule(overridePlan, ["a"])
+  if (
+    override.length !== 1 ||
+    override[0].eventId !== "b" ||
+    override[0].start !== t(10) ||
+    override[0].end !== t(15)
+  ) {
+    fail("statusDate: override floors at the cutoff", JSON.stringify(override))
+  } else ok("statusDate: override seats at the cutoff with remaining duration")
+  // Distintas convenciones → fechas distintas sobre el MISMO plan.
+  if (retained[0]?.start === override[0]?.start) {
+    fail("statusDate: conventions diverge", "identical results")
+  } else ok("statusDate: retained vs override produce different dates")
+
+  // (c) Frozen actuals: A (progress>0, empezó antes del corte) NUNCA se
+  // mueve aunque sea la semilla; sus sucesores sí se re-evalúan.
+  if (cascadeSchedule(base, ["a"]).some((adj) => adj.eventId === "a")) {
+    fail("statusDate: frozen actuals never move", "A moved")
+  } else ok("statusDate: frozen actual stays put")
+
+  // (d) Free float: cadena holgada A→B (B planeado tarde): A puede
+  // deslizarse 3 días sin empujar a B; B cierra contra el fin del proyecto.
+  const slackChain: PlanJSON = {
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: [
+      { id: "a", resourceId: "r", start: t(0), end: t(2), progress: 0 },
+      { id: "b", resourceId: "r", start: t(5), end: t(7), progress: 0 },
+    ],
+    dependencies: [{ id: "d", fromEventId: "a", toEventId: "b", type: "FS" }],
+  }
+  const cpmSlack = cpmSchedule(slackChain)
+  if (cpmSlack.freeFloatDays.get("a") !== 3 || cpmSlack.freeFloatDays.get("b") !== 0) {
+    fail(
+      "statusDate: free float counts unpushed slip",
+      JSON.stringify([...cpmSlack.freeFloatDays]),
+    )
+  } else ok("statusDate: free float = slip that pushes nobody (a=3, b=0)")
+
+  // (e) updatePlanSettings: fold, drop canónico y round-trip byte-idéntico.
+  const withStatus: PlanJSON = { ...fixturePlan, statusDate: t(10) }
+  const cleared = applyOps(withStatus, [
+    { op: "updatePlanSettings", patch: { statusDate: null } },
+  ])
+  if ("statusDate" in cleared) {
+    fail("settings: null patch drops the field", JSON.stringify(cleared.statusDate))
+  } else ok("settings: null patch drops statusDate (canonical absence)")
+  const setBoth = applyOps(fixturePlan, [
+    { op: "updatePlanSettings", patch: { statusDate: t(10), schedulingOptions: { outOfSequence: "progressOverride" } } },
+    { op: "updatePlanSettings", patch: { schedulingOptions: { outOfSequence: "retainedLogic" } } },
+  ])
+  if (
+    setBoth.statusDate !== t(10) ||
+    setBoth.schedulingOptions?.outOfSequence !== "retainedLogic"
+  ) {
+    fail("settings: last write wins per field", JSON.stringify({ s: setBoth.statusDate, o: setBoth.schedulingOptions }))
+  } else ok("settings: per-field fold, last write wins")
+  const entitySettings: unknown = { ...fixtureEntity, dynamicProperties: { plan: setBoth } }
+  const decSet = decodeUmePlan(entitySettings)
+  if (!decSet.ok) fail("settings: document decodes", decSet.errors[0]?.message ?? "rejected")
+  else {
+    const again = applyOps(decSet.plan, [
+      { op: "updatePlanSettings", patch: { schedulingOptions: { outOfSequence: "retainedLogic" } } },
+    ])
+    if (JSON.stringify(again) !== JSON.stringify(decSet.plan)) {
+      fail("settings: re-apply is a fixed point", "documents differ")
+    } else ok("settings: apply→decode→re-apply is byte-identical")
+  }
+
+  // (f) EVM: el corte resuelve actuals.dataDate ?? plan.statusDate ?? now.
+  const evmBudget = { schemaVersion: 1 as const, currency: "MXN", bacByEvent: { a: 100 } }
+  const evmActualsNoDate = {
+    schemaVersion: 1 as const,
+    dataDate: "",
+    planAnchor: ISO,
+    acByEvent: {},
+  }
+  const evmWithStatus = computeEvm(
+    { ...slackChain, statusDate: t(9) },
+    evmBudget,
+    evmActualsNoDate,
+  )
+  if (evmWithStatus.dataDate !== t(9)) {
+    fail("statusDate: EVM falls back to plan.statusDate", evmWithStatus.dataDate)
+  } else ok("statusDate: EVM dataDate resolves from the plan when actuals lack one")
+}
+
+// ---- 28. Timesheets: decode + transiciones (Ola 3B) ----------------------
+{
+  const t = (days: number) => new Date(Date.parse(ISO) + days * 86_400_000).toISOString()
+  const tsPlan: PlanJSON = {
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: [{ id: "e1", resourceId: "r", start: t(0), end: t(3), progress: 0 }],
+  }
+  const payload = (over: Record<string, unknown>): unknown => ({
+    id: "00000000-0000-4000-8000-0000000000e1",
+    entityName: "GanttTimesheet",
+    dynamicProperties: {
+      timesheet: {
+        schemaVersion: 1,
+        weekOf: ISO,
+        entries: [
+          {
+            id: "x1",
+            actor: "Ing. Ríos",
+            date: t(0),
+            eventId: "e1",
+            hours: 8,
+            status: "draft",
+            ...over,
+          },
+        ],
+      },
+    },
+    lifecycle: {
+      createdAt: ISO,
+      updatedAt: ISO,
+      deletedAt: null,
+      version: 1,
+    },
+    relations: [
+      { targetEntity: "GanttPlan", targetId: "plan-1", type: "many-to-one" },
+    ],
+    state: { current: "draft", statusLog: [{ status: "draft", timestamp: ISO }] },
+    markdownDocumentation: "# parte",
+  })
+
+  const happy = decodeTimesheet(payload({}), tsPlan, "plan-1")
+  if (!happy.ok) fail("timesheet: valid entry decodes", happy.errors[0]?.message ?? "rejected")
+  else ok("timesheet: valid entry decodes")
+
+  // Refs y rangos.
+  for (const [label, over] of [
+    ["unknown event", { eventId: "ghost" }],
+    ["zero hours", { hours: 0 }],
+    ["25h day", { hours: 25 }],
+    ["date outside window", { date: t(200) }],
+    ["duplicate handled by second row", null],
+    ["bad status", { status: "approved?" }],
+  ] as const) {
+    if (label === "duplicate handled by second row") continue
+    const doc = payload(over as Record<string, unknown>)
+    if (decodeTimesheet(doc, tsPlan, "plan-1").ok) fail(`reject timesheet: ${label}`, "accepted")
+    else ok(`reject timesheet: ${label}`)
+  }
+  const dupDoc = payload({}) as { dynamicProperties: { timesheet: { entries: unknown[] } } }
+  dupDoc.dynamicProperties.timesheet.entries.push({
+    ...dupDoc.dynamicProperties.timesheet.entries[0],
+  })
+  if (decodeTimesheet(dupDoc, tsPlan, "plan-1").ok) fail("reject timesheet: duplicate entry id", "accepted")
+  else ok("reject timesheet: duplicate entry id")
+
+  // Transiciones: draft → submitted → approved | rejected; approved terminal;
+  // saltos ilegales → null (misma disciplina que transitionChangeRequest).
+  const e: import("../src/lib/umejson/timesheet.ts").TimesheetEntry = {
+    id: "x", actor: "a", date: t(0), eventId: "e1", hours: 8, status: "draft",
+  }
+  if (transitionEntry(e, "approved") !== null) fail("timesheet: draft→approved illegal", "allowed")
+  else ok("timesheet: draft→approved is illegal")
+  const submitted = transitionEntry(e, "submitted")
+  if (!submitted || submitted.status !== "submitted") fail("timesheet: draft→submitted", JSON.stringify(submitted))
+  else ok("timesheet: draft→submitted is legal")
+  const approved = submitted ? transitionEntry(submitted, "approved") : null
+  if (!approved || approved.status !== "approved") fail("timesheet: submitted→approved", JSON.stringify(approved))
+  else ok("timesheet: submitted→approved is legal")
+  if (transitionEntry(approved!, "rejected") !== null || transitionEntry(approved!, "submitted") !== null) {
+    fail("timesheet: approved is terminal", "moved")
+  } else ok("timesheet: approved is terminal")
+
+  // Round-trip del builder: encodear → decodificar es estable.
+  const entity = buildTimesheetEntity({
+    id: "00000000-0000-4000-8000-0000000000e2",
+    planEntityId: "plan-1",
+    planAnchor: ISO,
+    timesheet: {
+      schemaVersion: 1,
+      weekOf: ISO,
+      entries: [{ id: "y1", actor: "b", date: t(1), eventId: "e1", hours: 4.5, status: "submitted" }],
+    },
+  })
+  const rt = decodeTimesheet(entity, tsPlan, "plan-1")
+  if (!rt.ok) fail("timesheet: builder output decodes", rt.errors[0]?.message ?? "rejected")
+  else if (JSON.stringify(rt.timesheet) !== JSON.stringify(entity.dynamicProperties.timesheet)) {
+    fail("timesheet: builder round-trips byte-identical", "payload differs")
+  } else ok("timesheet: builder round-trip is stable")
 }
 
 if (fails.length) {

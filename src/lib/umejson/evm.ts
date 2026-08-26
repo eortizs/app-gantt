@@ -19,6 +19,7 @@
 // imports it verbatim, same as every other contract module.
 import type { PlanJSON } from "../plan-types.ts"
 import { vigenteBaseline } from "./baselines.ts"
+import { workingDaysBetween, type WorkingCalendar } from "./working-time.ts"
 import type { BudgetPayload } from "./budget.ts"
 import type { ActualsPayload } from "./actuals.ts"
 
@@ -54,16 +55,29 @@ export interface EvmResult {
   project: EvmEventMetrics
 }
 
-/** Uniform PV fraction of one window earned by the data date, clamped. */
+/**
+ * Uniform PV fraction of one window earned by the data date, clamped.
+ * With `cal` the window phases over its WORKING days (earned = working
+ * days elapsed inside the window ÷ total working days of the window);
+ * null = linear over the corrido span, byte-equal to the old formula.
+ */
 export function pvFraction(
   dataDateMs: number,
   startMs: number,
   endMs: number,
+  cal?: WorkingCalendar | null,
 ): number {
   const span = endMs - startMs
   if (span <= 0) return dataDateMs >= endMs ? 1 : 0
-  const fraction = (dataDateMs - startMs) / span
-  return Math.min(1, Math.max(0, fraction))
+  if (!cal) {
+    const fraction = (dataDateMs - startMs) / span
+    return Math.min(1, Math.max(0, fraction))
+  }
+  const total = workingDaysBetween(cal, startMs, endMs)
+  if (total <= 0) return dataDateMs >= endMs ? 1 : 0
+  const earnedThrough = Math.min(Math.max(dataDateMs, startMs), endMs)
+  const earned = workingDaysBetween(cal, startMs, earnedThrough)
+  return Math.min(1, Math.max(0, earned / total))
 }
 
 const metricsOf = (
@@ -95,8 +109,18 @@ export function computeEvm(
   plan: PlanJSON,
   budget: BudgetPayload,
   actuals: ActualsPayload,
+  resolve?: (eventId: string) => WorkingCalendar | null,
 ): EvmResult {
-  const dataDateMs = Date.parse(actuals.dataDate)
+  // Cutoff resolution order (documented): the actuals' own dataDate wins;
+  // without a usable one the plan's statusDate stands in; last resort is
+  // "now" (an empty/invalid actuals cutoff must never NaN every metric).
+  const dataDateMs = (() => {
+    const fromActuals = Date.parse(actuals.dataDate)
+    if (Number.isFinite(fromActuals)) return fromActuals
+    const fromPlan = plan.statusDate ? Date.parse(plan.statusDate) : NaN
+    if (Number.isFinite(fromPlan)) return fromPlan
+    return Date.now()
+  })()
   const byEvent = new Map<string, EvmEventMetrics>()
   let bac = 0
   let pv = 0
@@ -115,7 +139,9 @@ export function computeEvm(
         : vigente
     const startMs = Date.parse(anchored?.start ?? event.start)
     const endMs = Date.parse(anchored?.end ?? event.end)
-    const eventPv = eventBac * pvFraction(dataDateMs, startMs, endMs)
+    // PV phases over the event's OWN working days when a calendar backs
+    // the plan; corrido-linear otherwise.
+    const eventPv = eventBac * pvFraction(dataDateMs, startMs, endMs, resolve?.(event.id) ?? null)
     const eventEv = eventBac * (event.progress / 100)
     const eventAc = actuals.acByEvent[event.id] ?? 0
     byEvent.set(event.id, metricsOf(eventBac, eventPv, eventEv, eventAc))
@@ -125,7 +151,7 @@ export function computeEvm(
     ac += eventAc
   }
   return {
-    dataDate: actuals.dataDate,
+    dataDate: new Date(dataDateMs).toISOString(),
     currency: budget.currency,
     byEvent,
     project: metricsOf(bac, pv, ev, ac),

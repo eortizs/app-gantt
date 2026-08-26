@@ -7,6 +7,7 @@
 // decoder the client uses. Node >= 22.18 runs them natively via
 // type-stripping, no transpiler.
 import Fastify, { type FastifyError, type FastifyInstance, type FastifyReply } from "fastify"
+import { timingSafeEqual } from "node:crypto"
 import type { Pool } from "pg"
 import { loadConfig } from "./config.ts"
 import { createPool } from "./db/pool.ts"
@@ -26,6 +27,8 @@ import type { UmeJsonLifecycle, UmeJsonState, ValidationError } from "../../src/
 import { ENTITY_NAME_BUDGET, decodeBudget, type BudgetPayload } from "../../src/lib/umejson/budget.ts"
 import { ENTITY_NAME_ACTUALS, decodeActuals } from "../../src/lib/umejson/actuals.ts"
 import { ENTITY_NAME_WORKFORCE, decodeWorkforce } from "../../src/lib/umejson/workforce.ts"
+import { ENTITY_NAME_CALENDAR, decodeCalendar } from "../../src/lib/umejson/calendar.ts"
+import { buildResolver, type CalendarResolver } from "../../src/lib/umejson/working-time.ts"
 import type { PlanJSON } from "../../src/lib/plan-types.ts"
 import { applyOps, type ChangeOp } from "../../src/lib/umejson/codec.ts"
 import {
@@ -36,6 +39,15 @@ import {
   ENTITY_NAME_CHANGE_REQUEST,
   type ChangeRequestPayload,
 } from "../../src/lib/umejson/change-request.ts"
+import {
+  clearSessionCookie,
+  createSessionToken,
+  registerSession,
+  requireRole,
+  setSessionCookie,
+  type ActorRole,
+} from "./auth.ts"
+import { registerTimesheets } from "./timesheets.ts"
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
@@ -165,9 +177,14 @@ function registerEntity<T extends StorableEntity>(
       if (!UUID_RE.test(planId)) return reply.code(404).send({ error: "not found" })
       const row = await getLatestForPlan(pool, planId, spec.entityName)
       if (!row) return reply.code(404).send({ error: "not found" })
+      // The stored revision rides the header so a client that edits the
+      // sibling (e.g. actuals capture) can PUT with a real expectedRevision.
+      void reply.header("x-ume-revision", row.revision)
       return row.document
     })
     app.put(base, async (req, reply) => {
+      // Writes demand a session (editor or above); GETs stay public.
+      if (!requireRole(req, reply, "editor" satisfies ActorRole)) return reply
       const { planId } = req.params as { planId: string }
       if (!UUID_RE.test(planId)) return reply.code(404).send({ error: "not found" })
       await handlePut(spec, pool, planId, req.body, reply)
@@ -182,9 +199,11 @@ function registerEntity<T extends StorableEntity>(
       if (!row) return reply.code(404).send({ error: "not found" })
       // Persisted documents are clean (sentinels were stamped on save);
       // the stored bytes are returned verbatim.
+      void reply.header("x-ume-revision", row.revision)
       return row.document
     })
     app.put(base, async (req, reply) => {
+      if (!requireRole(req, reply, "editor" satisfies ActorRole)) return reply
       const { id } = req.params as { id: string }
       if (!UUID_RE.test(id)) return reply.code(404).send({ error: "not found" })
       await handlePut(spec, pool, id, req.body, reply)
@@ -209,6 +228,18 @@ async function liveBudgetFor(pool: Pool, planId: string, plan: PlanJSON): Promis
   if (!row) return undefined
   const decoded = decodeBudget(row.document, plan, planId)
   return decoded.ok ? decoded.budget : undefined
+}
+
+/**
+ * Working-time resolver of the plan's calendar sibling, when one decodes.
+ * Feeds the CR impact snapshot so drift freezes in WORKING days; a missing
+ * or malformed sibling degrades to corrido (null-endowed kernels).
+ */
+async function calendarResolverFor(pool: Pool, planId: string, plan: PlanJSON): Promise<CalendarResolver | undefined> {
+  const row = await getLatestForPlan(pool, planId, ENTITY_NAME_CALENDAR)
+  if (!row) return undefined
+  const decoded = decodeCalendar(row.document, plan, planId)
+  return decoded.ok ? buildResolver(decoded.calendar) : undefined
 }
 
 /** Next CR document: payload swapped, envelope bumped, statusLog appended. */
@@ -258,6 +289,56 @@ function withPlanPayload(
   return cloned
 }
 
+function registerAuth(app: FastifyInstance, pool: Pool, config: { sessionSecret: string; actorPasscode: string }): void {
+  // Directorio público: alimenta el picker del login (sin secretos).
+  app.get("/api/auth/actors", async () => {
+    const { rows } = await pool.query<{
+      id: string
+      name: string
+      role: ActorRole
+    }>("SELECT id, name, role FROM actors ORDER BY name")
+    return rows
+  })
+
+  // Login: passcode compartido + actor elegido → cookie firmada 12h.
+  app.post("/api/auth/login", async (req, reply) => {
+    const body = req.body as { actorId?: unknown; passcode?: unknown }
+    if (
+      typeof body?.actorId !== "string" ||
+      typeof body?.passcode !== "string"
+    ) {
+      return reply.code(400).send({ error: "body must be { actorId, passcode }" })
+    }
+    const a = Buffer.from(body.passcode)
+    const b = Buffer.from(config.actorPasscode)
+    const okPasscode = a.length === b.length && timingSafeEqual(a, b)
+    if (!okPasscode) {
+      return reply.code(401).send({ error: "invalid passcode or actor" })
+    }
+    const { rows } = await pool.query<{ id: string; name: string; role: ActorRole }>(
+      "SELECT id, name, role FROM actors WHERE id = $1",
+      [body.actorId],
+    )
+    const actor = rows[0]
+    if (!actor) {
+      return reply.code(401).send({ error: "invalid passcode or actor" })
+    }
+    setSessionCookie(
+      reply,
+      createSessionToken(actor.id, Date.now(), config.sessionSecret),
+    )
+    return { id: actor.id, name: actor.name, role: actor.role }
+  })
+
+  app.post("/api/auth/logout", async (_req, reply) => {
+    clearSessionCookie(reply)
+    return { ok: true }
+  })
+
+  // ¿Quién soy? null = visitante anónimo (modo visor implícito).
+  app.get("/api/auth/me", async (req) => ({ actor: req.actor }))
+}
+
 function registerChangeRequests(app: FastifyInstance, pool: Pool, defaultActor: string): void {
   // Cola del plan: documentos completos, created_at DESC, filtro opcional
   // por estado promovido (alimenta el índice parcial ume_cr_queue).
@@ -277,6 +358,7 @@ function registerChangeRequests(app: FastifyInstance, pool: Pool, defaultActor: 
   // en el borde como check defensivo (ops con targets inexistentes de un
   // cliente con vista vencida → 422) y persiste con status "proposed".
   app.post("/api/plans/:planId/change-requests", async (req, reply) => {
+    if (!requireRole(req, reply, "editor")) return reply
     const { planId } = req.params as { planId: string }
     if (!UUID_RE.test(planId)) return reply.code(404).send({ error: "not found" })
     const body = req.body as { ops?: unknown; reason?: unknown }
@@ -293,6 +375,7 @@ function registerChangeRequests(app: FastifyInstance, pool: Pool, defaultActor: 
       return reply.code(422).send({ errors: decodedPlan.errors })
     }
     const budget = await liveBudgetFor(pool, planId, decodedPlan.plan)
+    const resolve = await calendarResolverFor(pool, planId, decodedPlan.plan)
     const reason = typeof body.reason === "string" ? body.reason.trim() : undefined
     const cr = createChangeRequest({
       planEntityId: planId,
@@ -301,13 +384,15 @@ function registerChangeRequests(app: FastifyInstance, pool: Pool, defaultActor: 
       basePlan: decodedPlan.plan,
       ops: body.ops as ChangeOp[],
       ...(budget ? { budget } : {}),
+      ...(resolve ? { resolve } : {}),
       ...(reason ? { reason } : {}),
     })
     const entity = buildChangeRequestEntity({ payload: cr })
     const checked = decodeChangeRequest(entity, decodedPlan.plan, planId)
     if (!checked.ok) return reply.code(422).send({ errors: checked.errors })
     const now = new Date().toISOString()
-    const document = stampChangeRequestSentinels(entity, now, defaultActor)
+    const actor = req.actor?.name ?? defaultActor
+    const document = stampChangeRequestSentinels(entity, now, actor)
     const outcome = await putEntity(pool, {
       entityName: ENTITY_NAME_CHANGE_REQUEST,
       entity: document as StorableEntity,
@@ -329,6 +414,8 @@ function registerChangeRequests(app: FastifyInstance, pool: Pool, defaultActor: 
   // binding de revisión (mismatch → 409, la CR queda approved y hay que
   // re-proponer) y escribe plan + CR en UNA transacción.
   app.post("/api/change-requests/:id/decision", async (req, reply) => {
+    // Decidir/aplicar es la acción más sensible: solo el aprobador.
+    if (!requireRole(req, reply, "aprobador")) return reply
     const { id } = req.params as { id: string }
     if (!UUID_RE.test(id)) return reply.code(404).send({ error: "not found" })
     const body = req.body as { to?: unknown; reason?: unknown }
@@ -355,7 +442,7 @@ function registerChangeRequests(app: FastifyInstance, pool: Pool, defaultActor: 
       const document = stampChangeRequestSentinels(
         withCrPayload(crRow.document, next, now, nextVersion),
         now,
-        defaultActor,
+        req.actor?.name ?? defaultActor,
       )
       const checked = decodeChangeRequest(document)
       if (!checked.ok) return reply.code(422).send({ errors: checked.errors })
@@ -403,7 +490,7 @@ function registerChangeRequests(app: FastifyInstance, pool: Pool, defaultActor: 
     const crDoc = stampChangeRequestSentinels(
       withCrPayload(crRow.document, next, now, nextVersion),
       now,
-      defaultActor,
+      req.actor?.name ?? defaultActor,
     )
     const checkedCr = decodeChangeRequest(crDoc)
     if (!checkedCr.ok) return reply.code(422).send({ errors: checkedCr.errors })
@@ -461,6 +548,9 @@ async function main(): Promise<void> {
     reply.code(status).send({ error: err.message })
   })
 
+  // Identidad: cookie firmada → request.actor (null = visitante).
+  await registerSession(app, pool, config.sessionSecret)
+
   app.get("/api/health", async (_req, reply) => {
     try {
       const { rows } = await pool.query<{ revision: string | number }>(
@@ -503,7 +593,22 @@ async function main(): Promise<void> {
     siblingMount: "workforce",
   })
 
+  registerEntity(app, pool, {
+    entityName: ENTITY_NAME_CALENDAR,
+    decode: (input) =>
+      decodeCalendar(input) as { ok: true; entity: StorableEntity } | { ok: false; errors: ValidationError[] },
+    planEntityIdOf: (entity) => entity.relations?.[0]?.targetId ?? null,
+    siblingMount: "calendar",
+  })
+
   registerChangeRequests(app, pool, config.defaultActor)
+
+  registerAuth(app, pool, {
+    sessionSecret: config.sessionSecret,
+    actorPasscode: config.actorPasscode,
+  })
+
+  registerTimesheets(app, pool)
 
   await app.listen({ port: config.port, host: config.host })
 

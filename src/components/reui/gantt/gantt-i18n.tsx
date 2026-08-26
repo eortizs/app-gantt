@@ -56,6 +56,8 @@ interface GanttI18nConfig {
     announceConnected: (fromTitle: string, toTitle: string) => string
     /** Screen-reader message when a connect drop is blocked (cycle / dup / self). */
     announceConnectBlocked: (fromTitle: string) => string
+    /** Aria-label of an active inline title input (tree row). */
+    editTitle: (currentTitle: string) => string
     scales: {
       day: string
       week: string
@@ -129,6 +131,7 @@ const DEFAULT_LABELS: GanttI18nConfig["labels"] = {
   connectHandleTitle: "Drag to another task to link a dependency",
   announceConnected: (from, to) => `Dependency created: ${from} → ${to}`,
   announceConnectBlocked: (from) => `Cannot link ${from}: would close a cycle, already exists, or points to the same task`,
+  editTitle: (current) => `Edit title: ${current}`,
   scales: {
     day: "Day",
     week: "Week",

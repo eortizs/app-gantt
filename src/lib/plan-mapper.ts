@@ -9,15 +9,18 @@ import type {
   PlanJSON,
   PlanResource,
 } from "@/lib/plan-types"
+import { addWorkingDays, type WorkingCalendar } from "@/lib/umejson/working-time"
+
+/** Status label derived from an event's own progress (single source). */
+export function progressStatus(progress: number): string {
+  if (progress >= 100) return "Terminado"
+  if (progress > 0) return "En curso"
+  return "Pendiente"
+}
 
 export function toGanttEvents(plan: PlanJSON): GanttEvent<EventData>[] {
   const byId = new Map(plan.resources.map((r) => [r.id, r]))
   const phaseColorById = new Map(plan.phases.map((p) => [p.id, p.color]))
-  const statusFor = (progress: number): string => {
-    if (progress >= 100) return "Terminado"
-    if (progress > 0) return "En curso"
-    return "Pendiente"
-  }
   return plan.events.map((e) => {
     const phaseId = resolvePhaseId(e.resourceId, byId) ?? ""
     const resource = byId.get(e.resourceId)
@@ -42,7 +45,7 @@ export function toGanttEvents(plan: PlanJSON): GanttEvent<EventData>[] {
       data: {
         responsable: resource?.responsable ?? "—",
         fase: phaseId,
-        status: statusFor(e.progress),
+        status: progressStatus(e.progress),
         // Original dates: the drift anchor for tasks that never captured
         // a baseline. Kept in EventData (not PlanEvent) so the bitácora
         // stays append-only and «Reiniciar plan» re-stamps fresh ones.
@@ -126,12 +129,12 @@ function titleize(id: string): string {
     .join(" ")
 }
 
-const DAY_MS = 86_400_000
-
 /**
  * A constraint is violated when the successor sits EARLIER than the
  * constraint demands (FS/SS bound the start; FF/SF bound the end). Only
  * forward violations count - extra slack is healthy float, not a problem.
+ * `cal` is the SUCCESSOR's calendar: its lag counts working days and its
+ * bound seats on working days, matching what the cascade would demand.
  */
 function isViolated(
   dep: PlanDependency,
@@ -139,18 +142,19 @@ function isViolated(
   fromEndMs: number,
   toStartMs: number,
   toEndMs: number,
+  cal?: WorkingCalendar | null,
 ): boolean {
-  const lag = (dep.lagDays ?? 0) * DAY_MS
+  const lag = dep.lagDays ?? 0
   switch (dep.type) {
     case "SS":
-      return toStartMs < fromStartMs + lag
+      return toStartMs < addWorkingDays(cal ?? null, fromStartMs, lag)
     case "FF":
-      return toEndMs < fromEndMs + lag
+      return toEndMs < addWorkingDays(cal ?? null, fromEndMs, lag)
     case "SF":
-      return toEndMs < fromStartMs + lag
+      return toEndMs < addWorkingDays(cal ?? null, fromStartMs, lag)
     case "FS":
     default:
-      return toStartMs < fromEndMs + lag
+      return toStartMs < addWorkingDays(cal ?? null, fromEndMs, lag)
   }
 }
 
@@ -159,11 +163,13 @@ function isViolated(
  * LIVE event list (post-drag, post-cascade), so a violation lights up the
  * moment a drag creates one - before anything is committed to the document.
  * Edges with unknown endpoints are skipped; the validator rejects those at
- * decode time anyway.
+ * decode time anyway. `resolve` supplies each successor's working calendar;
+ * absent/null = corrido bounds (the pre-calendar behavior).
  */
 export function resolveDependencyMarks(
   dependencies: readonly PlanDependency[],
   events: readonly GanttEvent<EventData>[],
+  resolve?: (eventId: string) => WorkingCalendar | null,
 ): GanttDependencyMark[] {
   if (!dependencies.length || !events.length) return []
   const byId = new Map(events.map((e) => [e.id, e]))
@@ -183,6 +189,7 @@ export function resolveDependencyMarks(
         from.end.getTime(),
         to.start.getTime(),
         to.end.getTime(),
+        resolve?.(dep.toEventId) ?? null,
       ),
     })
   }

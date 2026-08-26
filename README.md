@@ -20,6 +20,8 @@ pnpm lint                        # oxlint
 pnpm verify                      # round-trip + invariantes del contrato umeJSON (Node strip-types)
 ```
 
+Benchmark de virtualización (sin deps nuevas): `node --experimental-strip-types scripts/gen-stress-plan.mts [count]` genera el plan sintético por CLI; en el navegador, abre `/?stress=N` (1000 / 5000 / 20000 recomendados): el bundle se construye en memoria (modo offline) y la consola imprime `[stress] first paint after mount: <ms>` más el presupuesto de frame durante el scroll (`[stress] scroll frames: n=… avg=… p95=… max=…`).
+
 Backend (`server/`):
 
 ```bash
@@ -41,45 +43,59 @@ src/
 │   │   ├── GanttPlanViewer.tsx   # vista principal (caja negra umeJSON): bitono (reposo claro + avance fuerte), trazo de ruta crítica, bitácora, dependencias, tarea ⇄ hito
 │   │   ├── ChangesetPanel.tsx    # panel inferior: muestra el contrato JSON (cambios) + proponer CR
 │   │   ├── ChangeRequestsPanel.tsx # cola de solicitudes de cambio (badges de estado, impacto congelado, Aprobar/Rechazar/Aplicar)
+│   │   ├── PlanFiltersMenu.tsx   # filtros del árbol (texto/responsable/fase/crítica/drift/hitos) en un popover del header
+│   │   ├── AuthPanel.tsx         # diálogo de login: actor + passcode compartido (abre solo ante un 401)
+│   │   ├── TimesheetsPanel.tsx   # parte de horas: semana por actor/evento + cola de aprobación (mobile-first)
 │   │   ├── TreeColumnsMenu.tsx   # dropdown mostrar/ocultar columnas del panel árbol (persiste en localStorage)
 │   │   └── EvmPanel.tsx          # tarjetas BAC/PV/EV/AC/SPI/CPI/EAC sobre el plan vivo
 │   ├── reui/gantt/               # motor gantt headless (gantt.tsx, gantt-view.tsx, ...)
 │   └── ui/                       # primitivos shadcn-style (button, slider, scroll-area, tooltip, ...)
 ├── data/
-│   ├── plan-departamento.ts      # plan sintético (schema v2): WBS de 4–5 niveles, 7 fases, ~31 eventos
+│   ├── plan-departamento.ts      # plan sintético (schema v2): WBS de 4–5 niveles, 7 fases, ~31 eventos, statusDate sembrado
 │   ├── demo-entity.ts            # envelope umeJSON demo (única definición: fallback App + seed backend)
 │   ├── demo-contables.ts         # builders demo de GanttBudget / GanttActuals (tarifa×días con desglose exacto, wiggle determinista)
-│   └── demo-workforce.ts         # builder demo de GanttWorkforce (cuadrillas derivadas de los RESPONSABLES)
+│   ├── demo-workforce.ts         # builder demo de GanttWorkforce (cuadrillas derivadas de los RESPONSABLES; sobrecarga sembrada determinista)
+│   ├── demo-calendar.ts          # builder demo de GanttCalendar (Lun–Vie + feriados sintéticos a offsets fijos)
+│   ├── demo-timesheet.ts         # builder demo de GanttTimesheet para el fallback offline
+│   └── stress-plan.ts            # generador determinista 1k/5k/20k eventos (?stress=N + CLI)
 ├── lib/
-│   ├── plan-types.ts             # tipos PlanJSON v2 + EventData (compartidos data ↔ lib ↔ umejson)
+│   ├── plan-types.ts             # tipos PlanJSON v2 (+statusDate/schedulingOptions/priority) + EventData
 │   ├── plan-mapper.ts            # PlanJSON → GanttEvent[] + GanttResource[] (puro sobre el plan recibido)
 │   ├── wbs-levels.ts             # paleta L0–L4 + helper wbsLevelStyle(depth)
- │   ├── changeset.ts              # recorder de operaciones (drag/resize/create/dependencias, updateDependency con snap); re-exporta ChangeOp
+│   ├── changeset.ts              # recorder de operaciones; re-exporta ChangeOp; undo/redo por snapshots; recordOps() para kernels
 │   ├── umejson/                  # CONTRATO (runtime-puro, imports relativos .ts — lo importa el backend verbatim)
-│   │   ├── schema.ts             # UmeJsonEntity + decodeUmePlan() + validateUmeEnvelope() (DSL compartido)
- │   │   ├── codec.ts              # ChangeOp + applyOps() + encodeUpdatedPlan() (capa anti-corrupción)
- │   │   ├── schedule.ts           # grafo: cascadeSchedule (push-forward), snapToDependency (reasiento al borde), dependentClosure, wouldCreateCycle
+│   │   ├── schema.ts             # UmeJsonEntity + decodeUmePlan() + validateUmeEnvelope()
+│   │   ├── codec.ts              # ChangeOp + applyOps() + encodeUpdatedPlan() (capa anti-corrupción)
+│   │   ├── schedule.ts           # grafo: cascadeSchedule (push-forward + convenciones statusDate), snapToDependency, dependentClosure
+│   │   ├── working-time.ts       # matemática laborable: WorkingCalendar, addWorkingDays, workingDaysBetween, buildResolver
 │   │   ├── baselines.ts          # política de drift: vigenteBaseline, driftReference/isDrifted, driftDays
 │   │   ├── change-request.ts     # contrato del módulo de control de cambios (entidad propia, transiciones legales)
-│   │   ├── cpm.ts                # CPM runtime-puro: ES/EF/LS/LF, holgura total, conjunto crítico
+│   │   ├── cpm.ts                # CPM runtime-puro: ES/EF/LS/LF, holgura total y LIBRE, conjunto crítico
+│   │   ├── leveling.ts           # nivelación delay-based: demanda por cuadrilla/día, sobrecargas, levelPlan → UpdateOp[]
 │   │   ├── budget.ts             # entidad hermana GanttBudget (BAC por evento, uniform) + decodeBudget
 │   │   ├── actuals.ts            # entidad hermana GanttActuals (AC + dataDate + ancla baseline) + decodeActuals
+│   │   ├── workforce.ts          # entidad hermana GanttWorkforce (cuadrillas + asignaciones) + decodeWorkforce
+│   │   ├── calendar.ts           # entidad hermana GanttCalendar (calendarios laborables + asignación por evento)
+│   │   ├── timesheet.ts          # entidad hermana GanttTimesheet v1 (parte de horas por actor/semana) + transiciones
 │   │   └── evm.ts                # EVM runtime-pura: PV/EV/AC + SV/CV/SPI/CPI/EAC/ETC/TCPI/VAC
 │   ├── i18n-es.ts                # traducciones + locale es-AR
 │   └── utils.ts                  # cn() y helpers
-├── App.tsx                       # shell: fetch del bundle (plan+budget+actuals) con fallback demo + EVM
+├── App.tsx                       # shell: fetch del bundle (plan+hermanas+calendario) con fallback demo + sesión/roles + EVM
 ├── main.tsx                      # entrypoint React 19 createRoot
 └── index.css                     # tailwind v4 + tokens del tema
 server/                           # gantt-api (paquete del workspace)
 ├── src/
-│   ├── index.ts                  # Fastify 127.0.0.1:4600: health + GET/PUT plans + budget|actuals
+│   ├── index.ts                  # Fastify 127.0.0.1:4600: health + entidades + CRs + auth + gates de rol
+│   ├── auth.ts                   # sesiones: cookie HMAC gantt_session, requireRole(), ladder visor<editor<aprobador
+│   ├── timesheets.ts             # endpoints propios del parte de horas + merge aprobado→actuals en una transacción
 │   ├── config.ts                 # carga server/.env manual (fail-fast al boot)
 │   ├── entities.ts               # store híbrido JSONB + columnas promovidas + stampSentinels + lock optimista
 │   └── db/
 │       ├── pool.ts               # pool pg (max 10)
 │       ├── migrate.ts            # runner de migraciones (schema_migrations, transacción por archivo)
-│       └── migrations/           # 001_ume_entities.sql, 002_sibling_lookup_index.sql
-└── scripts/seed.ts               # seed idempotente (plan + budget + actuals, decodificado antes de persistir)
+│       └── migrations/           # 001_ume_entities.sql · 002_sibling_lookup_index.sql · 003_actors.sql
+└── scripts/seed.ts               # seed idempotente (plan + hermanas, decodificado antes de persistir)
+scripts/gen-stress-plan.mts       # CLI del generador de estrés (documenta cómo medir mount/scroll)
 public/                           # assets estáticos (favicon, íconos)
 ```
 
@@ -181,10 +197,28 @@ export type DeleteOp = { op: "delete"; id: string }
 export type AddDependencyOp = { op: "addDependency"; dependency: PlanDependency }
 export type UpdateDependencyOp = { op: "updateDependency"; dependency: PlanDependency }
 export type RemoveDependencyOp = { op: "removeDependency"; id: string }
-export type ChangeOp = UpdateOp | CreateOp | DeleteOp | AddDependencyOp | UpdateDependencyOp | RemoveDependencyOp
+export type UpdateResourceOp = {
+  op: "updateResource"; id: string
+  patch: { title?: string; responsable?: string } // aditivo: clave ausente = no toca
+}
+export type UpdatePlanSettingsOp = {
+  op: "updatePlanSettings"
+  patch: {
+    statusDate?: string | null   // null = DROP del campo (forma canónica)
+    schedulingOptions?: { outOfSequence: "retainedLogic" | "progressOverride" } | null
+  }
+}
+export type ChangeOp = UpdateOp | CreateOp | DeleteOp | AddDependencyOp | UpdateDependencyOp
+                   | RemoveDependencyOp | UpdateResourceOp | UpdatePlanSettingsOp
 ```
 
 `UpdateDependencyOp` **reemplaza** la forma del edge (type y/o `lagDays`) por id; id desconocido = no-op silencioso (mismo criterio que update sobre evento fantasma). El decoder de CRs, además de validar la forma, chequea contra el plan bound que el id de la dependencia exista (op sobre edge inexistente → 422 server-side).
+
+### Deshacer / Rehacer
+
+El recorder mantiene un historial de **snapshots del array de ops** (`history`/`future`, tope 50): el fold-by-key (una op por evento/borde) hace imposible deshacer op a op — un drag se FUSIONA con la op previa de su evento, así que «deshacer» significa volver al snapshot completo del gesto anterior. Toda mutación pushuea el snapshot previo y limpia `future`; `undo()`/`redo()` devuelven los ops vigentes; `canUndo`/`canRedo` llegan a la UI vía `useSyncExternalStore`. Los botones **Deshacer/Rehacer** viven junto a «Reiniciar plan» y los atajos son `Ctrl+Z` / `Ctrl+Shift+Z` (inertes dentro de inputs). Al reconstruir, el viewer regenera `events = toGanttEvents(livePlan)` contra el plan vivo post-undo.
+
+**Limitación aceptada**: las capturas de línea base de la sesión (bitácora) viven en el estado interno del engine, no en ops — un undo posterior a una captura la descarta al reconstruir, misma semántica de wipe que «Reiniciar plan».
 
 ### Editor de dependencias: tipo + lag con reasiento automático
 
@@ -211,6 +245,69 @@ La lectura también es bidireccional: el panel muestra el **lag efectivo** leíd
 El menú contextual de cada barra ofrece **«Convertir en hito» / «Convertir en tarea»**. Un hito es de **finalización** con duración 0: al convertir, `start = end = fin actual` (los dependientes FS quedan intactos; el inicio salta al fin y la cascada repara posibles SS). Al volver a tarea, el instante queda como inicio y la duración se restaura del **plan base** si allí era tarea (si nació hito → 1 día). El campo `kind` es opcional y aditivo (`schemaVersion` sigue en 2): aplicar `kind: "task"` en `applyOps` **elimina** el campo (forma canónica), así un toggle ida y vuelta round-tripea byte-idéntico. En pantalla el hito es un **diamante** cuadrado centrado en el instante (bitono: pastel de fase → tinte fuerte al 100%), sin resize y con la etiqueta siempre fuera; el plan demo siembra `acta-entrega` como hito.
 
 El panel `ChangesetPanel` inferior muestra dos secciones: el **`Op[]`** acumulado y, cuando hay cambios, el **documento umeJSON actualizado** (entidad lista para POST). Ambos con **Copiar JSON**.
+
+## Edición inline
+
+- **Título de fila**: doble clic o `F2` sobre la etiqueta la convierte en input (Enter o blur confirma el texto recortado; Escape cancela; vacío nunca confirma). El commit viaja como `UpdateResourceOp` (`patch.title`) — auditable, reversible con Deshacer/Reiniciar. Se habilita con `treePanel.titleEditable` (`true` o predicado por fila) sobre la etiqueta DEFAULT; un `renderResourceLabel` custom es dueño de su propia historia.
+- **Duración por teclado**: menú contextual → **«Duración…»** abre un panel anclado a la barra con un entero de días laborables; el commit reasienta el FIN desde el inicio vivo con `addWorkingDays` sobre el calendario DEL evento (corrido sin calendario), preserva la duración y encola la cascada como el drag. Los hitos no ofrecen la opción (duración 0). Todo viaja como `UpdateOp` de fechas con `cause` solo en los dependientes.
+
+Ambos canales entran por el mismo fold-by-key del recorder (`updateResourceTitle`, `setEventDuration`) y participan de undo/redo.
+
+## Filtros del árbol
+
+En la banda libre del header del árbol, junto al slider de profundidad, el embudo abre **PlanFiltersMenu**: texto (título/responsable, case-insensitive), responsable exacto, fase exacta (resuelta por la cadena heredable), y tres toggles de estado — solo ruta crítica (float 0 del CPM vivo), solo con desvío vs referencia, solo hitos. El motor recibe el árbol YA filtrado (matches ∪ ancestros, para no romper la estructura); las filas ocultas siguen recibiendo ops — drift y cascada las mueven igual — y el disparador muestra cuántas quedaron ocultas.
+
+## Calendario laboral
+
+`working-time.ts` concentra TODA la matemática laborable (`WorkingCalendar` = workWeek de 7 booleans + excepciones ISO; `isWorkingDay`, `addWorkingDays` firmado, `workingDaysBetween`, `buildResolver`: asignación por evento → default → null=corrido). Regla anti-riesgo: cero conversión ms↔días fuera de ese archivo — todos los kernels (cascada, CPM, drift, EVM, nivelación, mapper) aceptan un `resolve?` opcional y sin él reproducen la aritmética corrido byte-idéntica.
+
+La hermana **`GanttCalendar`** (`calendar.ts`) persiste los calendarios (`calendars[]`, `defaultCalendarId`, `assignmentByEvent`); el demo (`demo-calendar.ts`, Lun–Vie + 3 feriados) usa el MISMO payload que genera las fechas del plan sintético — cero violaciones por construcción. Con calendario activo, el lag corre sobre el calendario del SUCESOR (convención MS Project) y la holgura/free float cuentan días laborables propios.
+
+## Rendimiento: virtualización de filas
+
+El motor monta solo la ventana visible (+10 filas de overscan) de tree y timeline a partir de UN memo de offsets (`rowGeometry`: tops/heights acumulados en rem desde los mismos inputs que dimensionan las filas); los spacers preservan la altura total, así scrollbar, paneles y capa de dependencias comparten un único espacio de coordenadas. La capa de dependencias descarta conectores cuyo origen O destino cae fuera de la ventana (las filas colapsadas siguen re-apuntando a su ancestro renderizado); reordenar por grip solo ofrece límites visibles, por construcción.
+
+Dos reglas duras aprendidas con `?stress=20000`:
+- La ventana INICIAL nace chica (80 filas): React materializa lo que el primer render pida ANTES del clamp pre-paint — «arrancar ancho y recortar después» congelaba el tab.
+- El kernel de nivelación nivela cada tarea UNA SOLA VEZ por pasada (semántica MS Project): sin esa regla, una cadena que re-crea la sobrecarga aguas abajo re-nivelaba el mismo evento empujando el fin del proyecto décadas y encareciendo cada pasada de CPM hasta colgar el hilo minutos.
+
+## Nivelación de recursos
+
+- **Detección** (`leveling.ts`, runtime-puro): demanda por cuadrilla y día laborable (un evento ocupa SOLO los días laborables de su calendario dentro de `[start, end)`; hitos nada), corridas contiguas donde demanda > headcount (`overallocations` → `{crewId, from, to, peak, excessPersonDays}`) y heatmap por evento (`eventOverloadDays`) que pinta la columna **«Sobrecarga»** del árbol (ámbar 1–2 días, rojo ≥3).
+- **Nivelación** («Nivelar recursos» en la toolbar): delay-based sin splitting. Por cada corrida (cronológica) elige víctima entre los eventos de ESA cuadrilla que ocupan un día sobrecargado, ordenando por prioridad ↓ (`PlanEvent.priority` 1..1000, ausente = 500), holgura total ↑ e inicio ↑; la sienta en el primer día laborable posterior a la corrida conservando duración y hora del día, marca `leveledOnce` (cada tarea se nivela máximo una vez) y deja que `cascadeSchedule` re-asiente dependientes con causa documentada. Los hitos jamás son víctimas; una tarea cuya propia dotación ya excede la capacidad se estaciona como *sin resolver* (moverla no arregla nada). Salida: `UpdateOp[]` puros de fechas + reporte (`movedEvents`, Δ fin de proyecto, resueltas/sin resolver, iteraciones).
+- **UI**: el panel de preview muestra el reporte y el JSON de ops congelados al abrir; **Aplicar nivelación** los empuja por `recorder.recordOps()` (mismo canal auditable y undoable que cualquier gesto) y espeja las fechas en el engine. Cerrar descarta solo la propuesta.
+
+El demo siembra sobrecarga determinista: `demo-workforce.ts` ajusta el headcount de la cuadrilla más cargada por debajo de su pico real de demanda concurrente (schema v1 intacto).
+
+## Scheduling avanzado: statusDate, convenciones y free float
+
+Campos aditivos en `PlanJSON` v2 (validados cuando presentes):
+
+- **`statusDate?: string`** — corte del avance de obra. La cascada trata como HISTORIA congelada todo evento con progreso iniciado antes del corte (nunca se mueve; sus sucesores sí se re-evalúan). El timeline dibuja el marcador de corte (línea + punto en color primario, gemelo del now-line rojo).
+- **`schedulingOptions.outOfSequence`**: `retainedLogic` (default — el sucesor de un predecesor en curso se sienta desde su fin VIVO) o `progressOverride` (el asiento pisa el corte y el sucesor conserva solo la fracción restante `(100 − progress)/100`). Sin statusDate el comportamiento es el clásico byte-idéntico. El selector vive junto al pie del Gantt; viaja como `UpdatePlanSettingsOp` (volver a la convención base DROPEA el campo).
+- **CPM**: bajo override, el trabajo NO iniciado tiene piso ES = statusDate (los congelados mantienen su instante); nuevo `freeFloatDays` = cuánto puede deslizarse cada evento sin empujar a nadie (min sobre salientes de la fecha tardía que cada tipo restringe − lag − EF; sin sucesores, el fin del proyecto; clampeado a 0).
+- **EVM**: el corte resuelve `actuals.dataDate ?? plan.statusDate ?? now`.
+
+## Identidad, sesiones y roles
+
+Sin passwords por usuario: el login (`AuthPanel`, botón **Ingresar** del header; se abre solo ante el primer 401) combina un actor del directorio (`GET /api/auth/actors`, público) con un passcode compartido (`ACTOR_PASSCODE` en `server/.env`). La sesión es una cookie `gantt_session` firmada HMAC-SHA256 (HttpOnly, SameSite=Lax, 12 h; rotar `SESSION_SECRET` la invalida toda) resuelta por un preHandler global a `request.actor`.
+
+| Rol | Puede |
+|---|---|
+| anónimo | todo GET (el demo sigue siendo público) |
+| **visor** | idem anónimo |
+| **editor** | PUT de plan y hermanas, proponer CRs, subir parte de horas |
+| **aprobador** | todo lo anterior + decidir/aplicar CRs y aprobar/rechazar horas |
+
+Los gates viven server-side (`requireRole` → 401 sin sesión, 403 con rol insuficiente); el frontend solo OCULTA botones (`onProposeChangeRequest` no viaja sin editor+, `canDecide` apaga Aprobar/Rechazar/Aplicar) — la UI nunca es la frontera. La identidad de sesión reemplaza a `DEFAULT_ACTOR` al estampar `requestedBy`/`decidedBy` (queda como fallback defensivo).
+
+## Parte de horas (timesheets)
+
+Entidad hermana **`GanttTimesheet` v1** (`timesheet.ts`): un documento por (actor, semana) — `weekOf` + `entries[{ id, actor, date, eventId, hours ∈ (0,24], note?, status }]`; transiciones `draft → submitted → approved | rejected` (aprobado terminal, ilegal = `null`, misma disciplina que las CRs).
+
+- **Editor**: panel «Parte de horas» (mobile-first, navegación ±semana): filas evento/fecha/horas/nota propias, guardar borrador o enviar a aprobación (PUT REPLACE de la semana completa del actor autenticado).
+- **Aprobación**: la cola lista las entradas `submitted` de todos los actores; el aprobador aprueba o rechaza entrada por entrada.
+- **Merge a actuals**: aprobar persiste la decisión y recalcula la hermana `GanttActuals` EN LA MISMA transacción (retry interno ante carrera aprobación×aprobación): `AC[evento] = Σ horas aprobadas × dayRate(cuadrilla) / 8`, `dataDate` = fecha aprobada más nueva, semántica REPLACE (los AC sembrados del demo se sustituyen por lo aprobado). El EVM lo refleja al refetch.
 
 > **Nota sobre dependencias**: crear dependencias es **drag-and-drop** — se arranca desde los puntos de conexión en los bordes de la barra (con veto de ciclo en vivo `canConnectEvents`) y suelta sobre la tarea sucesora; no hay opción de alta en el menú contextual. El menú queda para **quitar**; el clic sobre el conector abre `DependencyPanel`, que además de quitar **edita tipo y lag** (ver arriba).
 > **Nota sobre borrado**: el menú contextual de cada barra expone borrado (`DeleteOp` vía `recorder.onEventDelete` + `GanttApi.removeEvent`); `applyOps` poda las dependencias incidentes para que el documento nunca quede con refs colgantes.
@@ -261,7 +358,7 @@ out ──▶│  ChangeOp[]  +  entityOut  ──▶  ChangesetPanel           
 pnpm verify   # node --experimental-strip-types scripts/verify-roundtrip.mts
 ```
 
-Cubre: round-trip del payload, `applyOps(update+create+delete+dependencias)`, cascada documentada, reasiento de dependencias (`snapToDependency` FS/SS/FF/SF, lag negativo, composición seat+cascada) y su contraparte de lectura (`impliedLagDays`: lecturas por tipo, redondeo, round-trip `implied(snap(lag)) === lag`), política de drift, contrato de change requests, CPM (lag, SS/FF, diamante, lead, tarea aislada, vacío), entidades contables (decode happy/rejections/refs) y EVM (caso calculado a mano, CPI 0, cortes fuera de rango).
+Cubre: round-trip del payload, `applyOps` (update/create/delete/dependencias/**updateResource/updatePlanSettings**), cascada documentada (incluidas convenciones statusDate: frozen actuals, retained vs override), reasiento de dependencias (`snapToDependency` FS/SS/FF/SF, lag negativo, composición seat+cascada) y su contraparte de lectura (`impliedLagDays`), política de drift, contrato de change requests, CPM (lag, SS/FF, diamante, lead, tarea aislada, vacío, **free float**, piso ES por override), **prioridades y statusDate/schedulingOptions aditivos**, **nivelación** (detección, víctima esperada, cascada documentada, hitos intocables, capacidad holgada), **calendario laboral**, entidades contables (decode happy/rejections/refs), **timesheets** (decode/refs/rangos/transiciones legales/round-trip del builder) y EVM (caso calculado a mano, CPI 0, cortes fuera de rango, fallback del corte).
 
 ## Backend `gantt-api` (`server/`)
 
@@ -272,14 +369,22 @@ Servicio Fastify + pg que escucha **solo en 127.0.0.1:4600** (nginx proxyea `/ap
 | Ruta | Descripción |
 |---|---|
 | `GET /api/health` | `{ ok, db, revision }` (smoke; `db: false` → 503) |
+| `GET /api/auth/actors` | Directorio público para el picker de login (`{id, name, role}`) |
+| `POST /api/auth/login` | `{ actorId, passcode }` → cookie `gantt_session` firmada 12 h (401 si no cuadra) |
+| `POST /api/auth/logout` | Limpia la cookie |
+| `GET /api/auth/me` | `{ actor }` de la sesión (`null` = anónimo) |
 | `GET /api/plans/:id` | Documento umeJSON del plan (404 si no existe); los bytes persistidos se devuelven tal cual |
-| `PUT /api/plans/:id` | Body `{ entity, expectedRevision }`; ver abajo |
+| `PUT /api/plans/:id` | Body `{ entity, expectedRevision }`; requiere sesión **editor+**; ver abajo |
 | `GET/PUT /api/plans/:planId/budget` | Entidad hermana `GanttBudget` del plan (la más reciente) |
 | `GET/PUT /api/plans/:planId/actuals` | Entidad hermana `GanttActuals` del plan |
 | `GET/PUT /api/plans/:planId/workforce` | Entidad hermana `GanttWorkforce` del plan (cuadrillas + asignaciones) |
+| `GET/PUT /api/plans/:planId/calendar` | Entidad hermana `GanttCalendar` (calendarios laborables) |
+| `GET /api/plans/:planId/timesheets?weekOf=&actor=` | Partes de horas del plan (documentos completos, filtros opcionales) |
+| `PUT /api/plans/:planId/timesheets` | Body `{ timesheet: { weekOf, entries }, expectedRevision }` — REPLACE de la semana del actor autenticado (**editor+**); solo entradas propias en draft/submitted |
+| `POST /api/timesheets/:entryId/decision` | Body `{ to: "submitted"\|"approved"\|"rejected" }` (**aprobador**); al aprobar mergea AC a `GanttActuals` en la misma transacción (409 con retry interno ante carrera) |
 | `GET /api/plans/:planId/change-requests?status=` | Cola de CRs del plan (`created_at DESC`, filtro opcional por estado promovido) |
-| `POST /api/plans/:planId/change-requests` | Body `{ ops, reason? }` → propone una CR contra la revisión vigente; responde `{ id, revision, impact }` (201). Ops con targets inexistentes (vista vencida) → **422** |
-| `POST /api/change-requests/:id/decision` | Body `{ to: "approved"\|"rejected"\|"applied", reason? }`. Transición ilegal → **422**; apply con revisión del plan movida → **409** `{ currentRevision, crPlanRevision }` (la CR queda approved y hay que re-proponer) |
+| `POST /api/plans/:planId/change-requests` | Body `{ ops, reason? }` (**editor+**) → propone una CR contra la revisión vigente; responde `{ id, revision, impact }` (201). Ops con targets inexistentes (vista vencida) → **422** |
+| `POST /api/change-requests/:id/decision` | Body `{ to: "approved"\|"rejected"\|"applied", reason? }` (**aprobador**). Transición ilegal → **422**; apply con revisión del plan movida → **409** `{ currentRevision, crPlanRevision }` (la CR queda approved y hay que re-proponer) |
 
 ### Pipeline del PUT
 
@@ -295,7 +400,7 @@ Servicio Fastify + pg que escucha **solo en 127.0.0.1:4600** (nginx proxyea `/ap
 
 ### Configuración
 
-`server/.env` (gitignored, mode 640 root:gantt; template en `server/.env.example`): `DATABASE_URL` (rol `system`, owner de `db_umejson`), `PORT=4600` y `DEFAULT_ACTOR` (identidad que estampa `requestedBy`/`decidedBy` de las CRs — sin auth por ahora, el demo es público y rate-limited). Carga manual sin dotenv, fail-fast al boot. Credenciales jamás en archivos trackeados.
+`server/.env` (gitignored, mode 640 root:gantt; template en `server/.env.example`): `DATABASE_URL` (rol `system`, owner de `db_umejson`), `PORT=4600`, `DEFAULT_ACTOR` (fallback de identidad sin sesión), **`SESSION_SECRET`** (HMAC de la cookie de sesión — rotarla mata las sesiones abiertas) y **`ACTOR_PASSCODE`** (passcode compartido del login). Los dos últimos son obligatorios: el servicio falla al boot sin ellos. Carga manual sin dotenv, fail-fast. Credenciales jamás en archivos trackeados.
 
 ### Seed y política de hermanas
 
@@ -320,7 +425,7 @@ El contrato vive en `change-request.ts`; el backend lo opera; el frontend propon
 - **Binding de revisión**: el payload lleva `planRevision` (int ≥ 1). `planAnchor` NO protege contra ediciones intermedias (`applyOps` lo preserva intacto) — la revisión sí: apply contra otra revisión → **409**, la CR queda `approved` y hay que re-proponer.
 - **Costo de un desliz (modelo labor-burn)**: `buildImpactSnapshot(basePlan, ops, budget?)` adjunta `costImpact` cuando hay budget: `dailyLaborBurn = breakdown.labor / duraciónDíasReferencia`; `projectedExtraCost = Σ driftDays × burn` (con signo — negativo = ahorro proyectado); `extendedDays = Σ driftDays > 0`. Sin budget no hay `costImpact`; sin desglose el burn es 0. Procurement/maquinaria-extendida/indirectos: out of scope (follow-up).
 - **Decisiones**: `proposed → approved | rejected`, `approved → applied` (terminal). El apply verifica la revisión y escribe **plan + CR en una transacción** (`applyOps` → documento del plan con `statusLog` append `«CR aplicada: <id>»`, revisión +1 → fila CR `applied`).
-- **Actores**: sin auth todavía — `DEFAULT_ACTOR` (`server/.env`) estampa `requestedBy`/`decidedBy` vía `stampChangeRequestSentinels`.
+- **Actores**: la identidad de la sesión (`req.actor.name`) estampa `requestedBy`/`decidedBy` vía `stampChangeRequestSentinels`; `DEFAULT_ACTOR` queda como fallback defensivo sin sesión.
 - **UI**: `ChangesetPanel` propone los ops grabados (sin resetear el recorder — el reset llega con el remount post-apply); `ChangeRequestsPanel` (patrón `EvmPanel`) lista la cola con badge de estado, razón, impacto congelado (N eventos, Σ desliz, costo proyectado con moneda y signo) y botones Aprobar/Rechazar/Aplicar. En modo offline ambas cosas se esconden. Tras un apply, `App` refetchea el bundle y remonta el viewer por `key={planId:revision}` (su estado interno de eventos no se re-inicializa con solo cambiar props — limitación existente, documentada).
 
 ## CPM (ruta crítica)

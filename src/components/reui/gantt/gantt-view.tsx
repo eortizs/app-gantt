@@ -1225,6 +1225,126 @@ if (row.isGroup && segments.length === 0 && viewConfig.summaryBars) {
     return next
   }, [baseRowBars, draftLayout, laneHeightRem, laneGapRem])
 
+  // ----- row virtualization -----
+  /**
+   * Single source of vertical geometry: cumulative tops and heights per row,
+   * in rem, derived from the SAME inputs (rows + rowBars) the panes size
+   * their rows with. Tree rows, timeline rows, the dependency layer's y
+   * anchors and the window spacers all read these numbers, so a divergent
+   * height between the two panes is impossible by construction.
+   */
+  const rowGeometry = useMemo(() => {
+    const tops = new Array<number>(rows.length)
+    const heights = new Array<number>(rows.length)
+    let acc = 0
+    for (let i = 0; i < rows.length; i++) {
+      tops[i] = acc
+      const h = rowBars.get(rows[i].resource.id)?.heightRem ?? minRowRem
+      heights[i] = h
+      acc += h
+    }
+    return { tops, heights, totalRem: acc }
+  }, [rows, rowBars, minRowRem])
+  // Read-through refs so scroll handlers keep ONE identity across geometry
+  // changes (re-binding a listener mid-scroll would drop events between them).
+  const rowGeometryRef = useRef(rowGeometry)
+  rowGeometryRef.current = rowGeometry
+
+  /** Rows rendered past each edge of the visible band. */
+  const OVERSCAN_ROWS = 10
+  /**
+   * Window size on the VERY FIRST commit. The layout effect below re-measures
+   * before paint, but React still builds and reconciles whatever the initial
+   * state asks for — and every mounted row carries several engine
+   * subscriptions, so "start wide, clamp later" materialized the WHOLE tree
+   * once on huge plans (20k rows = frozen tab before the clamp ever ran).
+   * Start small; the pre-paint measure GROWS the window when the viewport is
+   * taller than these rows, so nothing ever paints empty.
+   */
+  const INITIAL_WINDOW_ROWS = 80
+
+  // Visible row-index window [start, end).
+  const [rowWindow, setRowWindow] = useState<{ start: number; end: number }>({
+    start: 0,
+    end: INITIAL_WINDOW_ROWS,
+  })
+  const rowWindowRef = useRef(rowWindow)
+  rowWindowRef.current = rowWindow
+  const measureRowWindow = useCallback(() => {
+    const geo = rowGeometryRef.current
+    const count = geo.tops.length
+    const viewport = getPaneViewport(timelinePaneRef.current)
+    const heightPx = viewport?.clientHeight ?? 0
+    let start = 0
+    let end = Math.min(count, INITIAL_WINDOW_ROWS)
+    if (viewport && heightPx > 0 && count > 0) {
+      const scrollTopRem = Math.max(viewport.scrollTop, 0) / REM_PX
+      const bottomRem = scrollTopRem + heightPx / REM_PX
+      const { tops, heights } = geo
+      // Binary search the first row whose band crosses scrollTop...
+      let lo = 0
+      let hi = count - 1
+      start = count
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1
+        if (tops[mid] + heights[mid] > scrollTopRem) {
+          start = mid
+          hi = mid - 1
+        } else {
+          lo = mid + 1
+        }
+      }
+      // ...then walk to the first row entirely below the fold.
+      end = start
+      while (end < count && tops[end] < bottomRem) end++
+      start = Math.max(0, start - OVERSCAN_ROWS)
+      end = Math.min(count, end + OVERSCAN_ROWS)
+    }
+    setRowWindow((prev) =>
+      prev.start === start && prev.end === end ? prev : { start, end },
+    )
+  }, [])
+  // Layout effect: the FIRST clamp must flush before paint so a huge plan
+  // never paints its full row list even for one frame.
+  useLayoutEffect(() => {
+    measureRowWindow()
+  }, [measureRowWindow, rowGeometry])
+  // The window rides the timeline pane's vertical scroll (the tree mirrors
+  // into it, so every vertical movement - wheel, scrollbar drag, keyboard,
+  // programmatic - fires here exactly once). rAF-throttled like the other
+  // scroll readers in this file; ResizeObserver covers pane resizes and the
+  // scale-keyed ScrollArea remounts.
+  useEffect(() => {
+    const viewport = getPaneViewport(timelinePaneRef.current)
+    if (!viewport) return
+    let raf = 0
+    const schedule = () => {
+      if (raf) return
+      raf = requestAnimationFrame(() => {
+        raf = 0
+        measureRowWindow()
+      })
+    }
+    schedule()
+    viewport.addEventListener("scroll", schedule, { passive: true })
+    const observer = new ResizeObserver(schedule)
+    observer.observe(viewport)
+    return () => {
+      viewport.removeEventListener("scroll", schedule)
+      observer.disconnect()
+      if (raf) cancelAnimationFrame(raf)
+    }
+  }, [measureRowWindow, scale, viewConfig.scrollbars])
+
+  // Clamped window actually renderable this pass (state can lag a geometry
+  // shrink by one commit; slicing out of range would drop trailing rows).
+  const winStart = Math.min(Math.max(rowWindow.start, 0), rows.length)
+  const winEnd = Math.max(Math.min(rowWindow.end, rows.length), winStart)
+  const visibleRows = useMemo(
+    () => rows.slice(winStart, winEnd),
+    [rows, winStart, winEnd],
+  )
+
   const showCreateTask =
     viewConfig.displayCreateTaskHint &&
     !!settings.onCreateTask &&
@@ -2043,6 +2163,12 @@ if (row.isGroup && segments.length === 0 && viewConfig.summaryBars) {
       // Rows do not move during the gesture (the carry is a fixed overlay), so
       // rects are measured ONCE - per-move full-row rect scans forced a
       // synchronous reflow after every overlay style write.
+      // VIRTUALIZATION: only the rendered window is in the DOM, so `rects[i]`
+      // corresponds to `rows[windowStart + i]`. Dropping on an unrendered row
+      // is impossible by construction (you cannot point at what you cannot
+      // see); every boundary below maps back to FULL-array indices through
+      // `base`.
+      const base = rowWindowRef.current.start
       const rects = rowEls.map((el) => el.getBoundingClientRect())
       const place = (y: number) => {
         const top = Math.min(
@@ -2055,11 +2181,12 @@ if (row.isGroup && segments.length === 0 && viewConfig.summaryBars) {
       place(e.clientY)
 
       const propose = (boundary: number): TimelineReorderState => {
-        const below = rows[boundary]
+        const globalBoundary = Math.min(base + boundary, rows.length)
+        const below = rows[globalBoundary]
         const parentId =
           below?.parentId ?? rows[rows.length - 1]?.parentId ?? null
         let index = 0
-        for (let i = 0; i < boundary; i++) {
+        for (let i = 0; i < globalBoundary; i++) {
           if (
             rows[i].parentId === parentId &&
             rows[i].resource.id !== dragRow.resource.id
@@ -2309,7 +2436,19 @@ if (row.isGroup && segments.length === 0 && viewConfig.summaryBars) {
         </div>
       </div>
       <div ref={treeRowsRef} className="flex flex-col">
-        {rows.map((row) => (
+        {/* Window spacers: unmounted rows keep their exact share of the
+            scroll height through the shared offsets memo, so the scrollbar,
+            both panes and the dependency layer stay in one coordinate space.
+            The "create task" affordance below sits AFTER the full content
+            height, not after the window. */}
+        {winStart > 0 && (
+          <div
+            aria-hidden
+            data-slot="gantt-window-spacer"
+            style={{ height: `${rowGeometry.tops[winStart]}rem` }}
+          />
+        )}
+        {visibleRows.map((row) => (
           <GanttTreeRow
             key={row.resource.id}
             row={row}
@@ -2327,6 +2466,15 @@ if (row.isGroup && segments.length === 0 && viewConfig.summaryBars) {
             onToggle={onToggleRow}
           />
         ))}
+        {winEnd < rows.length && (
+          <div
+            aria-hidden
+            data-slot="gantt-window-spacer"
+            style={{
+              height: `${rowGeometry.totalRem - rowGeometry.tops[winEnd]}rem`,
+            }}
+          />
+        )}
         {showCreateTask && (
           <button
             type="button"
@@ -2485,6 +2633,13 @@ if (row.isGroup && segments.length === 0 && viewConfig.summaryBars) {
           {viewConfig.nowIndicator && (
             <GanttNowDot rangeStartMs={rangeStartMs} rangeEndMs={rangeEndMs} />
           )}
+          {viewConfig.statusMarker && (
+            <GanttStatusDot
+              ms={Date.parse(viewConfig.statusMarker)}
+              rangeStartMs={rangeStartMs}
+              rangeEndMs={rangeEndMs}
+            />
+          )}
         </div>
       </div>
       {/* Rows over a shared backdrop (off days, today, boundaries, now);
@@ -2549,12 +2704,32 @@ if (row.isGroup && segments.length === 0 && viewConfig.summaryBars) {
           {viewConfig.nowIndicator && (
             <GanttNowLine rangeStartMs={rangeStartMs} rangeEndMs={rangeEndMs} />
           )}
+          {viewConfig.statusMarker && (
+            <GanttStatusLine
+              ms={Date.parse(viewConfig.statusMarker)}
+              rangeStartMs={rangeStartMs}
+              rangeEndMs={rangeEndMs}
+            />
+          )}
         </div>
-        {rows.map((row, rowIndex) => (
+        {/* SAME window indices as the tree pane above - both slices derive
+            from the one `rows` array and the one offsets memo, so a row can
+            never be mounted in one pane and missing in the other. */}
+        {winStart > 0 && (
+          <div
+            aria-hidden
+            data-slot="gantt-window-spacer"
+            style={{ height: `${rowGeometry.tops[winStart]}rem` }}
+          />
+        )}
+        {visibleRows.map((row, sliceIndex) => (
           <GanttTimelineRow
             key={row.resource.id}
             row={row}
-            rowIndex={rowIndex}
+            // Slice-local index: the hint bubble's flip logic only cares
+            // where the row sits inside the VIEWPORT (first visible row
+            // flips its label downward), not in the full tree.
+            rowIndex={sliceIndex}
             bars={rowBars.get(row.resource.id)}
             rangeStartMs={rangeStartMs}
             rangeEndMs={rangeEndMs}
@@ -2569,6 +2744,15 @@ if (row.isGroup && segments.length === 0 && viewConfig.summaryBars) {
             minRowRem={minRowRem}
           />
         ))}
+        {winEnd < rows.length && (
+          <div
+            aria-hidden
+            data-slot="gantt-window-spacer"
+            style={{
+              height: `${rowGeometry.totalRem - rowGeometry.tops[winEnd]}rem`,
+            }}
+          />
+        )}
         {viewConfig.dependencies && viewConfig.dependencies.length > 0 && (
           <GanttDependencyLayer
             marks={viewConfig.dependencies}
@@ -2576,6 +2760,8 @@ if (row.isGroup && segments.length === 0 && viewConfig.summaryBars) {
             rowBars={rowBars}
             events={allEvents}
             resources={settings.resources}
+            offsets={rowGeometry}
+            windowRange={{ start: winStart, end: winEnd }}
             rangeStartMs={rangeStartMs}
             rangeEndMs={rangeEndMs}
             laneHeightRem={laneHeightRem}
@@ -2945,6 +3131,54 @@ function GanttNowDot({
 }
 
 /**
+ * The status-date marker (field-progress cutoff): same geometry as the red
+ * now-line, primary color, so the two read as "today" vs "the cutoff" at a
+ * glance. Static — it never ticks.
+ */
+function GanttStatusLine({
+  ms,
+  rangeStartMs,
+  rangeEndMs,
+}: {
+  ms: number
+  rangeStartMs: number
+  rangeEndMs: number
+}) {
+  if (!Number.isFinite(ms) || ms < rangeStartMs || ms >= rangeEndMs) return null
+  const fraction = (ms - rangeStartMs) / (rangeEndMs - rangeStartMs)
+  return (
+    <div
+      data-slot="gantt-status-indicator"
+      aria-hidden
+      className="from-primary/70 via-primary/40 to-primary/10 absolute inset-y-0 z-10 w-px bg-linear-to-b"
+      style={{ insetInlineStart: `${fraction * 100}%` }}
+    />
+  )
+}
+
+/** The status line's dot cap under the header (twin of the now-dot). */
+function GanttStatusDot({
+  ms,
+  rangeStartMs,
+  rangeEndMs,
+}: {
+  ms: number
+  rangeStartMs: number
+  rangeEndMs: number
+}) {
+  if (!Number.isFinite(ms) || ms < rangeStartMs || ms >= rangeEndMs) return null
+  const fraction = (ms - rangeStartMs) / (rangeEndMs - rangeStartMs)
+  return (
+    <span
+      aria-hidden
+      data-slot="gantt-status-dot"
+      className="bg-primary absolute -bottom-0.75 z-10 size-1.5 -translate-x-1/2 rounded-full"
+      style={{ insetInlineStart: `${fraction * 100}%` }}
+    />
+  )
+}
+
+/**
  * Consumer-owned drag/resize indicators (renderDragPreview /
  * renderResizeIndicator): content is React and re-renders per snap step from
  * drag state; the dnd engine adopts this wrapper and writes its
@@ -3035,6 +3269,84 @@ const GanttColumnResizeHandle = memo(function GanttColumnResizeHandle({
   )
 })
 
+/**
+ * Inline title editor for one tree-row label: double-click / F2 turns the
+ * label into an input; Enter or blur commits the TRIMMED text, Escape
+ * cancels, and a blank draft never commits (cancel). Reads its commit
+ * channel through the settings store, so the row's memo contract stays
+ * intact. Enabled only for the DEFAULT label - a consumer's
+ * renderResourceLabel owns its own editing story.
+ */
+function EditableTreeTitle({
+  resourceId,
+  title,
+  enabled,
+}: {
+  resourceId: string
+  title: string
+  enabled: boolean
+}) {
+  const settings = useGanttSettings()
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(title)
+  // External renames (undo, plan reset) re-seed the draft while closed.
+  useEffect(() => {
+    if (!editing) setDraft(title)
+  }, [editing, title])
+  const begin = () => {
+    setDraft(title)
+    setEditing(true)
+  }
+  const commit = () => {
+    setEditing(false)
+    const trimmed = draft.trim()
+    if (!trimmed || trimmed === title) return
+    settings.onResourceTitleCommit?.(resourceId, trimmed)
+  }
+  if (!enabled) return <span className="truncate">{title}</span>
+  if (editing) {
+    return (
+      <input
+        data-slot="gantt-title-input"
+        autoFocus
+        value={draft}
+        aria-label={settings.i18n.labels.editTitle(title)}
+        onChange={(e) => setDraft(e.target.value)}
+        onClick={(e) => e.stopPropagation()}
+        onDoubleClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit()
+          else if (e.key === "Escape") setEditing(false)
+          e.stopPropagation()
+        }}
+        onBlur={commit}
+        className="ring-ring/30 bg-background h-5 w-full min-w-0 rounded-sm px-1 ring-1 outline-none"
+      />
+    )
+  }
+  return (
+    <span
+      data-slot="gantt-title-editable"
+      tabIndex={0}
+      title={settings.i18n.labels.editTitle(title)}
+      className="hover:bg-muted/40 focus-visible:ring-ring/50 cursor-text truncate rounded-sm outline-none focus-visible:ring-2"
+      onDoubleClick={(e) => {
+        e.stopPropagation()
+        begin()
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "F2") {
+          e.preventDefault()
+          e.stopPropagation()
+          begin()
+        }
+      }}
+    >
+      {title}
+    </span>
+  )
+}
+
 /** Memoized: only rows whose props actually changed re-render. */
 const GanttTreeRow = memo(function GanttTreeRow({
   row,
@@ -3072,6 +3384,7 @@ const GanttTreeRow = memo(function GanttTreeRow({
 }) {
   const settings = useGanttSettings()
   const viewConfig = useGanttViewConfig()
+  const treePanel = viewConfig.treePanel
   const ctx = {
     resource: row.resource,
     depth: row.depth,
@@ -3216,8 +3529,20 @@ const GanttTreeRow = memo(function GanttTreeRow({
                 )
               )}
             </span>
-            {viewConfig.renderResourceLabel?.(ctx) ?? (
-              <span className="truncate">{row.resource.title}</span>
+            {viewConfig.renderResourceLabel ? (
+              viewConfig.renderResourceLabel(ctx)
+            ) : (
+              <EditableTreeTitle
+                resourceId={row.resource.id}
+                title={row.resource.title}
+                enabled={
+                  // Inert while THIS row is carried by a reorder drag.
+                  !dimmed &&
+                  (typeof treePanel?.titleEditable === "function"
+                    ? treePanel.titleEditable(ctx)
+                    : treePanel?.titleEditable === true)
+                }
+              />
             )}
           </div>
         </div>
@@ -4304,6 +4629,8 @@ const GanttDependencyLayer = memo(function GanttDependencyLayer({
   rowBars,
   events,
   resources,
+  offsets,
+  windowRange,
   rangeStartMs,
   rangeEndMs,
   laneHeightRem,
@@ -4316,6 +4643,18 @@ const GanttDependencyLayer = memo(function GanttDependencyLayer({
   rowBars: Map<string, TimelineRowBars>
   events: GanttEvent[]
   resources: GanttResource[]
+  /**
+   * Shared vertical geometry (cumulative tops per row, rem) from the view's
+   * single offsets memo - never a second derivation of row heights.
+   */
+  offsets: { tops: number[]; heights: number[]; totalRem: number }
+  /**
+   * Rendered window [start, end) of row indices. A link whose source OR
+   * target row falls outside it is dropped entirely - drawing against an
+   * unmounted row would anchor to stale geometry. Collapsed rows (absent
+   * from `rows`) still retarget to their rendered ancestor below.
+   */
+  windowRange: { start: number; end: number }
   rangeStartMs: number
   rangeEndMs: number
   laneHeightRem: number
@@ -4352,16 +4691,19 @@ const GanttDependencyLayer = memo(function GanttDependencyLayer({
   const links = useMemo(() => {
     if (!width || !marks.length) return []
 
-    // Rendered-row index: vertical offsets are the cumulative row heights,
-    // the exact numbers the rows themselves are laid out with.
+    // Rendered-row index: vertical offsets are the SHARED cumulative row
+    // offsets (rem -> px at the root's 16px reference), the exact numbers
+    // the rows themselves are laid out with.
     const rowIndexByResource = new Map<string, number>()
-    const rowTopPx: number[] = []
-    let accPx = 0
     rows.forEach((row, index) => {
       rowIndexByResource.set(row.resource.id, index)
-      rowTopPx.push(accPx)
-      accPx += (rowBars.get(row.resource.id)?.heightRem ?? minRowRem) * REM_PX
     })
+    const { tops } = offsets
+    const rowTopPx = (index: number) => tops[index]! * REM_PX
+    const inWindow = (index: number | undefined): index is number =>
+      index !== undefined &&
+      index >= windowRange.start &&
+      index < windowRange.end
 
     // Full-tree parent map for collapsed-endpoint retargeting.
     const parentOf = new Map<string, string | null>()
@@ -4376,7 +4718,7 @@ const GanttDependencyLayer = memo(function GanttDependencyLayer({
     const eventById = new Map(events.map((event) => [event.id, event]))
     const laneCenterY = (resourceId: string, occurrenceKey: string): number | null => {
       const index = rowIndexByResource.get(resourceId)
-      if (index === undefined) return null
+      if (!inWindow(index)) return null
       const bars = rowBars.get(resourceId)
       const lane =
         bars?.segments.find((seg) => seg.occurrence.key === occurrenceKey)
@@ -4384,15 +4726,18 @@ const GanttDependencyLayer = memo(function GanttDependencyLayer({
       const laneOffsetRem =
         bars?.laneOffsetRem ?? (minRowRem - laneHeightRem) / 2
       return (
-        rowTopPx[index]! +
+        rowTopPx(index) +
         (laneOffsetRem + lane * (laneHeightRem + laneGapRem) + laneHeightRem / 2) *
           REM_PX
       )
     }
     const rowMiddleY = (resourceId: string): number | null => {
       const index = rowIndexByResource.get(resourceId)
-      if (index === undefined) return null
-      return rowTopPx[index]! + ((rowBars.get(resourceId)?.heightRem ?? minRowRem) * REM_PX) / 2
+      if (!inWindow(index)) return null
+      return (
+        rowTopPx(index) +
+        ((rowBars.get(resourceId)?.heightRem ?? minRowRem) * REM_PX) / 2
+      )
     }
 
     const resolveAnchor = (
@@ -4403,6 +4748,11 @@ const GanttDependencyLayer = memo(function GanttDependencyLayer({
       const event = eventById.get(eventId)
       if (!event?.resourceId) return null
       const resourceId = event.resourceId
+      // WINDOW GATE before any retargeting: a row scrolled out of the
+      // rendered window is not painted, so its connector drops rather than
+      // anchoring into empty (or ancestor) space. Collapsed rows are absent
+      // from `rows` entirely and keep the ancestor retarget below.
+      if (!inWindow(rowIndexByResource.get(resourceId))) return null
       const direct = laneCenterY(resourceId, occurrenceKey)
       if (direct !== null) {
         const ms =
@@ -4415,13 +4765,13 @@ const GanttDependencyLayer = memo(function GanttDependencyLayer({
           out: side === "end" ? 1 : -1,
         }
       }
-      // Collapsed: climb to the nearest RENDERED ancestor and anchor to its
-      // rollup envelope (or row middle as a fallback).
+      // Collapsed (but IN-window): climb to the nearest RENDERED ancestor and
+      // anchor to its rollup envelope (or row middle as a fallback).
       let parent = parentOf.get(resourceId)
       while (parent && !rowIndexByResource.has(parent)) {
         parent = parentOf.get(parent) ?? null
       }
-      if (!parent) return null
+      if (!parent || !inWindow(rowIndexByResource.get(parent))) return null
       const bars = rowBars.get(parent)
       const env = bars?.summary ?? bars?.extent
       const y = rowMiddleY(parent)
@@ -4454,8 +4804,11 @@ const GanttDependencyLayer = memo(function GanttDependencyLayer({
       eventId: string
     }> = []
     rows.forEach((row, index) => {
+      // Unmounted (out-of-window) rows paint no bars, so they must not
+      // constrain routing either.
+      if (!inWindow(index)) return
       const bars = rowBars.get(row.resource.id)
-      const topPx = rowTopPx[index]!
+      const topPx = rowTopPx(index)
       const laneOffsetRem =
         bars?.laneOffsetRem ?? (minRowRem - laneHeightRem) / 2
       for (const seg of bars?.segments ?? []) {
@@ -4590,6 +4943,8 @@ const GanttDependencyLayer = memo(function GanttDependencyLayer({
     rowBars,
     events,
     resources,
+    offsets,
+    windowRange,
     rangeStartMs,
     totalMin,
     width,

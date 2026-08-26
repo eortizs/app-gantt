@@ -94,6 +94,49 @@ export function buildDemoWorkforce(
     assignmentByEvent[event.id] = { crewId: crew.id, headcount }
   }
 
+  // ----- sobrecarga sembrada (determinista) -----
+  // La cuadrilla más cargada (la de más eventos asignados) queda con un
+  // headcount POR DEBAJO de su pico real de demanda concurrente, así la
+  // columna «Sobrecarga» y «Nivelar recursos» tienen material visible al
+  // abrir el demo. Schema v1 intacto: solo ajusta el entero headcount.
+  const eventsPerCrew = new Map<string, number>()
+  const demandPerCrew = new Map<string, Map<string, number>>()
+  for (const [eventId, assignment] of Object.entries(assignmentByEvent)) {
+    eventsPerCrew.set(
+      assignment.crewId,
+      (eventsPerCrew.get(assignment.crewId) ?? 0) + 1,
+    )
+    const event = plan.events.find((e) => e.id === eventId)
+    if (!event || event.kind === "milestone") continue
+    let bucket = demandPerCrew.get(assignment.crewId)
+    if (!bucket) {
+      bucket = new Map()
+      demandPerCrew.set(assignment.crewId, bucket)
+    }
+    const startDay = Math.floor(Date.parse(event.start) / 86_400_000)
+    const endMs = Date.parse(event.end)
+    for (let d = startDay; d * 86_400_000 < endMs; d++) {
+      const key = String(d)
+      bucket.set(key, (bucket.get(key) ?? 0) + assignment.headcount)
+    }
+  }
+  let busiestCrewId: string | null = null
+  let busiestCount = 0
+  for (const [crewId, count] of eventsPerCrew) {
+    if (count > busiestCount) {
+      busiestCrewId = crewId
+      busiestCount = count
+    }
+  }
+  const peakDemand = (() => {
+    if (!busiestCrewId) return 0
+    return Math.max(0, ...(demandPerCrew.get(busiestCrewId)?.values() ?? []))
+  })()
+  if (busiestCrewId !== null && peakDemand >= 4) {
+    const crew = crews.find((c) => c.id === busiestCrewId)
+    if (crew) crew.headcount = Math.min(crew.headcount, peakDemand - 1)
+  }
+
   return buildWorkforceEntity({
     id: DEMO_WORKFORCE_ID,
     planEntityId,

@@ -53,10 +53,13 @@ export function ChangeRequestsPanel({
   requests,
   planRevision,
   onDecision,
+  canDecide = true,
 }: {
   requests: ChangeRequestItem[]
   planRevision: number
   onDecision: (id: string, to: ChangeRequestStatus) => Promise<void>
+  /** False for sessions without the aprobador role: rows render read-only. */
+  canDecide?: boolean
 }) {
   const [pending, setPending] = useState<string | null>(null)
   const [error, setError] = useState<{ id: string; text: string } | null>(null)
@@ -100,6 +103,7 @@ export function ChangeRequestsPanel({
             pending={pending?.startsWith(entity.id) ?? false}
             error={error?.id === entity.id ? error.text : null}
             planRevision={planRevision}
+            canDecide={canDecide}
             onDecision={decide}
           />
         ))}
@@ -114,6 +118,7 @@ function ChangeRequestRow({
   pending,
   error,
   planRevision,
+  canDecide,
   onDecision,
 }: {
   entity: UmeChangeRequestEntity
@@ -121,6 +126,7 @@ function ChangeRequestRow({
   pending: boolean
   error: string | null
   planRevision: number
+  canDecide: boolean
   onDecision: (id: string, to: ChangeRequestStatus) => void
 }) {
   // Aprobada pero anclada a una revisión que ya no es la vigente: el
@@ -169,7 +175,7 @@ function ChangeRequestRow({
           </span>
         )}
         <span className="grow" />
-        {cr.status === "proposed" && (
+        {canDecide && cr.status === "proposed" && (
           <>
             <Button
               size="sm"
@@ -190,7 +196,7 @@ function ChangeRequestRow({
             </Button>
           </>
         )}
-        {cr.status === "approved" && (
+        {canDecide && cr.status === "approved" && (
           <Button
             size="sm"
             disabled={pending || stale}

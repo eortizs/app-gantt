@@ -7,8 +7,7 @@
 // can load it under `node --experimental-strip-types` alongside the codec.
 import type { PlanBaseline } from "../plan-types.ts"
 import type { UpdateOp } from "./codec.ts"
-
-const DAY_MS = 86_400_000
+import { workingDaysBetween, type WorkingCalendar } from "./working-time.ts"
 
 /** The baseline in force: the highest-version bitácora entry. */
 export function vigenteBaseline(
@@ -63,10 +62,16 @@ export function isDrifted(subject: DriftSubject): boolean {
 /**
  * Whole-day Δ of one end date vs another (positive = later). The same
  * rounding the bitácora panel uses, shared so reports and the UI can
- * never disagree about what "+3 d" means.
+ * never disagree about what "+3 d" means. With `cal` the delta counts
+ * WORKING days (the drift reference's own calendar, passed by the
+ * caller); null = corrido, byte-equal to the original arithmetic.
  */
-export function driftDays(end: string, referenceEnd: string): number {
-  return Math.round((Date.parse(end) - Date.parse(referenceEnd)) / DAY_MS)
+export function driftDays(
+  end: string,
+  referenceEnd: string,
+  cal?: WorkingCalendar | null,
+): number {
+  return workingDaysBetween(cal ?? null, Date.parse(referenceEnd), Date.parse(end))
 }
 
 /**

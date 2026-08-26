@@ -1,5 +1,11 @@
 import { addDays, startOfWeek } from "date-fns"
 import type { PlanBaseline, PlanDependency, PlanEvent, PlanJSON, PlanPhase, PlanResource } from "@/lib/plan-types"
+// Relative `.ts` VALUE import (not `@/`): this module is loaded by
+// node --experimental-strip-types from the seed script and the verify
+// suite, where the alias does not resolve. Type-only `@/` imports are
+// fine — they never execute.
+import { addWorkingDays } from "../lib/umejson/working-time.ts"
+import { buildDemoCalendarPayload, DEMO_CALENDAR_KEY } from "./demo-calendar.ts"
 
 export type { PlanBaseline, PlanEvent, PlanResource, PlanPhase, PlanJSON, EventData } from "@/lib/plan-types"
 
@@ -51,10 +57,26 @@ export const RESPONSABLES: Record<string, string> = {
   "acta-entrega": "Residencia",
 }
 
-const week = (n: number) => addDays(anchor, n * 7)
-const days = (n: number) => addDays(anchor, n)
-
 const anchor = startOfWeek(new Date(), { weekStartsOn: 1 })
+const anchorMs = anchor.getTime()
+
+// Calendario demo (Lun–Vie + feriados sintéticos relativos al ancla): la
+// MISMA definición que siembra la hermana GanttCalendar genera las fechas
+// del plan, así ninguna barra arranca en fin de semana ni en feriado y el
+// grafo carga en sus bordes por construcción.
+const DEMO_CAL_PAYLOAD = buildDemoCalendarPayload(anchorMs)
+const demoCal =
+  DEMO_CAL_PAYLOAD.calendars.find((c) => c.id === DEMO_CALENDAR_KEY) ?? null
+
+/** Conversión corrido→laborable del demo (redondeo proporcional 5/7). */
+const wdur = (corridoDays: number): number =>
+  Math.round((corridoDays * 5) / 7)
+
+const iso = (instantMs: number): string => new Date(instantMs).toISOString()
+
+/** Fin de una tarea que arranca en `startMs` y dura `durationDays` corridos (convertidos a laborables). */
+const endAfter = (startMs: number, durationDays: number): string =>
+  iso(addWorkingDays(demoCal, startMs, wdur(durationDays)))
 
 // Concrete hexes (Tailwind v4 500-level), NOT `var()` references: the whole
 // paint chain (bars, baseline tones, swatches) then works without any
@@ -70,25 +92,53 @@ const phases: PlanPhase[] = [
   { id: "entrega", title: "Entrega", color: "#10b981" },
 ]
 
+/**
+ * Evento libre: su inicio sale del offset corrido convertido a laborables
+ * (ancla + addWorkingDays), su fin cuenta la duración en laborables.
+ */
 const event = (
   id: string,
   resourceId: string,
   startOffset: number,
   durationDays: number,
   progress: number,
-  _fase: string,
 ): PlanEvent => ({
   id,
   resourceId,
-  start: days(startOffset).toISOString(),
-  end: days(startOffset + durationDays).toISOString(),
+  start: iso(addWorkingDays(demoCal, anchorMs, wdur(startOffset))),
+  end: endAfter(addWorkingDays(demoCal, anchorMs, wdur(startOffset)), durationDays),
   progress,
 })
 
 /**
+ * Sucesor de una dependencia sembrada: el inicio DERIVA del borde del
+ * predecesor (fin + lag, ambos en laborables) en vez de un offset propio,
+ * así la restricción carga exactamente sentada en su límite — cero
+ * violaciones al abrir el demo (lo verifica la suite).
+ */
+const linkedEvent = (
+  id: string,
+  resourceId: string,
+  pred: PlanEvent,
+  durationDays: number,
+  progress: number,
+  lagDays = 0,
+): PlanEvent => {
+  const startMs = addWorkingDays(demoCal, Date.parse(pred.end), lagDays)
+  return {
+    id,
+    resourceId,
+    start: iso(startMs),
+    end: endAfter(startMs, durationDays),
+    progress,
+  }
+}
+
+/**
  * Seeds a baseline history on an event: each entry is a `[startOffset,
- * durationDays]` pair captured ten days before its own window, so versions
- * ascend in time like a real re-baselining log.
+ * durationDays]` corrido pair (converted to working dates like everything
+ * else), captured ten days before its own window, so versions ascend in
+ * time like a real re-baselining log.
  */
 const withBaselines = (
   e: PlanEvent,
@@ -96,69 +146,109 @@ const withBaselines = (
 ): PlanEvent => ({
   ...e,
   baselines: windows.map(
-    ([startOffset, durationDays], i): PlanBaseline => ({
-      version: i + 1,
-      start: days(startOffset).toISOString(),
-      end: days(startOffset + durationDays).toISOString(),
-      capturedAt: days(startOffset - 10).toISOString(),
-      reason: "Línea base aprobada",
-    }),
+    ([startOffset, durationDays], i): PlanBaseline => {
+      const startMs = addWorkingDays(demoCal, anchorMs, wdur(startOffset))
+      return {
+        version: i + 1,
+        start: iso(startMs),
+        end: endAfter(startMs, durationDays),
+        capturedAt: addDays(anchor, startOffset - 10).toISOString(),
+        reason: "Línea base aprobada",
+      }
+    },
   ),
 })
 
+const trazoNivelacion = event("trazo-nivelacion", "trazo-nivelacion", -10 * 7, 7, 100)
+// dep-01 (SS lag 0): mismo offset que trazo → arranques idénticos.
+const excavacion = event("excavacion", "excavacion", -10 * 7, 14, 100)
+const limpiezaTrazos = linkedEvent("limpieza-trazos", "limpieza-trazos", excavacion, 7, 100)
+
+const zapatasAisladas = event("zapatas-aisladas", "zapatas-aisladas", -8 * 7, 14, 100)
+const zapatasCorridas = event("zapatas-corridas", "zapatas-corridas", -7 * 7, 14, 100)
+const contratabes = event("contratabes", "contratabes", -7 * 7, 14, 100)
+const relleno = event("relleno", "relleno", -5 * 7, 7, 100)
+const impermeabilizacionCiment = event("impermeabilizacion-ciment", "impermeabilizacion-ciment", -5 * 7, 7, 100)
+
+const columnasPb = linkedEvent("columnas-pb", "columnas-pb", contratabes, 7, 100)
+const losaPb = withBaselines(linkedEvent("losa-pb", "losa-pb", columnasPb, 14, 85), [-4 * 7 - 3, 10])
+const columnasPa = linkedEvent("columnas-pa", "columnas-pa", losaPb, 7, 70)
+const cimbraAzotea = linkedEvent("losa-azotea-cimbra", "losa-azotea-cimbra", columnasPa, 7, 60)
+const concretoAzotea = linkedEvent("losa-azotea-concreto", "losa-azotea-concreto", cimbraAzotea, 7, 50)
+
+const murosBloquePb = event("muros-bloque-pb", "muros-bloque-pb", -1 * 7, 21, 40)
+const murosPa = withBaselines(
+  // dep-08: solapamiento documentado de −7 laborables desde el fin del pred.
+  linkedEvent("muros-pa", "muros-pa", murosBloquePb, 21, 25, -7),
+  [0, 14],
+)
+const castillosCadenas = event("castillos-cadenas", "castillos-cadenas", 3 * 7, 14, 10)
+const firmes = event("firmes", "firmes", 4 * 7, 14, 0)
+
+const electricaPb = event("electrica-empotrada-pb", "electrica-empotrada-pb", 2 * 7, 21, 15)
+const electricaPa = event("electrica-empotrada-pa", "electrica-empotrada-pa", 5 * 7, 14, 5)
+const hidrosanitaria = withBaselines(
+  event("hidrosanitaria", "hidrosanitaria", 3 * 7, 28, 10),
+  [3 * 7 - 7, 21],
+  [3 * 7 - 3, 24],
+)
+const gas = event("gas", "gas", 6 * 7, 14, 0)
+const vozDatos = event("voz-datos", "voz-datos", 6 * 7, 14, 0)
+
+const yesoPintura = linkedEvent("yeso-pintura", "yeso-pintura", electricaPa, 21, 0)
+const pisosCeramica = event("pisos-ceramica", "pisos-ceramica", 9 * 7, 21, 0)
+const carpinteria = event("carpinteria", "carpinteria", 11 * 7, 14, 0)
+const herreriaAluminio = event("herreria-aluminio", "herreria-aluminio", 11 * 7, 14, 0)
+
+const pruebasPuestasMarcha = linkedEvent("pruebas-puestas-marcha", "pruebas-puestas-marcha", herreriaAluminio, 14, 0)
+const limpiezaFina = event("limpieza-fina", "limpieza-fina", 15 * 7, 7, 0)
+const obraGrisCorrecciones = event("obra-gris-correcciones", "obra-gris-correcciones", 13 * 7, 14, 0)
+const kitEntrega = event("kit-entrega", "kit-entrega", 16 * 7, 7, 0)
+// Hito de cierre: duración 0 derivada del fin de kit-entrega + kind
+// milestone — el diamante del plan demo.
+const actaEntrega: PlanEvent = {
+  ...linkedEvent("acta-entrega", "acta-entrega", kitEntrega, 0, 0),
+  kind: "milestone" as const,
+}
+
 const events: PlanEvent[] = [
-  event("trazo-nivelacion", "trazo-nivelacion", -10 * 7, 7, 100, "preliminares"),
-  event("excavacion", "excavacion", -10 * 7, 14, 100, "preliminares"),
-  event("limpieza-trazos", "limpieza-trazos", -8 * 7, 7, 100, "preliminares"),
+  trazoNivelacion,
+  excavacion,
+  limpiezaTrazos,
 
-  event("zapatas-aisladas", "zapatas-aisladas", -8 * 7, 14, 100, "cimentacion"),
-  event("zapatas-corridas", "zapatas-corridas", -7 * 7, 14, 100, "cimentacion"),
-  event("contratabes", "contratabes", -7 * 7, 14, 100, "cimentacion"),
-  event("relleno", "relleno", -5 * 7, 7, 100, "cimentacion"),
-  event("impermeabilizacion-ciment", "impermeabilizacion-ciment", -5 * 7, 7, 100, "cimentacion"),
+  zapatasAisladas,
+  zapatasCorridas,
+  contratabes,
+  relleno,
+  impermeabilizacionCiment,
 
-  event("columnas-pb", "columnas-pb", -5 * 7, 7, 100, "estructura"),
-  withBaselines(
-    event("losa-pb", "losa-pb", -4 * 7, 14, 85, "estructura"),
-    [-4 * 7 - 3, 10],
-  ),
-  event("columnas-pa", "columnas-pa", -2 * 7, 7, 70, "estructura"),
-  event("losa-azotea-cimbra", "losa-azotea-cimbra", -1 * 7, 7, 60, "estructura"),
-  event("losa-azotea-concreto", "losa-azotea-concreto", 0, 7, 50, "estructura"),
+  columnasPb,
+  losaPb,
+  columnasPa,
+  cimbraAzotea,
+  concretoAzotea,
 
-  event("muros-bloque-pb", "muros-bloque-pb", -1 * 7, 21, 40, "albanileria"),
-  withBaselines(
-    event("muros-pa", "muros-pa", 1 * 7, 21, 25, "albanileria"),
-    [0, 14],
-  ),
-  event("castillos-cadenas", "castillos-cadenas", 3 * 7, 14, 10, "albanileria"),
-  event("firmes", "firmes", 4 * 7, 14, 0, "albanileria"),
+  murosBloquePb,
+  murosPa,
+  castillosCadenas,
+  firmes,
 
-  event("electrica-empotrada-pb", "electrica-empotrada-pb", 2 * 7, 21, 15, "instalaciones"),
-  event("electrica-empotrada-pa", "electrica-empotrada-pa", 5 * 7, 14, 5, "instalaciones"),
-  withBaselines(
-    event("hidrosanitaria", "hidrosanitaria", 3 * 7, 28, 10, "instalaciones"),
-    [3 * 7 - 7, 21],
-    [3 * 7 - 3, 24],
-  ),
-  event("gas", "gas", 6 * 7, 14, 0, "instalaciones"),
-  event("voz-datos", "voz-datos", 6 * 7, 14, 0, "instalaciones"),
+  electricaPb,
+  electricaPa,
+  hidrosanitaria,
+  gas,
+  vozDatos,
 
-  event("yeso-pintura", "yeso-pintura", 7 * 7, 21, 0, "acabados"),
-  event("pisos-ceramica", "pisos-ceramica", 9 * 7, 21, 0, "acabados"),
-  event("carpinteria", "carpinteria", 11 * 7, 14, 0, "acabados"),
-  event("herreria-aluminio", "herreria-aluminio", 11 * 7, 14, 0, "acabados"),
+  yesoPintura,
+  pisosCeramica,
+  carpinteria,
+  herreriaAluminio,
 
-  event("pruebas-puestas-marcha", "pruebas-puestas-marcha", 14 * 7, 14, 0, "entrega"),
-  event("limpieza-fina", "limpieza-fina", 15 * 7, 7, 0, "entrega"),
-  event("obra-gris-correcciones", "obra-gris-correcciones", 13 * 7, 14, 0, "entrega"),
-  event("kit-entrega", "kit-entrega", 16 * 7, 7, 0, "entrega"),
-  // Hito de cierre: duración 0 (el helper con durationDays = 0 ya produce
-  // end === start) + kind milestone — el diamante del plan demo.
-  {
-    ...event("acta-entrega", "acta-entrega", 17 * 7, 0, 0, "entrega"),
-    kind: "milestone" as const,
-  },
+  pruebasPuestasMarcha,
+  limpiezaFina,
+  obraGrisCorrecciones,
+  kitEntrega,
+  actaEntrega,
 ]
 
 const r = (
@@ -258,6 +348,15 @@ const dependencies: PlanDependency[] = [
   dep("dep-11", "kit-entrega", "acta-entrega"),
 ]
 
+// Corte de avance del demo (~40% de la ventana del plan) + convención de
+// fuera de secuencia por defecto. Aditivo-opcional en schema v2; los
+// kernels (cascada, CPM, EVM) lo leen directamente del plan.
+const planStartMs = Math.min(...events.map((e) => Date.parse(e.start)))
+const planEndMs = Math.max(...events.map((e) => Date.parse(e.end)))
+const STATUS_DATE = new Date(
+  planStartMs + 0.4 * (planEndMs - planStartMs),
+).toISOString()
+
 export const PLAN: PlanJSON = {
   schemaVersion: 2,
   anchor: anchor.toISOString(),
@@ -265,6 +364,6 @@ export const PLAN: PlanJSON = {
   phases,
   events,
   dependencies,
+  statusDate: STATUS_DATE,
+  schedulingOptions: { outOfSequence: "retainedLogic" },
 }
-
-export { week as weekOffset, days as daysOffset }

@@ -113,6 +113,13 @@ interface GanttCallbacks<TData = unknown> {
   /** Click on a tree row's surface (chevron/checkbox/grip clicks excluded). */
   onResourceClick?: (ctx: GanttColumnContext, e: React.MouseEvent) => void
   onResourceDoubleClick?: (ctx: GanttColumnContext, e: React.MouseEvent) => void
+  /**
+   * Commit of an inline title edit (double-click / F2 on the row label,
+   * Enter or blur commits, Escape cancels). Receives the TRIMMED text;
+   * blank drafts never reach this. The engine never mutates resources:
+   * adopt the title in your own state.
+   */
+  onResourceTitleCommit?: (resourceId: string, title: string) => void
   onRangeChange?: (info: GanttRangeInfo) => void
   onScaleChange?: (scale: GanttScale) => void
   onDateChange?: (date: Date) => void
@@ -1269,6 +1276,14 @@ interface GanttTreePanelConfig {
    * labels sit directly above the rows they name.
    */
   headerContent?: ReactNode
+  /**
+   * Inline title editing on tree rows: double-click / F2 on the label turns
+   * it into an input (Enter or blur commits, Escape cancels). `true` (or a
+   * per-row predicate) enables the DEFAULT label only - a custom
+   * renderResourceLabel owns its own editing story. Commits rise through
+   * onResourceTitleCommit. Inert while a reorder drag is active. Default off.
+   */
+  titleEditable?: boolean | ((ctx: GanttColumnContext) => boolean)
 }
 
 interface GanttRenderEventProps<TData = unknown> {
@@ -1293,6 +1308,12 @@ interface GanttTooltipExtrasProps<TData = unknown> {
 interface GanttViewConfig<TData = unknown> {
   /** Red now-line on the axis. */
   nowIndicator: boolean
+  /**
+   * Status-date marker (an ISO instant): a primary-colored line down the
+   * timeline with a dot cap pinned under the header — the field-progress
+   * cutoff twin of the red now-line. Omit for none.
+   */
+  statusMarker?: string
   /**
    * Day-scale unit interval in minutes: axis units and gridlines follow it.
    */
@@ -1636,6 +1657,7 @@ function useGanttViewConfig<TData = unknown>(): GanttViewConfig<TData> {
 
 const VIEW_CONFIG_KEYS: Array<keyof GanttViewConfig> = [
   "nowIndicator",
+  "statusMarker",
   "interval",
   "scrollbars",
   "displayScheduleHint",
@@ -1744,6 +1766,7 @@ const OPTION_KEYS: Array<keyof UseGanttStateOptions> = [
   "canCreateTask",
   "onResourceClick",
   "onResourceDoubleClick",
+  "onResourceTitleCommit",
   "onRangeChange",
   "onScaleChange",
   "onDateChange",
