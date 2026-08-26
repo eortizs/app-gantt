@@ -15,6 +15,7 @@ import {
 import {
   cascadeSchedule,
   dependentClosure,
+  impliedLagDays,
   snapToDependency,
   wouldCreateCycle,
 } from "../src/lib/umejson/schedule.ts"
@@ -1853,6 +1854,72 @@ for (const [label, input] of rejectionCases) {
         fail("snap: relaxing cascades nothing", "dependents moved")
       } else ok("snap: relaxing seats back, cascade stays forward-only")
     }
+  }
+}
+
+// ---- 25. impliedLagDays: lectura del lag desde fechas vivas ---------------
+{
+  const t = (days: number) => new Date(Date.parse(ISO) + days * 86_400_000).toISOString()
+  const pred = { start: t(0), end: t(2) }
+
+  // FS reads succ.start - pred.end; SS start-to-start.
+  if (impliedLagDays({ type: "FS" }, pred, { start: t(-1), end: t(3) }) !== -3) {
+    fail("implied-lag: FS", String(impliedLagDays({ type: "FS" }, pred, { start: t(-1), end: t(3) })))
+  } else ok("implied-lag: FS reads succ.start − pred.end")
+  if (impliedLagDays({ type: "SS" }, pred, { start: t(5), end: t(9) }) !== 5) {
+    fail("implied-lag: SS", "wrong value")
+  } else ok("implied-lag: SS reads succ.start − pred.start")
+
+  // FF reads end-to-end; SF reads succ.end - pred.start.
+  if (impliedLagDays({ type: "FF" }, pred, { start: t(4), end: t(6) }) !== 4) {
+    fail("implied-lag: FF", "wrong value")
+  } else ok("implied-lag: FF reads succ.end − pred.end")
+  if (impliedLagDays({ type: "SF" }, pred, { start: t(7), end: t(1) }) !== 1) {
+    fail("implied-lag: SF", "wrong value")
+  } else ok("implied-lag: SF reads succ.end − pred.start")
+
+  // Same rounding as the cascade/snap (half-days round away from zero).
+  if (impliedLagDays({ type: "FS" }, pred, { start: t(4.5), end: t(6) }) !== 3) {
+    fail("implied-lag: rounding", "half-day did not round")
+  } else ok("implied-lag: half-day rounds like the cascade")
+
+  // Date objects (the engine's live events) are accepted directly.
+  if (impliedLagDays({ type: "FS" }, { start: new Date(Date.parse(ISO)), end: new Date(t(2)) }, { start: new Date(t(2)), end: new Date(t(5)) }) !== 0) {
+    fail("implied-lag: Date objects", "wrong value")
+  } else ok("implied-lag: accepts live Date objects (bar at bound → 0)")
+
+  // Round-trip with the snap: implied(snap(x)) === x for every type.
+  for (const type of ["FS", "SS", "FF", "SF"] as const) {
+    const plan: PlanJSON = {
+      schemaVersion: 2,
+      anchor: ISO,
+      phases: [],
+      resources: [{ id: "r", title: "R" }],
+      events: [
+        { id: "a", resourceId: "r", start: t(0), end: t(3), progress: 0 },
+        { id: "b", resourceId: "r", start: t(10), end: t(14), progress: 0 },
+      ],
+      dependencies: [{ id: "d", fromEventId: "a", toEventId: "b", type, lagDays: -2 }],
+    }
+    const dep = plan.dependencies![0]!
+    const snap = snapToDependency(plan, dep)
+    if (!snap) {
+      fail(`implied-lag: round-trip ${type}`, "snap produced nothing")
+      continue
+    }
+    const seated: PlanJSON = {
+      ...plan,
+      events: plan.events.map((e) =>
+        e.id === "b" ? { ...e, start: snap.start, end: snap.end } : e,
+      ),
+    }
+    const implied = impliedLagDays(
+      dep,
+      { start: seated.events[0]!.start, end: seated.events[0]!.end },
+      { start: seated.events[1]!.start, end: seated.events[1]!.end },
+    )
+    if (implied !== -2) fail(`implied-lag: round-trip ${type}`, String(implied))
+    else ok(`implied-lag: implied(snap(lag)) === lag (${type})`)
   }
 }
 

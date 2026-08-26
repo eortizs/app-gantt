@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -58,7 +59,12 @@ import {
   toGanttEvents,
   toGanttResources,
 } from "@/lib/plan-mapper"
-import { wouldCreateCycle, dependentClosure, type ScheduleAdjustment } from "@/lib/umejson/schedule"
+import {
+  impliedLagDays,
+  wouldCreateCycle,
+  dependentClosure,
+  type ScheduleAdjustment,
+} from "@/lib/umejson/schedule"
 import { cpmSchedule } from "@/lib/umejson/cpm"
 import { isDrifted as isPlanDrifted, type DriftSubject } from "@/lib/umejson/baselines"
 import { applyOps, encodeUpdatedPlan, type ChangeOp } from "@/lib/umejson/codec"
@@ -1332,11 +1338,14 @@ function BaselineHistoryPanel({
  * type (and lag), and edits the edge's SHAPE - a segmented FS/SS/FF/SF
  * control plus a signed lag stepper (negative = overlap/lead). Every
  * commit travels as ONE net op (the recorder folds by dep id) AND
- * re-seats the dependent bar exactly at the new constraint's bound
+ * re-seats the dependent bar exactly at its new constraint's bound
  * (bidirectional - see recorder.updateDependency), so the timeline shows
- * the edit immediately. Anchored to the CLICK point; like the baseline
- * panel it closes when anything reflows under it, so it can never end up
- * describing the wrong edge.
+ * the edit immediately. Anchored ABOVE the click point: the dependent
+ * bar sits BELOW the connector, and watching it re-seat is the whole
+ * point of the editor - opening downward covered exactly the bar the
+ * user is about to move (falls back below only when the viewport's top
+ * leaves no room). Like the baseline panel it closes when anything
+ * reflows under it, so it can never end up describing the wrong edge.
  */
 function DependencyPanel({
   mark,
@@ -1356,17 +1365,41 @@ function DependencyPanel({
   onClose: () => void
 }) {
   const cardRef = useRef<HTMLDivElement | null>(null)
+  // Above by default; flipped below only when the measured card would
+  // overflow the viewport's top (measured pre-paint so it never flashes).
+  const [flipBelow, setFlipBelow] = useState(false)
+  useLayoutEffect(() => {
+    const height = cardRef.current?.offsetHeight ?? 0
+    setFlipBelow(point.y - 8 - height < 8)
+  }, [point.y])
   const dep = deps.find((d) => d.id === mark.key)
-  const committedLag = dep?.lagDays ?? 0
+  const predEv = events.find((ev) => ev.id === dep?.fromEventId)
+  const succEv = events.find((ev) => ev.id === dep?.toEventId)
+  // Lag EFECTIVO: leído de las fechas vivas de ambos extremos (misma
+  // matemática que snapToDependency, convención inversa). Es lo que el
+  // panel muestra y la base de los steppers, así un drag manual de
+  // cualquiera de las barras se refleja acá al soltar — el documento solo
+  // cambia cuando el usuario confirma una edición.
+  const effectiveLag = useMemo(
+    () =>
+      dep && predEv && succEv
+        ? impliedLagDays(
+            dep,
+            { start: predEv.start, end: predEv.end },
+            { start: succEv.start, end: succEv.end },
+          )
+        : (dep?.lagDays ?? 0),
+    [dep, predEv, succEv],
+  )
   // Draft of the lag input: committed on blur/Enter/steppers, never
-  // mid-typing. Re-synced from the live dep when a commit lands (the
-  // render-time adjustment pattern: no effect, no stale number on screen
-  // after a rejected edit).
-  const [lagDraft, setLagDraft] = useState(String(committedLag))
-  const [syncedLag, setSyncedLag] = useState(committedLag)
-  if (committedLag !== syncedLag) {
-    setSyncedLag(committedLag)
-    setLagDraft(String(committedLag))
+  // mid-typing. Re-synced from the EFFECTIVE lag whenever it moves (a
+  // commit's snap, or a bar dragged elsewhere) - the render-time
+  // adjustment pattern: no effect, no stale number on screen.
+  const [lagDraft, setLagDraft] = useState(String(effectiveLag))
+  const [syncedLag, setSyncedLag] = useState(effectiveLag)
+  if (effectiveLag !== syncedLag) {
+    setSyncedLag(effectiveLag)
+    setLagDraft(String(effectiveLag))
   }
 
   useEffect(() => {
@@ -1403,16 +1436,28 @@ function DependencyPanel({
     window.innerWidth - 120,
   )
 
+  // Every commit normalizes the document to the SHOWN (effective) lag
+  // before applying its own delta/type, so a prior manual drag is never
+  // lost nor produces a surprising jump: what you see is the base.
+  const commitShape = (shape: {
+    type?: PlanDependency["type"]
+    lagDays?: number
+  }) => {
+    if (!dep) return
+    const type = shape.type ?? dep.type
+    const lagDays = shape.lagDays ?? effectiveLag
+    if (type === dep.type && lagDays === (dep.lagDays ?? 0)) return
+    onUpdate({ ...dep, type, lagDays })
+  }
   const commitLag = (raw: string) => {
     const parsed = Number.parseInt(raw.trim(), 10)
     const next = Number.isFinite(parsed) ? parsed : 0
     setLagDraft(String(next))
-    if (next !== committedLag) onUpdate({ ...dep, lagDays: next })
+    commitShape({ lagDays: next })
   }
-  const stepLag = (delta: number) =>
-    commitLag(String(committedLag + delta))
+  const stepLag = (delta: number) => commitShape({ lagDays: effectiveLag + delta })
   const commitType = (type: PlanDependency["type"]) => {
-    if (type !== dep.type) onUpdate({ ...dep, type })
+    if (dep && type !== dep.type) commitShape({ type })
   }
 
   return (
@@ -1423,12 +1468,16 @@ function DependencyPanel({
         titleOf(dep.fromEventId),
         titleOf(dep.toEventId),
         typeLabel,
-        dep.lagDays,
+        effectiveLag,
       )}
       tabIndex={-1}
       data-slot="gantt-dependency-panel"
       className="bg-popover text-popover-foreground ring-ring/20 fixed z-50 w-max max-w-80 rounded-md py-2 text-xs shadow-md outline-none ring-1"
-      style={{ left, top: point.y + 8, transform: "translateX(-50%)" }}
+      style={
+        flipBelow
+          ? { left, top: point.y + 8, transform: "translateX(-50%)" }
+          : { left, top: point.y - 8, transform: "translate(-50%, -100%)" }
+      }
       onPointerDown={(e) => e.stopPropagation()}
     >
       <div className="flex items-start justify-between gap-4 px-3 pb-1">
@@ -1449,10 +1498,10 @@ function DependencyPanel({
       </div>
       <div className="text-muted-foreground flex items-center gap-2 whitespace-nowrap px-3">
         <span>{typeLabel}</span>
-        {!!dep.lagDays && (
+        {!!effectiveLag && (
           <span className="tabular-nums">
-            ({dep.lagDays > 0 ? "+" : ""}
-            {dep.lagDays} d)
+            ({effectiveLag > 0 ? "+" : ""}
+            {effectiveLag} d)
           </span>
         )}
         {mark.violated && (

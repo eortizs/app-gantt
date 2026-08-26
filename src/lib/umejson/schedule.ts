@@ -216,6 +216,36 @@ export function snapToDependency(
 }
 
 /**
+ * Lag IMPLICIT in the two endpoints' live dates under the edge's type —
+ * the read-side counterpart of `snapToDependency` (same rounding, inverse
+ * convention: snap writes dates FROM a lag, impliedLag reads the lag FROM
+ * dates). FS/SS measure start-to-X, FF/SF end-to-X per the constraint's
+ * meaning. The dependency panel renders this so a manual drag of either
+ * bar is reflected the moment it drops, without touching the stored op.
+ */
+export function impliedLagDays(
+  dep: Pick<PlanDependency, "type">,
+  pred: { start: string | Date; end: string | Date },
+  succ: { start: string | Date; end: string | Date },
+): number {
+  const ms = (v: string | Date): number =>
+    typeof v === "number"
+      ? v
+      : v instanceof Date
+        ? v.getTime()
+        : Date.parse(v)
+  const [from, to] =
+    dep.type === "SS"
+      ? [ms(pred.start), ms(succ.start)]
+      : dep.type === "FF"
+        ? [ms(pred.end), ms(succ.end)]
+        : dep.type === "SF"
+          ? [ms(pred.start), ms(succ.end)]
+          : [ms(pred.end), ms(succ.start)] // FS
+  return Math.round((to - from) / DAY_MS)
+}
+
+/**
  * Transitive closure of successors reachable from `seedIds` along the
  * `fromEventId -> toEventId` direction. Excludes the seeds themselves; a
  * diamond (A->B, A->C, B->D, C->D) visits D once because of the visited

@@ -188,7 +188,7 @@ export type ChangeOp = UpdateOp | CreateOp | DeleteOp | AddDependencyOp | Update
 
 ### Editor de dependencias: tipo + lag con reasiento automático
 
-El clic sobre un conector abre `DependencyPanel`, que además de nombrar ambos extremos y ofrecer «Quitar» permite **editar la forma de la restricción**:
+El clic sobre un conector abre `DependencyPanel` **anclado por encima del punto de clic** (con fallback hacia abajo solo si no entra en el viewport): la barra dependiente vive debajo del conector y mirarla reasentarse es el punto del editor — abrirlo hacia abajo tapaba exactamente la barra que se está por mover. Además de nombrar ambos extremos y ofrecer «Quitar», permite **editar la forma de la restricción**:
 
 - **Tipo**: botones segmentados FS / SS / FF / SF.
 - **Lag**: stepper − / valor / + con input entero firmado (negativo = solapamiento/lead). Commit en blur/Enter/botones, nunca mid-typing; la forma canónica omite `lagDays === 0`.
@@ -203,6 +203,8 @@ Cada commit viaja como UNA op neta (el recorder colapsa por id de edge: edicione
 | SF | fin = inicio del predecesor (+lag) |
 
 El reasiento es **bidireccional por diseño** (el usuario eligió la forma de la restricción — decisión humana mediada por UI), distinto de `cascadeSchedule` que sigue siendo **forward-only**: tras sentar la barra, la cascada transitive empuja dependientes si el nuevo borde aprieta, y no mueve nada si relaja. El op de reasiento documenta su causa (`cause.shiftDays` firmado — negativo = asiento hacia atrás). Si otra restricción del sucesor ata más tarde, la cascada corrige hacia adelante y esa queda como la binding del `cause`. `snapToDependency` devuelve `null` cuando la barra ya está en el borde (sin op de ruido) o falta un endpoint.
+
+La lectura también es bidireccional: el panel muestra el **lag efectivo** leído de las fechas vivas de los extremos (`impliedLagDays` — misma matemática que el snap, convención inversa), así que arrastrar cualquiera de las dos barras actualiza el valor mostrado al soltar/reabrir sin tocar el documento; los steppers y el cambio de tipo parten de ese valor visible y lo materializan en el documento recién al confirmar.
 
 ### Tarea ⇄ hito (`kind: "milestone"`)
 
@@ -259,7 +261,7 @@ out ──▶│  ChangeOp[]  +  entityOut  ──▶  ChangesetPanel           
 pnpm verify   # node --experimental-strip-types scripts/verify-roundtrip.mts
 ```
 
-Cubre: round-trip del payload, `applyOps(update+create+delete+dependencias)`, cascada documentada, reasiento de dependencias (`snapToDependency` FS/SS/FF/SF, lag negativo, composición seat+cascada), política de drift, contrato de change requests, CPM (lag, SS/FF, diamante, lead, tarea aislada, vacío), entidades contables (decode happy/rejections/refs) y EVM (caso calculado a mano, CPI 0, cortes fuera de rango).
+Cubre: round-trip del payload, `applyOps(update+create+delete+dependencias)`, cascada documentada, reasiento de dependencias (`snapToDependency` FS/SS/FF/SF, lag negativo, composición seat+cascada) y su contraparte de lectura (`impliedLagDays`: lecturas por tipo, redondeo, round-trip `implied(snap(lag)) === lag`), política de drift, contrato de change requests, CPM (lag, SS/FF, diamante, lead, tarea aislada, vacío), entidades contables (decode happy/rejections/refs) y EVM (caso calculado a mano, CPI 0, cortes fuera de rango).
 
 ## Backend `gantt-api` (`server/`)
 
