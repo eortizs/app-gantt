@@ -14,7 +14,10 @@ export interface DependencyCause {
   /** Predecessor whose constraint bound this event's new position. */
   sourceEventId: string
   type: DependencyType
-  /** Whole calendar days the event was pushed forward by this cascade. */
+  /**
+   * Signed whole calendar days of this move (positive = pushed forward
+   * by a cascade, negative = seated back by an edge-shape edit snap).
+   */
   shiftDays: number
 }
 
@@ -168,6 +171,48 @@ export function cascadeSchedule(
     }
   }
   return adjustments
+}
+
+/**
+ * Seats a successor EXACTLY at its constraint's bound: FS → start at the
+ * predecessor's end (+lag), SS → starts aligned, FF → ends aligned, SF →
+ * end at the predecessor's start. Duration is preserved; the move is
+ * BIDIRECTIONAL by design — this is the edge-SHAPE-EDIT gesture (the user
+ * chose the constraint, so the bar re-seats on both sides), distinct from
+ * `cascadeSchedule`, which stays forward-only. Returns null when an
+ * endpoint is missing from the plan or the bar already sits at the bound.
+ */
+export function snapToDependency(
+  plan: PlanJSON,
+  dep: PlanDependency,
+): ScheduleAdjustment | null {
+  const events = new Map(plan.events.map((e) => [e.id, e]))
+  const pred = events.get(dep.fromEventId)
+  const succ = events.get(dep.toEventId)
+  if (!pred || !succ) return null
+  const startMs = Date.parse(succ.start)
+  const durationMs = Math.max(Date.parse(succ.end) - startMs, 0)
+  const boundMs = earliestStart(
+    Date.parse(pred.start),
+    Date.parse(pred.end),
+    durationMs,
+    dep.type,
+    lagMs(dep),
+  )
+  const start = new Date(boundMs).toISOString()
+  const end = new Date(Math.max(boundMs + durationMs, boundMs)).toISOString()
+  if (start === succ.start && end === succ.end) return null
+  return {
+    eventId: succ.id,
+    start,
+    end,
+    cause: {
+      kind: "dependency-cascade",
+      sourceEventId: pred.id,
+      type: dep.type,
+      shiftDays: Math.round((boundMs - startMs) / DAY_MS),
+    },
+  }
 }
 
 /**

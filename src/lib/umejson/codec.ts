@@ -54,6 +54,11 @@ export type AddDependencyOp = {
   dependency: PlanDependency
 }
 
+export type UpdateDependencyOp = {
+  op: "updateDependency"
+  dependency: PlanDependency
+}
+
 export type RemoveDependencyOp = {
   op: "removeDependency"
   id: string
@@ -64,6 +69,7 @@ export type ChangeOp =
   | CreateOp
   | DeleteOp
   | AddDependencyOp
+  | UpdateDependencyOp
   | RemoveDependencyOp
 
 export function applyOps(plan: PlanJSON, ops: ChangeOp[]): PlanJSON {
@@ -110,6 +116,14 @@ export function applyOps(plan: PlanJSON, ops: ChangeOp[]): PlanJSON {
     } else if (op.op === "addDependency") {
       const rest = deps().filter((d) => d.id !== op.dependency.id)
       dependencies = [...rest, op.dependency]
+    } else if (op.op === "updateDependency") {
+      // Replace by id only; an unknown id is a silent no-op (same
+      // criterion as update on a ghost event). Adding a NEW edge is
+      // addDependency's job - the create+edit story folds into one op
+      // at the recorder, so applyOps never needs to synthesize edges.
+      dependencies = deps().map((d) =>
+        d.id === op.dependency.id ? op.dependency : d,
+      )
     } else {
       dependencies = deps().filter((d) => d.id !== op.id)
     }

@@ -175,7 +175,9 @@ export function buildImpactSnapshot(
   const seeds = ops.flatMap((op) => {
     if (op.op === "update" || op.op === "delete") return [op.id]
     if (op.op === "create") return [op.event.id]
-    if (op.op === "addDependency") return [op.dependency.toEventId]
+    if (op.op === "addDependency" || op.op === "updateDependency") {
+      return [op.dependency.toEventId]
+    }
     return []
   })
   const affected = [
@@ -484,7 +486,8 @@ const validateOps = (
         }
         break
       }
-      case "addDependency": {
+      case "addDependency":
+      case "updateDependency": {
         if (!isObject(op.dependency)) {
           errors.push(err(`${p}.dependency`, "type", "op.dependency must be an object"))
           break
@@ -510,7 +513,7 @@ const validateOps = (
         break
       }
       default:
-        errors.push(err(`${p}.op`, "enum", "op must be one of update, create, delete, addDependency, removeDependency"))
+        errors.push(err(`${p}.op`, "enum", "op must be one of update, create, delete, addDependency, updateDependency, removeDependency"))
     }
   })
 }
@@ -752,11 +755,26 @@ export function decodeChangeRequest(
           if (typeof op.id === "string" && !known.has(op.id)) {
             errors.push(err(p, "ref", `op targets unknown event "${op.id}"`))
           }
-        } else if (op.op === "addDependency" && isObject(op.dependency)) {
+        } else if (
+          (op.op === "addDependency" || op.op === "updateDependency") &&
+          isObject(op.dependency)
+        ) {
           for (const side of ["fromEventId", "toEventId"] as const) {
             const v = op.dependency[side]
             if (typeof v === "string" && !known.has(v)) {
               errors.push(err(`${p}.dependency.${side}`, "ref", `dependency endpoint "${v}" is not an event of the bound plan`))
+            }
+          }
+          // An update targets an edge the plan must already carry: an op
+          // over a ghost edge is a contract drift, rejected here so the
+          // server's boundary decode turns it into a 422.
+          if (op.op === "updateDependency") {
+            const depId = op.dependency.id
+            if (
+              typeof depId === "string" &&
+              !(plan.dependencies ?? []).some((d) => d.id === depId)
+            ) {
+              errors.push(err(`${p}.dependency.id`, "ref", `op updates unknown dependency "${depId}"`))
             }
           }
         }

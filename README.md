@@ -54,11 +54,11 @@ src/
 │   ├── plan-types.ts             # tipos PlanJSON v2 + EventData (compartidos data ↔ lib ↔ umejson)
 │   ├── plan-mapper.ts            # PlanJSON → GanttEvent[] + GanttResource[] (puro sobre el plan recibido)
 │   ├── wbs-levels.ts             # paleta L0–L4 + helper wbsLevelStyle(depth)
-│   ├── changeset.ts              # recorder de operaciones (drag/resize/create/dependencias); re-exporta ChangeOp
+ │   ├── changeset.ts              # recorder de operaciones (drag/resize/create/dependencias, updateDependency con snap); re-exporta ChangeOp
 │   ├── umejson/                  # CONTRATO (runtime-puro, imports relativos .ts — lo importa el backend verbatim)
 │   │   ├── schema.ts             # UmeJsonEntity + decodeUmePlan() + validateUmeEnvelope() (DSL compartido)
-│   │   ├── codec.ts              # ChangeOp + applyOps() + encodeUpdatedPlan() (capa anti-corrupción)
-│   │   ├── schedule.ts           # grafo: cascadeSchedule (push-forward), dependentClosure, wouldCreateCycle
+ │   │   ├── codec.ts              # ChangeOp + applyOps() + encodeUpdatedPlan() (capa anti-corrupción)
+ │   │   ├── schedule.ts           # grafo: cascadeSchedule (push-forward), snapToDependency (reasiento al borde), dependentClosure, wouldCreateCycle
 │   │   ├── baselines.ts          # política de drift: vigenteBaseline, driftReference/isDrifted, driftDays
 │   │   ├── change-request.ts     # contrato del módulo de control de cambios (entidad propia, transiciones legales)
 │   │   ├── cpm.ts                # CPM runtime-puro: ES/EF/LS/LF, holgura total, conjunto crítico
@@ -178,8 +178,31 @@ export type CreateOp = {
   }
 }
 export type DeleteOp = { op: "delete"; id: string }
-export type ChangeOp = UpdateOp | CreateOp | DeleteOp | AddDependencyOp | RemoveDependencyOp
+export type AddDependencyOp = { op: "addDependency"; dependency: PlanDependency }
+export type UpdateDependencyOp = { op: "updateDependency"; dependency: PlanDependency }
+export type RemoveDependencyOp = { op: "removeDependency"; id: string }
+export type ChangeOp = UpdateOp | CreateOp | DeleteOp | AddDependencyOp | UpdateDependencyOp | RemoveDependencyOp
 ```
+
+`UpdateDependencyOp` **reemplaza** la forma del edge (type y/o `lagDays`) por id; id desconocido = no-op silencioso (mismo criterio que update sobre evento fantasma). El decoder de CRs, además de validar la forma, chequea contra el plan bound que el id de la dependencia exista (op sobre edge inexistente → 422 server-side).
+
+### Editor de dependencias: tipo + lag con reasiento automático
+
+El clic sobre un conector abre `DependencyPanel`, que además de nombrar ambos extremos y ofrecer «Quitar» permite **editar la forma de la restricción**:
+
+- **Tipo**: botones segmentados FS / SS / FF / SF.
+- **Lag**: stepper − / valor / + con input entero firmado (negativo = solapamiento/lead). Commit en blur/Enter/botones, nunca mid-typing; la forma canónica omite `lagDays === 0`.
+
+Cada commit viaja como UNA op neta (el recorder colapsa por id de edge: ediciones repetidas = una sola `updateDependency`; add+edición = una sola `addDependency` con la forma final) y **reasienta la barra dependiente exactamente en el borde de la nueva restricción** vía `snapToDependency`:
+
+| Tipo | La barra dependiente se sienta en… |
+|---|---|
+| FS | inicio = fin del predecesor (+lag) |
+| SS | inicios alineados (+lag) |
+| FF | fines alineados (+lag), duración preservada |
+| SF | fin = inicio del predecesor (+lag) |
+
+El reasiento es **bidireccional por diseño** (el usuario eligió la forma de la restricción — decisión humana mediada por UI), distinto de `cascadeSchedule` que sigue siendo **forward-only**: tras sentar la barra, la cascada transitive empuja dependientes si el nuevo borde aprieta, y no mueve nada si relaja. El op de reasiento documenta su causa (`cause.shiftDays` firmado — negativo = asiento hacia atrás). Si otra restricción del sucesor ata más tarde, la cascada corrige hacia adelante y esa queda como la binding del `cause`. `snapToDependency` devuelve `null` cuando la barra ya está en el borde (sin op de ruido) o falta un endpoint.
 
 ### Tarea ⇄ hito (`kind: "milestone"`)
 
@@ -187,7 +210,7 @@ El menú contextual de cada barra ofrece **«Convertir en hito» / «Convertir e
 
 El panel `ChangesetPanel` inferior muestra dos secciones: el **`Op[]`** acumulado y, cuando hay cambios, el **documento umeJSON actualizado** (entidad lista para POST). Ambos con **Copiar JSON**.
 
-> **Nota sobre dependencias**: crear dependencias es **drag-and-drop** — se arranca desde los puntos de conexión en los bordes de la barra (con veto de ciclo en vivo `canConnectEvents`) y suelta sobre la tarea sucesora; no hay opción de alta en el menú contextual. El menú (y el clic sobre el conector, que abre `DependencyPanel`) queda para **quitar**.
+> **Nota sobre dependencias**: crear dependencias es **drag-and-drop** — se arranca desde los puntos de conexión en los bordes de la barra (con veto de ciclo en vivo `canConnectEvents`) y suelta sobre la tarea sucesora; no hay opción de alta en el menú contextual. El menú queda para **quitar**; el clic sobre el conector abre `DependencyPanel`, que además de quitar **edita tipo y lag** (ver arriba).
 > **Nota sobre borrado**: el menú contextual de cada barra expone borrado (`DeleteOp` vía `recorder.onEventDelete` + `GanttApi.removeEvent`); `applyOps` poda las dependencias incidentes para que el documento nunca quede con refs colgantes.
 
 ## Pipeline umeJSON (caja negra)
@@ -236,7 +259,7 @@ out ──▶│  ChangeOp[]  +  entityOut  ──▶  ChangesetPanel           
 pnpm verify   # node --experimental-strip-types scripts/verify-roundtrip.mts
 ```
 
-Cubre: round-trip del payload, `applyOps(update+create+delete+dependencias)`, cascada documentada, política de drift, contrato de change requests, CPM (lag, SS/FF, diamante, lead, tarea aislada, vacío), entidades contables (decode happy/rejections/refs) y EVM (caso calculado a mano, CPI 0, cortes fuera de rango).
+Cubre: round-trip del payload, `applyOps(update+create+delete+dependencias)`, cascada documentada, reasiento de dependencias (`snapToDependency` FS/SS/FF/SF, lag negativo, composición seat+cascada), política de drift, contrato de change requests, CPM (lag, SS/FF, diamante, lead, tarea aislada, vacío), entidades contables (decode happy/rejections/refs) y EVM (caso calculado a mano, CPI 0, cortes fuera de rango).
 
 ## Backend `gantt-api` (`server/`)
 

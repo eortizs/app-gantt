@@ -104,8 +104,25 @@ export const APP_STRINGS_ES = {
   dependencyRemoveAction: "Quitar",
   dependencyClose: "Cerrar panel de dependencia",
   /** Connector tooltip/aria text: type + lag between two named events. */
-  dependencyAriaLabel: (fromTitle: string, toTitle: string, type: string) =>
-    `${fromTitle} → ${toTitle} (${type})`,
+  dependencyAriaLabel: (
+    fromTitle: string,
+    toTitle: string,
+    type: string,
+    lagDays?: number,
+  ) =>
+    `${fromTitle} → ${toTitle} (${type}${
+      lagDays ? `, ${lagDays > 0 ? "+" : ""}${lagDays} d` : ""
+    })`,
+  /** Segmented control heading: the constraint type of the edge. */
+  dependencyTypeLabel: "Tipo",
+  /** Lag stepper heading (calendar days, signed). */
+  dependencyLagLabel: "Lag (días)",
+  /** Hint under the lag stepper: negative lag = overlap (lead). */
+  dependencyLagHint: "Negativo = solapamiento (adelanto)",
+  /** Stepper button: subtract one day of lag. */
+  dependencyLagDecrease: "Restar un día de lag",
+  /** Stepper button: add one day of lag. */
+  dependencyLagIncrease: "Sumar un día de lag",
   /** Cause badge on auto-adjusted ops in the changeset JSON. */
   cascadeCauseLegend:
     "Los ops con «cause» son ajustes automáticos en cascada por dependencias; el resto son ediciones manuales.",

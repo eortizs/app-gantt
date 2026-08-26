@@ -15,6 +15,7 @@ import {
 import {
   cascadeSchedule,
   dependentClosure,
+  snapToDependency,
   wouldCreateCycle,
 } from "../src/lib/umejson/schedule.ts"
 import { cpmSchedule } from "../src/lib/umejson/cpm.ts"
@@ -1551,6 +1552,306 @@ for (const [label, input] of rejectionCases) {
           fail("milestone: demo breakdown 0/0/0", JSON.stringify(part))
         } else ok("milestone: demo budget BAC 0 with exact 0/0/0 partition")
       }
+    }
+  }
+}
+
+// ---- 23. updateDependency: op de forma + matemática del editor ------------
+{
+  const t = (days: number) => new Date(Date.parse(ISO) + days * 86_400_000).toISOString()
+  const plan: PlanJSON = {
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: [
+      { id: "a", resourceId: "r", start: t(0), end: t(2), progress: 0 },
+      { id: "b", resourceId: "r", start: t(1), end: t(3), progress: 0 },
+      { id: "c", resourceId: "r", start: t(2), end: t(4), progress: 0 },
+    ],
+    dependencies: [
+      { id: "d1", fromEventId: "a", toEventId: "b", type: "FS" },
+      { id: "d2", fromEventId: "b", toEventId: "c", type: "FS" },
+    ],
+  }
+
+  // Replaces the shape (type + lag) by id; sibling edges untouched.
+  const reshaped = applyOps(plan, [
+    { op: "updateDependency", dependency: { id: "d1", fromEventId: "a", toEventId: "b", type: "SS", lagDays: -3 } },
+  ])
+  const d1 = reshaped.dependencies?.find((d) => d.id === "d1")
+  const d2 = reshaped.dependencies?.find((d) => d.id === "d2")
+  if (
+    !d1 || d1.type !== "SS" || d1.lagDays !== -3 ||
+    !d2 || d2.type !== "FS" || d2.lagDays !== undefined
+  ) {
+    fail("upd-dep: replaces shape by id", JSON.stringify(reshaped.dependencies))
+  } else ok("upd-dep: replaces shape by id")
+
+  // Unknown id: silent no-op, graph intact (same criterion as update on
+  // a ghost event).
+  const ghost = applyOps(plan, [
+    { op: "updateDependency", dependency: { id: "nope", fromEventId: "a", toEventId: "b", type: "SS" } },
+  ])
+  if (!deepEqual(ghost, plan)) fail("upd-dep: unknown id is a no-op", "graph changed")
+  else ok("upd-dep: unknown id is a no-op")
+
+  // add + update sequence: the update lands on the added edge.
+  const seq = applyOps(plan, [
+    { op: "addDependency", dependency: { id: "d3", fromEventId: "a", toEventId: "c", type: "FS" } },
+    { op: "updateDependency", dependency: { id: "d3", fromEventId: "a", toEventId: "c", type: "FS", lagDays: 4 } },
+  ])
+  const d3 = seq.dependencies?.find((d) => d.id === "d3")
+  if (!d3 || d3.lagDays !== 4 || seq.dependencies?.length !== 3) {
+    fail("upd-dep: add then update", JSON.stringify(seq.dependencies))
+  } else ok("upd-dep: add then update lands on the added edge")
+
+  // Editor math: FS lag −3 with the successor exactly at the bound.
+  // Tightening to lag 0 pushes +3 (documented cause); relaxing back to
+  // −3 moves nothing (forward-only).
+  const lagPlan: PlanJSON = {
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: [
+      { id: "a", resourceId: "r", start: t(0), end: t(2), progress: 0 },
+      { id: "b", resourceId: "r", start: t(-1), end: t(1), progress: 0 },
+    ],
+    dependencies: [{ id: "d", fromEventId: "a", toEventId: "b", type: "FS", lagDays: -3 }],
+  }
+  const tightened = applyOps(lagPlan, [
+    { op: "updateDependency", dependency: { id: "d", fromEventId: "a", toEventId: "b", type: "FS" } },
+  ])
+  const push = cascadeSchedule(tightened, ["b"])
+  const pushAdj = push[0]
+  if (
+    push.length !== 1 ||
+    pushAdj?.eventId !== "b" ||
+    pushAdj.start !== t(2) ||
+    pushAdj.end !== t(4) ||
+    pushAdj.cause.sourceEventId !== "a" ||
+    pushAdj.cause.shiftDays !== 3
+  ) {
+    fail("upd-dep: tightening pushes forward", JSON.stringify(push))
+  } else ok("upd-dep: tightening to lag 0 pushes +3 with cause")
+  const movedPlan: PlanJSON = {
+    ...tightened,
+    events: tightened.events.map((e) =>
+      e.id === "b" ? { ...e, start: t(2), end: t(4) } : e,
+    ),
+  }
+  const relaxed = applyOps(movedPlan, [
+    { op: "updateDependency", dependency: { id: "d", fromEventId: "a", toEventId: "b", type: "FS", lagDays: -3 } },
+  ])
+  if (cascadeSchedule(relaxed, ["b"]).length !== 0) {
+    fail("upd-dep: relaxing never pulls back", "cascade moved the successor")
+  } else ok("upd-dep: relaxing never pulls back (forward-only)")
+
+  // CR contract: a valid op decodes with plan binding.
+  const cr = createChangeRequest({
+    planEntityId: "plan-1",
+    planAnchor: plan.anchor,
+    planRevision: 1,
+    basePlan: plan,
+    ops: [{ op: "updateDependency", dependency: { id: "d1", fromEventId: "a", toEventId: "b", type: "FS", lagDays: -2 } }],
+  })
+  const crEntity = buildChangeRequestEntity({ payload: cr })
+  if (!decodeChangeRequest(crEntity, plan, "plan-1").ok) fail("upd-dep: cr decode happy path", "rejected")
+  else ok("upd-dep: cr decodes the op with plan binding")
+
+  const crPayload = (patch: Record<string, unknown>): unknown => ({
+    ...crEntity,
+    dynamicProperties: { changeRequest: { ...cr, ...patch } },
+  })
+  const crRejects: Array<[string, unknown]> = [
+    ["bad type in op", crPayload({ ops: [{ op: "updateDependency", dependency: { id: "d1", fromEventId: "a", toEventId: "b", type: "XX" } }] })],
+    ["non-integer lag in op", crPayload({ ops: [{ op: "updateDependency", dependency: { id: "d1", fromEventId: "a", toEventId: "b", type: "FS", lagDays: 1.5 } }] })],
+    ["unknown dependency id", crPayload({ ops: [{ op: "updateDependency", dependency: { id: "ghost", fromEventId: "a", toEventId: "b", type: "FS" } }] })],
+    ["ghost endpoint", crPayload({ ops: [{ op: "updateDependency", dependency: { id: "d1", fromEventId: "a", toEventId: "ghost", type: "FS" } }] })],
+  ]
+  for (const [label, input] of crRejects) {
+    const d = decodeChangeRequest(input, plan)
+    if (d.ok) fail(`reject upd-dep cr: ${label}`, "decoder accepted it")
+    else ok(`reject upd-dep cr: ${label}`)
+  }
+
+  // Impact snapshot: the op seeds the successor (entry present).
+  const snap = buildImpactSnapshot(plan, [
+    { op: "updateDependency", dependency: { id: "d1", fromEventId: "a", toEventId: "b", type: "FS", lagDays: 5 } },
+  ])
+  if (!snap.entries.some((e) => e.eventId === "b")) {
+    fail("upd-dep: impact seeds toEventId", JSON.stringify(snap.entries))
+  } else ok("upd-dep: impact snapshot seeds toEventId")
+}
+
+// ---- 24. snapToDependency: reasiento al borde de la restricción ------------
+{
+  const t = (days: number) => new Date(Date.parse(ISO) + days * 86_400_000).toISOString()
+  const day = (iso: string) => Math.round((Date.parse(iso) - Date.parse(ISO)) / 86_400_000)
+  const planWith = (
+    events: Array<{ id: string; s: number; e: number; kind?: "milestone" }>,
+    deps: Array<{ id: string; from: string; to: string; type: "FS" | "SS" | "FF" | "SF"; lag?: number }>,
+  ): PlanJSON => ({
+    schemaVersion: 2,
+    anchor: ISO,
+    phases: [],
+    resources: [{ id: "r", title: "R" }],
+    events: events.map((x) => ({
+      id: x.id,
+      resourceId: "r",
+      start: t(x.s),
+      end: t(x.e),
+      progress: 0,
+      ...(x.kind === "milestone" ? { kind: "milestone" } : {}),
+    })),
+    dependencies: deps.map((d) => ({
+      id: d.id,
+      fromEventId: d.from,
+      toEventId: d.to,
+      type: d.type,
+      ...(d.lag !== undefined ? { lagDays: d.lag } : {}),
+    })),
+  })
+  const snapOf = (
+    plan: PlanJSON,
+    depId: string,
+  ) => {
+    const dep = (plan.dependencies ?? []).find((d) => d.id === depId)!
+    return snapToDependency(plan, dep)
+  }
+
+  // FS: the successor STARTS at pred.end (+lag), duration preserved.
+  {
+    const plan = planWith(
+      [{ id: "a", s: 0, e: 2 }, { id: "b", s: 4, e: 6 }],
+      [{ id: "d", from: "a", to: "b", type: "FS" }],
+    )
+    const snap = snapOf(plan, "d")
+    if (!snap || snap.eventId !== "b" || day(snap.start) !== 2 || day(snap.end) !== 4) {
+      fail("snap: FS seats at pred end", JSON.stringify(snap))
+    } else if (snap.cause.shiftDays !== -2) {
+      fail("snap: FS signed shift", String(snap.cause.shiftDays))
+    } else ok("snap: FS seats start at pred end (signed shift)")
+  }
+
+  // SS: starts aligned; FF: ends aligned; SF: end at pred start.
+  {
+    const ss = snapOf(planWith(
+      [{ id: "a", s: 0, e: 2 }, { id: "b", s: 4, e: 6 }],
+      [{ id: "d", from: "a", to: "b", type: "SS" }],
+    ), "d")
+    if (!ss || day(ss.start) !== 0 || day(ss.end) !== 2) fail("snap: SS aligns starts", JSON.stringify(ss))
+    else ok("snap: SS aligns starts")
+    const ff = snapOf(planWith(
+      [{ id: "a", s: 0, e: 2 }, { id: "b", s: 4, e: 6 }],
+      [{ id: "d", from: "a", to: "b", type: "FF" }],
+    ), "d")
+    if (!ff || day(ff.start) !== 0 || day(ff.end) !== 2) fail("snap: FF aligns ends", JSON.stringify(ff))
+    else ok("snap: FF aligns ends (duration preserved)")
+    const sf = snapOf(planWith(
+      [{ id: "a", s: 3, e: 5 }, { id: "b", s: 6, e: 8 }],
+      [{ id: "d", from: "a", to: "b", type: "SF" }],
+    ), "d")
+    if (!sf || day(sf.start) !== 1 || day(sf.end) !== 3) fail("snap: SF end at pred start", JSON.stringify(sf))
+    else ok("snap: SF seats end at pred start")
+  }
+
+  // Lag applies to the bound in every direction.
+  {
+    const plan = planWith(
+      [{ id: "a", s: 0, e: 2 }, { id: "b", s: 4, e: 6 }],
+      [{ id: "d", from: "a", to: "b", type: "FS", lag: -5 }],
+    )
+    const snap = snapOf(plan, "d")
+    if (!snap || day(snap.start) !== -3 || day(snap.end) !== -1) {
+      fail("snap: negative lag", JSON.stringify(snap))
+    } else ok("snap: negative lag seats back from the bound")
+  }
+
+  // Already at the bound → null (no noise op).
+  {
+    const plan = planWith(
+      [{ id: "a", s: 0, e: 2 }, { id: "b", s: 2, e: 4 }],
+      [{ id: "d", from: "a", to: "b", type: "FS" }],
+    )
+    if (snapOf(plan, "d") !== null) fail("snap: at bound yields null", "returned an adjustment")
+    else ok("snap: bar already at the bound yields null")
+  }
+
+  // Missing endpoint → null (defensive).
+  {
+    const plan = planWith([{ id: "a", s: 0, e: 2 }], [
+      { id: "d", from: "a", to: "ghost", type: "FS" },
+    ])
+    if (snapOf(plan, "d") !== null) fail("snap: ghost endpoint yields null", "returned an adjustment")
+    else ok("snap: missing endpoint yields null")
+  }
+
+  // Milestone successor: duration 0 seats the instant at the bound.
+  {
+    const plan = planWith(
+      [{ id: "a", s: 0, e: 2 }, { id: "m", s: 5, e: 5, kind: "milestone" }],
+      [{ id: "d", from: "a", to: "m", type: "FS" }],
+    )
+    const snap = snapOf(plan, "d")
+    if (!snap || day(snap.start) !== 2 || day(snap.end) !== 2) {
+      fail("snap: milestone seats the instant", JSON.stringify(snap))
+    } else ok("snap: milestone seats the instant at the bound")
+  }
+
+  // Recorder flow, reproduced purely: seat FIRST (folded as an update op),
+  // then the forward cascade over the seated plan pushes transitive
+  // dependents. Tightening: SS → FS lag +1 moves b to (3-5), c to (5-7).
+  {
+    const plan = planWith(
+      [{ id: "a", s: 0, e: 2 }, { id: "b", s: 0, e: 2 }, { id: "c", s: 2, e: 4 }],
+      [
+        { id: "d1", from: "a", to: "b", type: "SS" },
+        { id: "d2", from: "b", to: "c", type: "FS" },
+      ],
+    )
+    const reshaped = applyOps(plan, [
+      { op: "updateDependency", dependency: { id: "d1", fromEventId: "a", toEventId: "b", type: "FS", lagDays: 1 } },
+    ])
+    const snap = snapToDependency(reshaped, reshaped.dependencies!.find((d) => d.id === "d1")!)
+    if (!snap || day(snap.start) !== 3 || day(snap.end) !== 5) {
+      fail("snap: recorder flow seats b", JSON.stringify(snap))
+    } else {
+      const seated = applyOps(reshaped, [
+        { op: "update", id: "b", patch: { start: snap.start, end: snap.end } },
+      ])
+      const casc = cascadeSchedule(seated, ["b"])
+      const cAdj = casc.find((a) => a.eventId === "c")
+      if (!cAdj || day(cAdj.start) !== 5 || day(cAdj.end) !== 7) {
+        fail("snap: recorder flow cascades c", JSON.stringify(casc))
+      } else ok("snap: seat + forward cascade (tightening propagates)")
+    }
+  }
+
+  // Relaxing seats the bar BACK and the cascade moves nothing downstream
+  // (forward-only is the cascade's rule; the SNAP is the bidirectional one).
+  {
+    const plan = planWith(
+      [{ id: "a", s: 0, e: 2 }, { id: "b", s: 2, e: 4 }, { id: "c", s: 4, e: 6 }],
+      [
+        { id: "d1", from: "a", to: "b", type: "FS" },
+        { id: "d2", from: "b", to: "c", type: "FS" },
+      ],
+    )
+    const reshaped = applyOps(plan, [
+      { op: "updateDependency", dependency: { id: "d1", fromEventId: "a", toEventId: "b", type: "SS" } },
+    ])
+    const snap = snapToDependency(reshaped, reshaped.dependencies!.find((d) => d.id === "d1")!)
+    if (!snap || day(snap.start) !== 0 || day(snap.end) !== 2) {
+      fail("snap: relaxing seats back", JSON.stringify(snap))
+    } else {
+      const seated = applyOps(reshaped, [
+        { op: "update", id: "b", patch: { start: snap.start, end: snap.end } },
+      ])
+      if (cascadeSchedule(seated, ["b"]).length !== 0) {
+        fail("snap: relaxing cascades nothing", "dependents moved")
+      } else ok("snap: relaxing seats back, cascade stays forward-only")
     }
   }
 }

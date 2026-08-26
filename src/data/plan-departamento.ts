@@ -230,9 +230,11 @@ const resources: PlanResource[] = [
 /**
  * Seeded scheduling constraints, chosen against the event offsets so the
  * demo loads with a readable graph: mostly clean FS chains, one SS (trazo
- * runs parallel to excavación) and ONE deliberately violated edge
- * (muros-pa starts before its predecessor finishes), which paints red and
- * shows what the cascade fixes when a drag triggers it.
+ * runs parallel to excavación) and one DOCUMENTED overlap — muros-pa
+ * starts 7 days before muros-bloque-pb finishes (FS with lag −7, the
+ * dates already overlap by exactly that much). The violation machinery
+ * stays demonstrable interactively: drag the predecessor forward and the
+ * successor reddens live until the cascade repairs it.
  */
 const dep = (
   id: string,
@@ -250,7 +252,7 @@ const dependencies: PlanDependency[] = [
   dep("dep-05", "losa-pb", "columnas-pa"),
   dep("dep-06", "columnas-pa", "losa-azotea-cimbra"),
   dep("dep-07", "losa-azotea-cimbra", "losa-azotea-concreto"),
-  dep("dep-08", "muros-bloque-pb", "muros-pa"),
+  dep("dep-08", "muros-bloque-pb", "muros-pa", "FS", -7),
   dep("dep-09", "electrica-empotrada-pa", "yeso-pintura"),
   dep("dep-10", "herreria-aluminio", "pruebas-puestas-marcha"),
   dep("dep-11", "kit-entrega", "acta-entrega"),

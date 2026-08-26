@@ -727,6 +727,17 @@ function GanttPlanViewerInner({
     [recorder, applyAdjustments],
   )
 
+  // Edge-shape editor (type/lag): the op flows into livePlan, which
+  // re-derives the marks and the violation state on its own; the cascade
+  // a tightening produces is mirrored into the engine events here.
+  const handleUpdateDependency = useCallback(
+    (dep: PlanDependency) => {
+      const adjustments = recorder.updateDependency(dep)
+      if (adjustments !== false) applyAdjustments(adjustments)
+    },
+    [recorder, applyAdjustments],
+  )
+
   // Connect-drag (engine → consumer) wiring. canConnectEvents owns the live
   // veto: the same predicates the menu uses (self / duplicate / cycle) so
   // both affordances never disagree. onEventConnect reuses the existing
@@ -936,6 +947,7 @@ function GanttPlanViewerInner({
           deps={livePlan.dependencies ?? []}
           events={events}
           point={{ x: activeDependency.x, y: activeDependency.y }}
+          onUpdate={handleUpdateDependency}
           onRemove={() => {
             recorder.removeDependency(activeDependency.mark.key)
             setDependencyTarget(null)
@@ -1317,15 +1329,21 @@ function BaselineHistoryPanel({
 
 /**
  * Floating card for a clicked connector: names both ends, the constraint
- * type (and lag), and offers the documented removal. Anchored to the CLICK
- * point; like the baseline panel it closes when anything reflows under it,
- * so it can never end up describing the wrong edge.
+ * type (and lag), and edits the edge's SHAPE - a segmented FS/SS/FF/SF
+ * control plus a signed lag stepper (negative = overlap/lead). Every
+ * commit travels as ONE net op (the recorder folds by dep id) AND
+ * re-seats the dependent bar exactly at the new constraint's bound
+ * (bidirectional - see recorder.updateDependency), so the timeline shows
+ * the edit immediately. Anchored to the CLICK point; like the baseline
+ * panel it closes when anything reflows under it, so it can never end up
+ * describing the wrong edge.
  */
 function DependencyPanel({
   mark,
   deps,
   events,
   point,
+  onUpdate,
   onRemove,
   onClose,
 }: {
@@ -1333,10 +1351,23 @@ function DependencyPanel({
   deps: readonly PlanDependency[]
   events: GanttEvent<EventData>[]
   point: { x: number; y: number }
+  onUpdate: (dep: PlanDependency) => void
   onRemove: () => void
   onClose: () => void
 }) {
   const cardRef = useRef<HTMLDivElement | null>(null)
+  const dep = deps.find((d) => d.id === mark.key)
+  const committedLag = dep?.lagDays ?? 0
+  // Draft of the lag input: committed on blur/Enter/steppers, never
+  // mid-typing. Re-synced from the live dep when a commit lands (the
+  // render-time adjustment pattern: no effect, no stale number on screen
+  // after a rejected edit).
+  const [lagDraft, setLagDraft] = useState(String(committedLag))
+  const [syncedLag, setSyncedLag] = useState(committedLag)
+  if (committedLag !== syncedLag) {
+    setSyncedLag(committedLag)
+    setLagDraft(String(committedLag))
+  }
 
   useEffect(() => {
     const contains = (target: EventTarget | null) =>
@@ -1363,7 +1394,6 @@ function DependencyPanel({
     }
   }, [onClose])
 
-  const dep = deps.find((d) => d.id === mark.key)
   if (!dep) return null
   const titleOf = (id: string) =>
     events.find((ev) => ev.id === id)?.title ?? id
@@ -1373,6 +1403,18 @@ function DependencyPanel({
     window.innerWidth - 120,
   )
 
+  const commitLag = (raw: string) => {
+    const parsed = Number.parseInt(raw.trim(), 10)
+    const next = Number.isFinite(parsed) ? parsed : 0
+    setLagDraft(String(next))
+    if (next !== committedLag) onUpdate({ ...dep, lagDays: next })
+  }
+  const stepLag = (delta: number) =>
+    commitLag(String(committedLag + delta))
+  const commitType = (type: PlanDependency["type"]) => {
+    if (type !== dep.type) onUpdate({ ...dep, type })
+  }
+
   return (
     <div
       ref={cardRef}
@@ -1381,6 +1423,7 @@ function DependencyPanel({
         titleOf(dep.fromEventId),
         titleOf(dep.toEventId),
         typeLabel,
+        dep.lagDays,
       )}
       tabIndex={-1}
       data-slot="gantt-dependency-panel"
@@ -1417,6 +1460,84 @@ function DependencyPanel({
             {APP_STRINGS_ES.dependencyViolated}
           </span>
         )}
+      </div>
+      {/* Shape editor: each commit REPLACES the previous op for this edge
+          (dep:<id> key in the recorder's opsMap), like repeated drags
+          collapse into one update on an event. */}
+      <div className="mt-1 flex flex-col gap-1.5 border-t px-3 pt-1.5">
+        <div className="flex items-center justify-between gap-4">
+          <span className="text-muted-foreground">
+            {APP_STRINGS_ES.dependencyTypeLabel}
+          </span>
+          <div
+            role="group"
+            aria-label={APP_STRINGS_ES.dependencyTypeLabel}
+            data-slot="gantt-dependency-types"
+            className="ring-ring/30 flex overflow-hidden rounded-md ring-1"
+          >
+            {(
+              Object.keys(APP_STRINGS_ES.dependencyTypes) as PlanDependency["type"][]
+            ).map((t) => (
+              <button
+                key={t}
+                type="button"
+                title={APP_STRINGS_ES.dependencyTypes[t]}
+                aria-pressed={dep.type === t}
+                onClick={() => commitType(t)}
+                className={cn(
+                  "min-w-8 px-1.5 py-0.5 text-center font-medium outline-none",
+                  "focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:z-10",
+                  dep.type === t
+                    ? "bg-primary text-primary-foreground"
+                    : "hover:bg-accent",
+                )}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="flex items-center justify-between gap-4">
+          <span className="text-muted-foreground">
+            {APP_STRINGS_ES.dependencyLagLabel}
+          </span>
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              data-slot="gantt-dependency-lag-dec"
+              aria-label={APP_STRINGS_ES.dependencyLagDecrease}
+              onClick={() => stepLag(-1)}
+              className="ring-ring/30 hover:bg-accent size-6 rounded-md text-center leading-6 font-medium ring-1 outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            >
+              −
+            </button>
+            <input
+              type="text"
+              inputMode="numeric"
+              data-slot="gantt-dependency-lag"
+              aria-label={APP_STRINGS_ES.dependencyLagLabel}
+              value={lagDraft}
+              onChange={(e) => setLagDraft(e.target.value)}
+              onBlur={() => commitLag(lagDraft)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") commitLag(lagDraft)
+              }}
+              className="ring-ring/30 bg-background w-12 rounded-md py-0.5 text-center tabular-nums ring-1 outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            />
+            <button
+              type="button"
+              data-slot="gantt-dependency-lag-inc"
+              aria-label={APP_STRINGS_ES.dependencyLagIncrease}
+              onClick={() => stepLag(1)}
+              className="ring-ring/30 hover:bg-accent size-6 rounded-md text-center leading-6 font-medium ring-1 outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            >
+              +
+            </button>
+          </div>
+        </div>
+        <span className="text-muted-foreground text-[10px]">
+          {APP_STRINGS_ES.dependencyLagHint}
+        </span>
       </div>
       <div className="border-t px-1 pt-1 mt-1">
         <button
